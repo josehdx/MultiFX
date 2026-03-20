@@ -31,12 +31,10 @@ void __attribute__((constructor)) pre_boot_kill_switch() {
 i2s_chan_handle_t tx_chan;
 i2s_chan_handle_t rx_chan;
 
-// --- DUAL SLEEP CONFIGURATION ---
-unsigned long lastActivityTime = 0;       // CPU Sleep Timer (2 Mins)
-unsigned long lastScreenActivityTime = 0; // Screen Timeout Timer (5 Mins)
-const unsigned long LIGHT_SLEEP_TIMEOUT = 120000; // 2 Minutes
-const unsigned long SCREEN_OFF_TIMEOUT = 300000;  // 5 Minutes
-bool isScreenOff = false;
+// --- SLEEP CONFIGURATION ---
+unsigned long lastActivityTime = 0;
+const unsigned long SLEEP_TIMEOUT_MS = 120000; // 2 Minutes
+bool isSleeping = false;
 
 // --- TFT DISPLAY & SPRITE OBJECTS ---
 TFT_eSPI tft = TFT_eSPI();
@@ -66,7 +64,6 @@ float frozenMag[SAMPLES / 2] = {0};
 
 // --- HARDWARE PINS (Core 0) ---
 pin_t pinPB = A0;
-pin_t pinPB2 = 2;
 const int CAROUSEL_BUTTON_PIN = 14; 
 const int FREEZE_BUTTON_PIN = 2;    
 const int INTERVAL_BUTTON_PIN = 43; 
@@ -74,13 +71,12 @@ const int FEEDBACK_BUTTON_PIN = 44;
 
 // Button States
 bool lastCarouselState = HIGH;
-bool lastBootState = HIGH;      
 bool lastButtonState = HIGH;
 bool lastIntervalButtonState = HIGH;
 bool lastFbState = HIGH;
+
 unsigned long carouselPressedTime = 0; 
-unsigned long bootPressedTime = 0;     
-unsigned long intervalButtonPressedTime = 0;
+unsigned long intervalButtonPressedTime = 0; 
 
 // --- INDEPENDENT EFFECT MEMORY BANKS ---
 int activeEffectMode = 0; // 0=WHAMMY, 1=FREEZE, 2=FEEDBACK, 3=HARMONY, 4=CAPO
@@ -103,8 +99,6 @@ USBMIDI_Interface usbmidi;
 MIDI_PipeFactory<2> pipes;
 Bank<16> bankChannel;
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB = pinPB;
-FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
-
 uint16_t lastMidiSent = 8192;
 
 // Calibration Variables
@@ -202,25 +196,6 @@ inline float IRAM_ATTR fast_mag(float re, float im) {
 
 const int TRIG_LUT_SIZE = 4096; 
 float sinLUT[TRIG_LUT_SIZE];
-
-void turnScreenOff() {
-    if (!isScreenOff) {
-        digitalWrite(38, LOW);  // Backlight OFF
-        digitalWrite(15, LOW);  // Screen Power OFF
-        isScreenOff = true;
-    }
-}
-
-void turnScreenOn() {
-    if (isScreenOff) {
-        pinMode(15, OUTPUT); digitalWrite(15, HIGH); 
-        tft.init(); 
-        forceUIUpdate = true;
-        delay(120);
-        pinMode(38, OUTPUT); digitalWrite(38, HIGH); 
-        isScreenOff = false;
-    }
-}
 
 void initTrigLUT() {
     for (int i = 0; i < TRIG_LUT_SIZE; i++) {
@@ -455,87 +430,118 @@ void DisplayTask(void * pvParameters) {
 // --- CORE 0: MIDI CONTROL TASK (Priority 2) ---
 void MidiTask(void * pvParameters) {
     static bool lastBtState = false; 
+    static bool lastBootState = HIGH;      // Track Boot Button state
+    static unsigned long bootPressedTime = 0; 
     lastActivityTime = millis(); 
-    lastScreenActivityTime = millis(); 
 
     for(;;) {
-        if (pitchShiftLUT[8192] == 0) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+        // 0. Safety Gate: Wait for calibration to finish
+        if (pitchShiftLUT[8192] == 0) { 
+            vTaskDelay(pdMS_TO_TICKS(100)); 
+            continue; 
+        }
+
         Control_Surface.loop();
 
-        // --- 1. CPU TIMER RESET (BLUETOOTH ONLY) ---
+        // --- 1. DETECT BLUETOOTH CHANGES ---
         bool btConnected = btmidi.isConnected();
         if (btConnected != lastBtState) {
-            if (!isScreenOff) forceUIUpdate = true;
+            forceUIUpdate = true;
             lastBtState = btConnected;
-            lastActivityTime = millis(); // Resets CPU Sleep Timer
+            lastActivityTime = millis(); 
         }
 
-        // --- 2. SCREEN TIMEOUT CHECK (5 MINS) ---
-        if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) {
-            turnScreenOff();
-        }
-
-        // --- 3. LIGHT SLEEP CHECK (2 MINS - NO BT) ---
-        if (!btConnected && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) {
+        // --- 2. INACTIVITY / SLEEP LOGIC ---
+        if (!btConnected && (millis() - lastActivityTime > SLEEP_TIMEOUT_MS)) {
             goToLightSleep();
-            lastScreenActivityTime = millis(); // Reset screen timer on wake
         }
 
-        // --- 4. BUTTONS (NO TIMER RESETS) ---
-        // Carousel and Boot buttons process logic but do NOT wake the screen
-        bool curC = digitalRead(CAROUSEL_BUTTON_PIN);
-        if (curC == LOW && lastCarouselState == HIGH) carouselPressedTime = millis();
-        else if (curC == HIGH && lastCarouselState == LOW) {
-            unsigned long dur = millis() - carouselPressedTime;
-            if (dur < 400) activeEffectMode = (activeEffectMode + 1) % 5;
-            else effectMemory[activeEffectMode] += 1.0f;
-            updateLUT(); 
-            if (!isScreenOff) forceUIUpdate = true; 
+        // --- 3. CAROUSEL BUTTON (GPIO 14) ---
+        bool currentCarouselState = digitalRead(CAROUSEL_BUTTON_PIN);
+        if (currentCarouselState == LOW && lastCarouselState == HIGH) {
+            carouselPressedTime = millis();
+            vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
         }
-        lastCarouselState = curC;
+        else if (currentCarouselState == HIGH && lastCarouselState == LOW) {
+            unsigned long pressDuration = millis() - carouselPressedTime;
+            
+            if (pressDuration < 400) {
+                // Short Press: Advance Mode
+                activeEffectMode++;
+                if (activeEffectMode > 4) activeEffectMode = 0;
 
-        // Boot Button (GPIO 0) decrease logic
-        bool curB = digitalRead(0);
-        if (curB == LOW && lastBootState == HIGH) bootPressedTime = millis();
-        else if (curB == HIGH && lastBootState == LOW) {
-            unsigned long dur = millis() - bootPressedTime;
-            if (dur >= 400 && dur < 2000) {
-                effectMemory[activeEffectMode] -= 1.0f;
-                updateLUT(); 
-                if (!isScreenOff) forceUIUpdate = true;
+                isHarmonizerMode = false;
+                isCapoMode = false;
+                isFeedbackActive = false; 
+                feedbackRamp = 0.0f;
+                isFrozen = false; 
+
+                switch(activeEffectMode) {
+                    case 0: break; 
+                    case 1: isFrozen = true; break;
+                    case 2: isFeedbackActive = true; break; 
+                    case 3: isHarmonizerMode = true; break;
+                    case 4: isCapoMode = true; break;
+                }
+            } 
+            else {
+                // Medium/Long Press: Increase Interval only
+                effectMemory[activeEffectMode] += 1.0f;
+                if (effectMemory[activeEffectMode] > 24.0f) effectMemory[activeEffectMode] = 24.0f;
             }
+
+            updateLUT();
+            forceUIUpdate = true; 
+            lastActivityTime = millis();
+            vTaskDelay(pdMS_TO_TICKS(50)); 
         }
-        lastBootState = curB;
+        lastCarouselState = currentCarouselState;
 
-       // --- 5. DUAL EXPRESSION PEDAL LOGIC (THE WAKE TRIGGER) ---
-filterPB.update();
-filterPB2.update(); // Update the second pot
+        // --- 4. BOOT BUTTON (GPIO 0) - DECREASE INTERVAL ---
+        bool currentBootState = digitalRead(0); // GPIO 0
+        if (currentBootState == LOW && lastBootState == HIGH) {
+            bootPressedTime = millis();
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        else if (currentBootState == HIGH && lastBootState == LOW) {
+            unsigned long pressDuration = millis() - bootPressedTime;
+            
+            // Medium press (Same timing as Carousel) to decrease
+            if (pressDuration >= 400 && pressDuration < 2000) {
+                effectMemory[activeEffectMode] -= 1.0f;
+                if (effectMemory[activeEffectMode] < -24.0f) effectMemory[activeEffectMode] = -24.0f;
+                
+                updateLUT();
+                forceUIUpdate = true;
+            }
+            lastActivityTime = millis(); 
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        lastBootState = currentBootState;
 
-// Get values for both
-analog_t raw14_A = map(filterPB.getValue(), 0, 4095, 0, 16383);
-analog_t raw14_B = map(filterPB2.getValue(), 0, 4095, 0, 16383);
+        // --- 5. BUTTON ACTIVITY RESET ---
+        if (digitalRead(FREEZE_BUTTON_PIN) == LOW || 
+            digitalRead(INTERVAL_BUTTON_PIN) == LOW || 
+            digitalRead(FEEDBACK_BUTTON_PIN) == LOW) {
+            lastActivityTime = millis(); 
+        }
 
-// Calibrate both to your MIDI range
-analog_t calibratedA = map_PB_Full(raw14_A);
-analog_t calibratedB = map_PB_Full(raw14_B);
+        // --- 6. UNIFIED EXPRESSION PEDAL LOGIC ---
+        filterPB.update();
+        analog_t raw12 = filterPB.getValue(); 
+        analog_t raw14 = map(raw12, 0, 4095, 0, 16383);
+        analog_t calibratedMidi = map_PB_Full(raw14);
 
-// Check if EITHER pot has moved significantly
-if (calibratedA != lastMidiSent || calibratedB != lastMidiSent) {
-    // Determine which one moved (for this simple logic, we prioritize B if both move)
-    analog_t finalMidi = (calibratedB != lastMidiSent) ? calibratedB : calibratedA;
+        if (calibratedMidi != lastMidiSent) {
+            lastActivityTime = millis(); 
+            Control_Surface.sendPitchBend(Channel_1, calibratedMidi);
+            lastMidiSent = calibratedMidi;
 
-    // WAKE SCREEN AND RESET SCREEN TIMER
-    if (isScreenOff) turnScreenOn(); 
-    lastScreenActivityTime = millis(); 
+            int safeIndex = constrain(calibratedMidi, 0, 16383);
+            pitchShiftFactor = pitchShiftLUT[safeIndex];
+        }
 
-    // Send the single MIDI Pitch Bend for both
-    Control_Surface.sendPitchBend(Channel_1, finalMidi);
-    lastMidiSent = finalMidi;
-
-    // Update the Audio Engine
-    pitchShiftFactor = pitchShiftLUT[constrain(finalMidi, 0, 16383)];
-}
-
+        // --- 7. HEARTBEAT (Crucial to prevent Boot Loop) ---
         vTaskDelay(pdMS_TO_TICKS(5)); 
     }
 }

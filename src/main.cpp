@@ -494,18 +494,40 @@ void MidiTask(void * pvParameters) {
         }
         lastCarouselState = curC;
 
-        // Boot Button (GPIO 0) decrease logic
-        bool curB = digitalRead(0);
-        if (curB == LOW && lastBootState == HIGH) bootPressedTime = millis();
-        else if (curB == HIGH && lastBootState == LOW) {
-            unsigned long dur = millis() - bootPressedTime;
-            if (dur >= 400 && dur < 2000) {
-                effectMemory[activeEffectMode] -= 1.0f;
-                updateLUT(); 
-                if (!isScreenOff) forceUIUpdate = true;
-            }
+       bool currentBootState = digitalRead(0); // GPIO 0
+if (currentBootState == LOW && lastBootState == HIGH) {
+    bootPressedTime = millis();
+    vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
+}
+else if (currentBootState == HIGH && lastBootState == LOW) {
+    unsigned long pressDuration = millis() - bootPressedTime;
+    
+    if (pressDuration < 400) {
+        // --- SHORT PRESS LOGIC ---
+        if (isScreenOff) {
+            // Wake the screen if it was off
+            turnScreenOn();
+            lastScreenActivityTime = millis();
+        } 
+        // If screen is already on, a quick press does nothing per your request.
+    } 
+    else {
+        // --- LONG PRESS (>=400ms) LOGIC ---
+        // Decrease the interval by a factor of 1
+        effectMemory[activeEffectMode] -= 1.0f;
+        if (effectMemory[activeEffectMode] < -24.0f) {
+            effectMemory[activeEffectMode] = -24.0f;
         }
-        lastBootState = curB;
+        
+        updateLUT();
+        if (!isScreenOff) forceUIUpdate = true;
+        
+        // Optional: Keeping the device awake if the user is interacting with intervals
+        lastActivityTime = millis();
+    }
+    vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
+}
+lastBootState = currentBootState;
 
        // --- 5. DUAL EXPRESSION PEDAL LOGIC (THE WAKE TRIGGER) ---
 filterPB.update();

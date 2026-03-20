@@ -7,10 +7,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/stream_buffer.h"
 #include "dsps_mul.h"
+#include <TFT_eSPI.h>
 
 // --- THE LOOKUP TABLE ---
 float pitchShiftLUT[16384]; // 64KB array to hold all possible pedal multipliers
 
+// --- TFT DISPLAY OBJECT ---
+TFT_eSPI tft = TFT_eSPI();
 
 // --- GitHub Configuration & Constants ---
 #define SAMPLES 512             
@@ -32,19 +35,18 @@ volatile bool isFrozen = false;
 float frozenMag[SAMPLES / 2] = {0};
 QueueHandle_t i2s_event_queue;
 
-
 // --- MIDI & Full Calibration Suite (Core 0) ---
 pin_t pinPB = A0;
-const int FREEZE_BUTTON_PIN = 2; // Set this to your desired GPIO (e.g., 0, 4, or 5)
-const int INTERVAL_BUTTON_PIN = 8;
-const int FEEDBACK_BUTTON_PIN = 9;
+const int FREEZE_BUTTON_PIN = 2; 
+const int INTERVAL_BUTTON_PIN = 43; // Safely moved away from screen pins
+const int FEEDBACK_BUTTON_PIN = 44; // Safely moved away from screen pins
 
 bool lastButtonState = HIGH;
 bool lastIntervalButtonState = HIGH;
 unsigned long intervalButtonPressedTime = 0;
-float maxSemitones = 12.0f; // Defaults to +/- 1 Octave on boot
+float maxSemitones = 12.0f; 
 
-const int HARMONY_BUTTON_PIN = 6; 
+const int HARMONY_BUTTON_PIN = 3;  // Safely moved away from screen pins
 bool lastHarmonyButtonState = HIGH;
 volatile bool isHarmonizerMode = false; 
 
@@ -53,7 +55,7 @@ volatile float feedbackRamp = 0.0f;
 const int CAPO_BUTTON_PIN = 10;
 bool lastCapoButtonState = HIGH;
 volatile bool isCapoMode = false;
-float capoSemitones = -2.0f; // Set your fixed Capo interval here
+float capoSemitones = -2.0f; 
 
 BluetoothMIDI_Interface btmidi;
 USBMIDI_Interface usbmidi;
@@ -77,22 +79,17 @@ static bool lockedAtMax = false;
 
 // --- Full Mapping Logic ---
 analog_t map_PB_Full(analog_t raw) {
-    // raw is already 14-bit! No up-mapping needed.
     raw = constrain(raw, PBminimumValue, PBmaximumValue);
     
-    // HARD FLOOR
     if (raw <= PBminimumValue + 150) { 
         PBwasOffCenter = true;
         return 0; 
     }
-    
-    // HARD CEILING
     if (raw >= PBmaximumValue - 150) {
         PBwasOffCenter = true;
         return 16383; 
     }
     
-    // Deadzone Math
     if (raw <= PBcenter - PBdeadzone) {
         PBwasOffCenter = true;
         return map(raw, PBminimumValue, PBcenter - PBdeadzone, 0, 8191);
@@ -102,25 +99,21 @@ analog_t map_PB_Full(analog_t raw) {
         return map(raw, PBcenter + PBdeadzone, PBmaximumValue, 8191, 16383);
     }
     else {
-        return 8192; // Solid center
+        return 8192; 
     }
 }
 
-// --- GitHub Calibration Routine (All Serial Lines Restored) ---
 void calibrateCenterAndDeadzone() {
   Serial.println("Calibrating Center and Deadzones...");
-  
-  // WARM UP THE FILTER SO IT DOESN'T START AT 0
   for(int i=0; i<50; i++) { filterPB.update(); delay(1); }
 
   int iNumberOfSamples = 750;
-  analog_t calibPBLow = 16383; // Start at 14-bit max
+  analog_t calibPBLow = 16383; 
   analog_t calibPBHigh = 0; 
   long lSampleSumPB = 0;
 
   for (int iSample = 1; iSample <= iNumberOfSamples; iSample++) {
-    filterPB.update(); // Update the filter
-   
+    filterPB.update(); 
     analog_t raw12 = filterPB.getValue();
     analog_t calibPB = map(raw12, 0, 4095, 0, 16383); 
     
@@ -133,42 +126,19 @@ void calibrateCenterAndDeadzone() {
   PBcenter = lSampleSumPB / iNumberOfSamples;
   Serial.print("PB Center: "); Serial.println(PBcenter);
 
-  // No mapping needed because it's already 14-bit
   PBdeadzone = (analog_t)constrain(((calibPBHigh - calibPBLow) * PBdeadzoneMultiplier), PBdeadzoneMinimum, PBdeadzoneMaximum);
   Serial.print("PB Deadzone: "); Serial.println(PBdeadzone);
 }
 
-
 void updateLUT() {
-    // Loop through every possible expression pedal position (0 to 16383)
     for (int i = 0; i < 16384; i++) {
         float normalizedThrow = (float(i) - 8192.0f) / 8192.0f;
         float currentWhammyShift = maxSemitones * normalizedThrow;
         float currentCapoShift = isCapoMode ? capoSemitones : 0.0f;
         float totalSemitones = currentCapoShift + currentWhammyShift;
-        
-        // Calculate the math heavily once, and store the answer
         pitchShiftLUT[i] = powf(2.0f, totalSemitones / 12.0f);
     }
     Serial.println("System: DSP Math Table Recalculated!");
-}
-
-// --- GitHub debugPrint() - Fully Restored ---
-void debugPrint() {
-    //Serial.print("Factor: "); Serial.print(pitchShiftFactor); Serial.print("\t");
-  /* Serial.print("AR: ");
-  Serial.print(analogRead(pinPB)); Serial.print("\t");
-  Serial.print("PB Min/Cen/Max/Range/DZ: ");
-  Serial.print(PBminimumValue); Serial.print(" ");
-  Serial.print(PBcenter); Serial.print(" ");
-  Serial.print(PBmaximumValue); Serial.print(" ");
-  Serial.print(PBmaximumValue-PBminimumValue); Serial.print(" ");
-  Serial.print(PBdeadzone); Serial.print(" ");
-  Serial.print("PB OffCenter/Raw(14bit)/Val(12bit): ");
-  Serial.print(PBwasOffCenter); Serial.print("\t");
-  */
-  
-  Serial.println();
 }
 
 inline float IRAM_ATTR fast_mag(float re, float im) {
@@ -179,8 +149,7 @@ inline float IRAM_ATTR fast_mag(float re, float im) {
     return max_val + 0.337f * min_val;
 }
 
-// --- TRIGONOMETRY LUT ---
-const int TRIG_LUT_SIZE = 4096; // 4096 entries is plenty for audio phase accuracy
+const int TRIG_LUT_SIZE = 4096; 
 float sinLUT[TRIG_LUT_SIZE];
 
 void initTrigLUT() {
@@ -190,12 +159,9 @@ void initTrigLUT() {
     Serial.println("System: Trigonometry LUT Initialized!");
 }
 
-// Super-fast 2-cycle Sine/Cosine
 inline float IRAM_ATTR fast_sin(float phase) {
-    // Fast phase wrapping to 0 -> 2PI range
     float wrapped = phase - (TWO_PI * (int)(phase / TWO_PI));
     if (wrapped < 0) wrapped += TWO_PI;
-    
     int index = (int)((wrapped / TWO_PI) * TRIG_LUT_SIZE);
     return sinLUT[index % TRIG_LUT_SIZE];
 }
@@ -204,7 +170,6 @@ inline float IRAM_ATTR fast_cos(float phase) {
     return fast_sin(phase + (PI / 2.0f));
 }
 
-
 // --- CORE 1: PHASE-LOCKED DSP TASK ---
 void IRAM_ATTR AudioDSPTask(void * pvParameters) { 
     esp_err_t ret = dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
@@ -212,7 +177,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     
     dsps_wind_hann_f32(window_coefficients, SAMPLES);
 
-    // --- STATIC ALLOCATION: Shaves microseconds off every frame ---
     static int16_t in_block[HOP_SIZE];
     static int16_t out_block[HOP_SIZE];
     static float ola_buffer[SAMPLES] = {0};
@@ -281,7 +245,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         prevAnalysisPhase[i] = phase; 
                     }
                     
-                    // Path 1: Dry/Shifted
                     float mainFactor = _harmonizer ? 1.0f : _pitchFactor;
                     int targetBin = (int)((i * mainFactor) + 0.5f);
                     if (targetBin < SAMPLES / 2) {
@@ -291,7 +254,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         prevSynthesisPhase[targetBin] = newPhase[targetBin];
                     }
 
-                    // Path 2: Feedback
                     if (_feedback > 0.0f) {
                         float fbFactor = _pitchFactor * (1.0f + _feedback); 
                         int fbTargetBin = (int)((i * fbFactor) + 0.5f);
@@ -303,7 +265,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         }
                     }
 
-                    // Path 3: Harmonizer
                     if (_harmonizer && fabsf(_pitchFactor - 1.0f) > 0.001f) {
                         int harmTargetBin = (int)((i * _pitchFactor) + 0.5f);
                         if (harmTargetBin < SAMPLES / 2) {
@@ -317,7 +278,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
 
                 #pragma GCC unroll 4
                 for (int i = 0; i < SAMPLES / 2; i++) {
-                    // --- FAST TRIG LUT IN USE ---
                     fft_buffer[i * 2] = newMag[i] * fast_cos(newPhase[i]);
                     fft_buffer[i * 2 + 1] = newMag[i] * fast_sin(newPhase[i]);
                 }
@@ -328,7 +288,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     ola_buffer[i] += fft_buffer[i * 2]; 
                 }
 
-                // --- VECTORIZED SIMD SCALING: Blitzes the whole array in 1 cycle ---
                 float scale = 32767.0f;
                 dsps_mul_f32(ola_buffer, &scale, ola_buffer, HOP_SIZE, 1, 0, 1);
 
@@ -350,160 +309,128 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     }
 }
 
-
-
 // --- CORE 0: MIDI & ADVANCED CONTROL ---
 void MidiTask(void * pvParameters) {
-
     for(;;) {
         Control_Surface.loop();
         
-        // --- FREEZE BUTTON LOGIC ---
         bool currentButtonState = digitalRead(FREEZE_BUTTON_PIN);
-        
         if (currentButtonState == LOW && lastButtonState == HIGH) {
             isFrozen = !isFrozen;
-            if (isFrozen) {
-                Serial.println("FREEZE ON - Snapshot Captured!");
-            } else {
-                Serial.println("FREEZE OFF - Back to Live Audio");
-            }
-            vTaskDelay(pdMS_TO_TICKS(50)); // Simple debounce delay
+            if (isFrozen) { Serial.println("FREEZE ON - Snapshot Captured!"); } 
+            else { Serial.println("FREEZE OFF - Back to Live Audio"); }
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
         lastButtonState = currentButtonState;
 
-
-        // --- HARMONY MODE TOGGLE ---
         bool currentHarmonyState = digitalRead(HARMONY_BUTTON_PIN);
         if (currentHarmonyState == LOW && lastHarmonyButtonState == HIGH) {
             isHarmonizerMode = !isHarmonizerMode;
-            if (isHarmonizerMode) {
-                Serial.println("HARMONY MODE ON: Dry Signal + Sweeping Harmony");
-            } else {
-                Serial.println("WHAMMY MODE ON: Pitch Bend Only");
-            }
-            vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
+            if (isHarmonizerMode) { Serial.println("HARMONY MODE ON"); } 
+            else { Serial.println("WHAMMY MODE ON"); }
+            vTaskDelay(pdMS_TO_TICKS(50)); 
         }
         lastHarmonyButtonState = currentHarmonyState;
 
-        // --- CAPO MODE TOGGLE ---
         bool currentCapoState = digitalRead(CAPO_BUTTON_PIN);
         if (currentCapoState == LOW && lastCapoButtonState == HIGH) {
             isCapoMode = !isCapoMode;
             updateLUT();
-            if (isCapoMode) {
-                Serial.println("CAPO MODE ON: Fixed Pitch Shift");
-            } else {
-                Serial.println("CAPO MODE OFF: Expression Pedal Active");
-            }
-            vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
+            if (isCapoMode) { Serial.println("CAPO MODE ON"); } 
+            else { Serial.println("CAPO MODE OFF"); }
+            vTaskDelay(pdMS_TO_TICKS(50)); 
         }
         lastCapoButtonState = currentCapoState;
 
-
-        // --- 2. INTERVAL BUTTON LOGIC (Short vs Long Press) ---
         bool currentIntervalButtonState = digitalRead(INTERVAL_BUTTON_PIN);
-        
         if (currentIntervalButtonState == LOW && lastIntervalButtonState == HIGH) {
-            // Button was just pressed, start the timer
             intervalButtonPressedTime = millis();
-            vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
+            vTaskDelay(pdMS_TO_TICKS(50)); 
         } 
         else if (currentIntervalButtonState == HIGH && lastIntervalButtonState == LOW) {
-            // Button was just released, check how long it was held
             unsigned long pressDuration = millis() - intervalButtonPressedTime;
-            
             if (pressDuration < 1000) {
-                // Short Press: Increment by 0.5 semitones
                 maxSemitones += 0.5f;
-                if (maxSemitones > 24.0f) maxSemitones = 24.0f; // Max +/- 24 semitones
+                if (maxSemitones > 24.0f) maxSemitones = 24.0f; 
                 Serial.print("Interval Up: +/- "); Serial.println(maxSemitones);
                 updateLUT();
             } else {
-                // Long Press (>= 1 second): Decrement by 0.5 semitones
                 maxSemitones -= 0.5f;
-                if (maxSemitones < -24.0f) maxSemitones = -24.0f; // Min 0 (No shift)
+                if (maxSemitones < -24.0f) maxSemitones = -24.0f; 
                 Serial.print("Interval Down: +/- "); Serial.println(maxSemitones);
                 updateLUT();
             }
-            vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
+            vTaskDelay(pdMS_TO_TICKS(50)); 
         }
-        
         lastIntervalButtonState = currentIntervalButtonState;
 
-        // --- 3. AUTO-FEEDBACKER ENVELOPE ---
-        // Momentary action: only active while your foot is holding it down
         bool currentFbState = digitalRead(FEEDBACK_BUTTON_PIN);
-        
-        if (currentFbState == LOW) { 
-            feedbackRamp += 0.01f; // Swell attack (approx 500ms fade-in)
+      if (currentFbState == LOW) { 
+            feedbackRamp = feedbackRamp + 0.01f; // Replaced += 
             if (feedbackRamp > 1.0f) feedbackRamp = 1.0f;
         } else { 
-            feedbackRamp -= 0.02f; // Fade out release (approx 250ms decay)
+            feedbackRamp = feedbackRamp - 0.02f; // Replaced -= 
             if (feedbackRamp < 0.0f) feedbackRamp = 0.0f;
         }
     
-
-
-        // --- 4. WHAMMY POTENTIOMETER LOGIC ---
         filterPB.update();
-        
-        // 1. Get the raw 12-bit hardware reading (0 to 4095)
         analog_t raw12 = filterPB.getValue(); 
-        
-        // 2. "Stretch" it to the 14-bit MIDI scale (0 to 16383)
         analog_t raw14 = map(raw12, 0, 4095, 0, 16383);
-        
-        // 3. Pass the stretched 14-bit value into your deadzone math
         analog_t calibratedMidi = map_PB_Full(raw14);
 
-        // Send MIDI ONLY if the pedal actually moved!
         if (calibratedMidi != lastMidiSent) {
             Control_Surface.sendPitchBend(Channel_1, calibratedMidi);
             lastMidiSent = calibratedMidi;
         }
 
-        // --- LOW BOUNDARY (HEEL DOWN) ---
         if (calibratedMidi == 0) {
-            if (!lockedAtMin) {
-                lockedAtMin = true;
-                Serial.println("[LIMIT: MIN]");
-            }
+            if (!lockedAtMin) { lockedAtMin = true; Serial.println("[LIMIT: MIN]"); }
         } else { lockedAtMin = false; }
 
-        // --- HIGH BOUNDARY (TOE DOWN) ---
         if (calibratedMidi == 16383) { 
-            if (!lockedAtMax) {
-                lockedAtMax = true;
-                Serial.println("[LIMIT: MAX]");
-            }
+            if (!lockedAtMax) { lockedAtMax = true; Serial.println("[LIMIT: MAX]"); }
         } else { lockedAtMax = false; }
 
-        // --- RE-CENTERING LOGIC ---
         if (calibratedMidi == 8192 && PBwasOffCenter) {
             PBwasOffCenter = false;
             Serial.println("[FORCE MIDI CENTER]");
         }
 
-        // --- 5. DYNAMIC PITCH SHIFT MATH ---
         int safeIndex = constrain(calibratedMidi, 0, 16383);
         pitchShiftFactor = pitchShiftLUT[safeIndex];
           
-        
-        //debugPrint();
-        vTaskDelay(pdMS_TO_TICKS(5)); // Yield to RTOS scheduler
+        vTaskDelay(pdMS_TO_TICKS(5)); 
     }
 }
 
 void setup() {
-
     Serial.begin(SERIAL_BAUDRATE);
 
-    // Wait up to 4 seconds for the Serial Monitor to physically open on the PC
     uint32_t startWait = millis();
     while (!Serial && (millis() - startWait < 4000));
 
     Serial.println("--- SYSTEM BOOTING ---");
+
+    // --- 1. TURN ON SCREEN HARDWARE ---
+    pinMode(15, OUTPUT); 
+    digitalWrite(15, HIGH);
+    
+    pinMode(38, OUTPUT); 
+    digitalWrite(38, HIGH);
+
+    // --- 2. INITIALIZE TFT ---
+    tft.init();
+    tft.setRotation(1); 
+    
+    // --- 3. DRAW THE UI ---
+    tft.fillScreen(TFT_WHITE);              
+    tft.setTextColor(TFT_BLACK, TFT_WHITE); 
+    tft.setTextDatum(MC_DATUM);             
+    tft.setTextSize(4);                     
+
+    tft.drawString("HELLO", tft.width() / 2, tft.height() / 2, 1); 
+
+    Serial.println("Screen Initialized and HELLO drawn!");
 
     btmidi.setName("Whammy_S3");
     pinMode(FREEZE_BUTTON_PIN, INPUT_PULLUP);
@@ -521,7 +448,6 @@ void setup() {
     Control_Surface.sendPitchBend(Channel_1, 8192);
     lastMidiSent = 8192;
 
-
     i2s_config_t i2c = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
         .sample_rate = SAMPLING_FREQUENCY,
@@ -532,16 +458,14 @@ void setup() {
         .dma_buf_len = HOP_SIZE
     };
 
-
     i2s_driver_install(I2S_NUM_0, &i2c, 4, &i2s_event_queue);
 
     i2s_pin_config_t pin_config = {
-        .bck_io_num = 14,   // Replace with your BCLK pin
-        .ws_io_num = 15,    // Replace with your LRCK/WS pin
-        .data_out_num = 16, // Replace with your DAC Data pin
-        .data_in_num = 17   // Replace with your ADC Data pin
+        .bck_io_num = 14,   
+        .ws_io_num = 4,    
+        .data_out_num = 16, 
+        .data_in_num = 17   
     };
-
 
     i2s_set_pin(I2S_NUM_0, &pin_config);
     initTrigLUT();
@@ -549,8 +473,8 @@ void setup() {
 
     xTaskCreatePinnedToCore(MidiTask, "Midi", 8192, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES - 1, NULL, 1);
-
 }
 
-    void loop() {
-    }
+void loop() {
+    // The main loop is empty because all the work is done in the RTOS tasks
+}

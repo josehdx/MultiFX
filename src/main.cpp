@@ -14,13 +14,27 @@
 // This executes at the OS level BEFORE Arduino or setup() even exist!
 // It is the absolute fastest way software can intervene after a hardware reset.
 void __attribute__((constructor)) pre_boot_kill_switch() {
+    // 1. Kill Backlight
     gpio_set_direction(GPIO_NUM_38, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NUM_38, 0); // KILL BACKLIGHT INSTANTLY
+    gpio_set_level(GPIO_NUM_38, 0); 
+    
+    // 2. Kill Screen Power
+    gpio_set_direction(GPIO_NUM_15, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_15, 0);
+    
+    // 3. Force Hardware Reset on the LCD chip
+    gpio_set_direction(GPIO_NUM_5, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_5, 0);
 }
 
 /// --- TYPE DEFINITIONS & GLOBALS ---
 i2s_chan_handle_t tx_chan;
 i2s_chan_handle_t rx_chan;
+
+// --- SLEEP CONFIGURATION ---
+unsigned long lastActivityTime = 0;
+const unsigned long SLEEP_TIMEOUT_MS = 120000; // 2 Minutes
+bool isSleeping = false;
 
 // --- TFT DISPLAY & SPRITE OBJECTS ---
 TFT_eSPI tft = TFT_eSPI();
@@ -104,6 +118,35 @@ analog_t map_PB_Full(analog_t raw) {
     if (raw <= PBcenter - PBdeadzone) { PBwasOffCenter = true; return map(raw, PBminimumValue, PBcenter - PBdeadzone, 0, 8191); }
     else if (raw >= PBcenter + PBdeadzone) { PBwasOffCenter = true; return map(raw, PBcenter + PBdeadzone, PBmaximumValue, 8191, 16383); }
     else { return 8192; }
+}
+
+void goToLightSleep() {
+    Serial.println("Entering Light Sleep...");
+    
+    // 1. Shut down the screen hardware to save power
+    digitalWrite(38, LOW);  // Backlight OFF
+    digitalWrite(15, LOW);  // Screen Power OFF
+    
+    // 2. Configure the Boot Button (GPIO 0) as the wakeup trigger
+    // LOW level triggers wakeup because the button shorts to GND
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); 
+    
+    // 3. Enter Light Sleep
+    esp_light_sleep_start();
+
+    // --- CODE PAUSES HERE UNTIL WOKEN UP ---
+
+  // 4. Recovery sequence after waking up
+    lastActivityTime = millis();
+    pinMode(15, OUTPUT); digitalWrite(15, HIGH); // Power to screen
+    
+    tft.init(); 
+    forceUIUpdate = true;
+    delay(120); // Let hardware settle
+    
+    pinMode(38, OUTPUT);    // Ensure pin is output
+    digitalWrite(38, HIGH); // Lights on!
+    Serial.println("System Woken Up!");
 }
 
 void calibrateCenterAndDeadzone() {
@@ -360,6 +403,16 @@ void updateDisplay() {
         spr.drawString("* FROZEN *", spr.width() / 2, spr.height() - 40);
     }
     
+// ---  BLUETOOTH STATUS LABEL ---
+    spr.setTextSize(2); // Slightly smaller for the bottom status bar
+    if (btmidi.isConnected()) {
+        spr.setTextColor(TFT_GREEN, TFT_BLACK);
+        spr.drawString("BT: Connected", spr.width() / 2, spr.height() - 20);
+    } else {
+        spr.setTextColor(TFT_YELLOW, TFT_BLACK);
+        spr.drawString("BT: Waiting", spr.width() / 2, spr.height() - 20);
+    }
+
     spr.pushSprite(0, 0); 
 }
 
@@ -376,9 +429,43 @@ void DisplayTask(void * pvParameters) {
 
 // --- CORE 0: MIDI CONTROL TASK (Priority 2) ---
 void MidiTask(void * pvParameters) {
+    static bool lastBtState = false; 
+    lastActivityTime = millis(); 
+
     for(;;) {
+      
+        if (pitchShiftLUT[8192] == 0) { 
+            vTaskDelay(pdMS_TO_TICKS(100)); 
+            continue; 
+        }
         Control_Surface.loop();
+
+        bool btConnected = btmidi.isConnected();
         
+        // --- 1. DETECT BLUETOOTH CHANGES ---
+        if (btConnected != lastBtState) {
+            forceUIUpdate = true;
+            lastBtState = btConnected;
+            lastActivityTime = millis(); // Reset timer on connection change
+        }
+
+        // --- 2. INACTIVITY / SLEEP LOGIC ---
+        // Only attempt sleep if NOT connected to Bluetooth
+        if (!btConnected && (millis() - lastActivityTime > SLEEP_TIMEOUT_MS)) {
+            goToLightSleep();
+        }
+
+    
+        // --- 4. RESET TIMER ON BUTTON PRESSES ---
+        if (digitalRead(CAROUSEL_BUTTON_PIN) == LOW || 
+            digitalRead(FREEZE_BUTTON_PIN) == LOW || 
+            digitalRead(INTERVAL_BUTTON_PIN) == LOW || 
+            digitalRead(FEEDBACK_BUTTON_PIN) == LOW) {
+            lastActivityTime = millis(); // Reset timer!
+        }
+
+
+
         // --- 1. SMART CAROUSEL LOGIC ---
         bool currentCarouselState = digitalRead(CAROUSEL_BUTTON_PIN);
         
@@ -395,6 +482,7 @@ void MidiTask(void * pvParameters) {
 
                 isHarmonizerMode = false;
                 isCapoMode = false;
+                isFeedbackActive = false; 
                 feedbackRamp = 0.0f;
                 isFrozen = false; 
 
@@ -466,23 +554,26 @@ void MidiTask(void * pvParameters) {
             if (feedbackRamp < 0.0f) feedbackRamp = 0.0f;
         }
     
-        // --- 5. EXPRESSION PEDAL LOGIC ---
+       // --- 5. UNIFIED EXPRESSION PEDAL & ACTIVITY LOGIC ---
         filterPB.update();
         analog_t raw12 = filterPB.getValue(); 
         analog_t raw14 = map(raw12, 0, 4095, 0, 16383);
         analog_t calibratedMidi = map_PB_Full(raw14);
 
         if (calibratedMidi != lastMidiSent) {
+            lastActivityTime = millis(); 
             Control_Surface.sendPitchBend(Channel_1, calibratedMidi);
             lastMidiSent = calibratedMidi;
-        }
 
-        int safeIndex = constrain(calibratedMidi, 0, 16383);
-        pitchShiftFactor = pitchShiftLUT[safeIndex];
+            int safeIndex = constrain(calibratedMidi, 0, 16383);
+            pitchShiftFactor = pitchShiftLUT[safeIndex];
+            
+        }
 
         vTaskDelay(pdMS_TO_TICKS(5)); 
     }
 }
+
 
 void init_i2s_modern() {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);

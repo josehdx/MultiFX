@@ -5,9 +5,18 @@
 #include <dsps_fft2r.h>   
 #include <dsps_wind.h>
 #include <driver/i2s_std.h> 
+#include "driver/gpio.h" // <-- ADDED FOR LOW-LEVEL BARE-METAL CONTROL
 #include "freertos/FreeRTOS.h"
 #include "freertos/stream_buffer.h"
 #include "dsps_mul.h"
+
+// --- BARE-METAL PRE-BOOT ASSASSIN ---
+// This executes at the OS level BEFORE Arduino or setup() even exist!
+// It is the absolute fastest way software can intervene after a hardware reset.
+void __attribute__((constructor)) pre_boot_kill_switch() {
+    gpio_set_direction(GPIO_NUM_38, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_38, 0); // KILL BACKLIGHT INSTANTLY
+}
 
 /// --- TYPE DEFINITIONS & GLOBALS ---
 i2s_chan_handle_t tx_chan;
@@ -60,7 +69,7 @@ int activeEffectMode = 0; // 0=WHAMMY, 1=FREEZE, 2=FEEDBACK, 3=HARMONY, 4=CAPO
 
 float effectMemory[5] = {
     12.0f,  // Memory Slot 0: Whammy
-    12.0f,  // Memory Slot 1: Freeze (Pitch-shift your frozen pad!)
+    12.0f,  // Memory Slot 1: Freeze
     12.0f,  // Memory Slot 2: Feedback
     12.0f,  // Memory Slot 3: Harmony
     -2.0f   // Memory Slot 4: Capo
@@ -299,7 +308,6 @@ void updateDisplay() {
     spr.fillSprite(TFT_BLACK); 
     spr.setTextDatum(MC_DATUM);
 
-    // 1. Draw Active Mode
     spr.setTextSize(4);
     switch(activeEffectMode) {
         case 0:
@@ -324,7 +332,6 @@ void updateDisplay() {
             break;
     }
 
-    // 2. Draw Pitch Shift Value
     spr.setTextColor(TFT_WHITE, TFT_BLACK);
     float displayVal = effectMemory[activeEffectMode];
 
@@ -347,7 +354,6 @@ void updateDisplay() {
         spr.drawString(intervalStr, spr.width() / 2, spr.height() / 2);
     }
 
-    // 3. Draw Freeze Tag (Hide if already in explicit FREEZE mode)
     spr.setTextSize(3);
     if (isFrozen && activeEffectMode != 1) {
         spr.setTextColor(TFT_CYAN, TFT_BLACK);
@@ -364,7 +370,7 @@ void DisplayTask(void * pvParameters) {
             updateDisplay();
             forceUIUpdate = false;
         }
-        vTaskDelay(pdMS_TO_TICKS(10)); // Yields CPU so MIDI can run
+        vTaskDelay(pdMS_TO_TICKS(10)); 
     }
 }
 
@@ -387,17 +393,15 @@ void MidiTask(void * pvParameters) {
                 activeEffectMode++;
                 if (activeEffectMode > 4) activeEffectMode = 0;
 
-                // Turn off active modifiers
                 isHarmonizerMode = false;
                 isCapoMode = false;
                 feedbackRamp = 0.0f;
                 isFrozen = false; 
 
-                // Turn on the new mode
                 switch(activeEffectMode) {
                     case 0: break; 
                     case 1: isFrozen = true; break;
-                    case 2: isFeedbackActive = true; break; // <--- TURN TOGGLE ON
+                    case 2: isFeedbackActive = true; break; 
                     case 3: isHarmonizerMode = true; break;
                     case 4: isCapoMode = true; break;
                 }
@@ -410,7 +414,7 @@ void MidiTask(void * pvParameters) {
             }
 
             updateLUT();
-            forceUIUpdate = true; // Alerts the Display Task!
+            forceUIUpdate = true; 
             vTaskDelay(pdMS_TO_TICKS(50)); 
         }
         lastCarouselState = currentCarouselState;
@@ -447,16 +451,13 @@ void MidiTask(void * pvParameters) {
 
         // --- 4. FEEDBACK TOGGLE & SWELL LOGIC ---
         bool currentFbState = digitalRead(FEEDBACK_BUTTON_PIN);
-        
-        // Listen for the press-and-release (Toggle)
         if (currentFbState == LOW && lastFbState == HIGH) {
-            isFeedbackActive = !isFeedbackActive; // Flip the state!
+            isFeedbackActive = !isFeedbackActive; 
             forceUIUpdate = true;
             vTaskDelay(pdMS_TO_TICKS(50)); 
         }
         lastFbState = currentFbState;
 
-        // Apply the smooth audio fade based on the toggle state
         if (isFeedbackActive) { 
             feedbackRamp = feedbackRamp + 0.01f; 
             if (feedbackRamp > 1.0f) feedbackRamp = 1.0f;
@@ -479,7 +480,6 @@ void MidiTask(void * pvParameters) {
         int safeIndex = constrain(calibratedMidi, 0, 16383);
         pitchShiftFactor = pitchShiftLUT[safeIndex];
 
-        // Notice: No updateDisplay() here anymore!
         vTaskDelay(pdMS_TO_TICKS(5)); 
     }
 }
@@ -508,25 +508,28 @@ void init_i2s_modern() {
 }
 
 void setup() {
+    // 1. Double ensure clamp is applied here as well (redundancy)
+    pinMode(38, OUTPUT); digitalWrite(38, LOW); 
+    pinMode(15, OUTPUT); digitalWrite(15, HIGH); 
+
     Serial.begin(SERIAL_BAUDRATE);
 
-    // 1. Manually force the backlight OFF (Library can't override this now!)
-    pinMode(15, OUTPUT); digitalWrite(15, HIGH); 
-    pinMode(38, OUTPUT); digitalWrite(38, LOW); 
-
-    // 2. Init and draw everything in the dark
+    // 2. Initialize the screen quietly in the dark
     tft.init();
     tft.setRotation(1); 
     spr.createSprite(tft.width(), tft.height());
 
+    // 3. Wipe the leftover memory clean and draw the boot text
     tft.fillScreen(TFT_BLACK);
     tft.setTextDatum(MC_DATUM);
     tft.setTextSize(3);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.drawString("BOOTING...", tft.width() / 2, tft.height() / 2);
 
-    // 3. Give the LCD RAM 50ms to settle, THEN turn the lights on!
-    delay(50);
+    // 4. ST7789 Requirement: Wait for the chip to settle
+    delay(120);
+
+    // 5. NOW turn on the real backlight! (Clean pop-in)
     digitalWrite(38, HIGH);
 
     btmidi.setName("Whammy_S3");
@@ -548,9 +551,8 @@ void setup() {
     initTrigLUT();
     updateLUT();
 
-    // --- TASK CREATION: Notice the different priorities! ---
-    xTaskCreatePinnedToCore(DisplayTask, "Display", 8192, NULL, 1, NULL, 0); // Priority 1
-    xTaskCreatePinnedToCore(MidiTask, "Midi", 8192, NULL, 2, NULL, 0);       // Priority 2
+    xTaskCreatePinnedToCore(DisplayTask, "Display", 8192, NULL, 1, NULL, 0); 
+    xTaskCreatePinnedToCore(MidiTask, "Midi", 8192, NULL, 2, NULL, 0);       
     xTaskCreatePinnedToCore(AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES - 1, NULL, 1);
 }
 

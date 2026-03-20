@@ -15,13 +15,13 @@ i2s_chan_handle_t rx_chan;
 
 // --- TFT DISPLAY & SPRITE OBJECTS ---
 TFT_eSPI tft = TFT_eSPI();
-TFT_eSprite spr = TFT_eSprite(&tft); 
+TFT_eSprite spr = TFT_eSprite(&tft); // The invisible off-screen canvas!
 volatile bool forceUIUpdate = true; 
 
 // --- THE LOOKUP TABLE ---
 float pitchShiftLUT[16384]; 
 
-// --- Configuration & Constants ---
+// --- GitHub Configuration & Constants ---
 #define SAMPLES 512             
 #define HOP_SIZE 64            
 #define SAMPLING_FREQUENCY 96000 
@@ -56,11 +56,11 @@ unsigned long carouselPressedTime = 0;
 unsigned long intervalButtonPressedTime = 0; 
 
 // --- INDEPENDENT EFFECT MEMORY BANKS ---
-int activeEffectMode = 0; // 0=WHAMMY, 1=FREEZE, 2=FEEDBACK, 3=HARMONY, 4=CAPO
+int activeEffectMode = 0; // 0=WHAMMY, 1=INTERVAL, 2=FEEDBACK, 3=HARMONY, 4=CAPO
 
 float effectMemory[5] = {
     12.0f,  // Memory Slot 0: Whammy
-    12.0f,  // Memory Slot 1: Freeze (Pitch-shift your frozen pad!)
+    12.0f,  // Memory Slot 1: Interval
     12.0f,  // Memory Slot 2: Feedback
     12.0f,  // Memory Slot 3: Harmony
     -2.0f   // Memory Slot 4: Capo
@@ -68,7 +68,6 @@ float effectMemory[5] = {
 
 volatile bool isHarmonizerMode = false; 
 volatile float feedbackRamp = 0.0f;
-volatile bool isFeedbackActive = false;
 volatile bool isCapoMode = false;
 
 BluetoothMIDI_Interface btmidi;
@@ -162,7 +161,7 @@ inline float IRAM_ATTR fast_cos(float phase) {
     return fast_sin(phase + (PI / 2.0f));
 }
 
-// --- CORE 1: AUDIO DSP TASK (Priority 24) ---
+// --- CORE 1: AUDIO DSP TASK ---
 void IRAM_ATTR AudioDSPTask(void * pvParameters) { 
     esp_err_t ret = dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
     if (ret != ESP_OK) { vTaskDelete(NULL); }
@@ -294,12 +293,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     }
 }
 
-// --- SCREEN RENDER LOGIC ---
+// --- ABSOLUTE ZERO-FLICKER SPRITE LOGIC ---
 void updateDisplay() {
+    // 1. Wipe the invisible canvas clean
     spr.fillSprite(TFT_BLACK); 
     spr.setTextDatum(MC_DATUM);
 
-    // 1. Draw Active Mode
+    // 2. Draw Active Carousel Mode to the canvas
     spr.setTextSize(4);
     switch(activeEffectMode) {
         case 0:
@@ -307,15 +307,15 @@ void updateDisplay() {
             spr.drawString("WHAMMY", spr.width() / 2, 40);
             break;
         case 1:
-            spr.setTextColor(TFT_CYAN, TFT_BLACK);
-            spr.drawString("FREEZE", spr.width() / 2, 40);
+            spr.setTextColor(TFT_YELLOW, TFT_BLACK);
+            spr.drawString("INTERVAL", spr.width() / 2, 40);
             break;
         case 2:
             spr.setTextColor(TFT_RED, TFT_BLACK);
             spr.drawString("FEEDBACK", spr.width() / 2, 40);
             break;
         case 3:
-            spr.setTextColor(TFT_MAGENTA, TFT_BLACK);
+            spr.setTextColor(TFT_CYAN, TFT_BLACK);
             spr.drawString("HARMONY", spr.width() / 2, 40);
             break;
         case 4:
@@ -324,11 +324,12 @@ void updateDisplay() {
             break;
     }
 
-    // 2. Draw Pitch Shift Value
+    // 3. Draw Pitch Shift Value to the canvas
     spr.setTextColor(TFT_WHITE, TFT_BLACK);
     float displayVal = effectMemory[activeEffectMode];
 
     if (activeEffectMode == 0) { 
+        // WHAMMY MODE (Dual Row)
         spr.setTextSize(4); 
         char topStr[16];
         char botStr[16];
@@ -341,39 +342,30 @@ void updateDisplay() {
         spr.drawString(botStr, spr.width() / 2, (spr.height() / 2) + 18);
 
     } else { 
+        // ALL OTHER MODES (Single Row)
         spr.setTextSize(5); 
         char intervalStr[16];
         sprintf(intervalStr, "%s%.1f", displayVal > 0 ? "+" : "", displayVal);
         spr.drawString(intervalStr, spr.width() / 2, spr.height() / 2);
     }
 
-    // 3. Draw Freeze Tag (Hide if already in explicit FREEZE mode)
+    // 4. Draw Freeze Tag to the canvas
     spr.setTextSize(3);
-    if (isFrozen && activeEffectMode != 1) {
+    if (isFrozen) {
         spr.setTextColor(TFT_CYAN, TFT_BLACK);
         spr.drawString("* FROZEN *", spr.width() / 2, spr.height() - 40);
     }
     
+    // 5. PUSH TO SCREEN! (Instantly blasts the complete image to the display)
     spr.pushSprite(0, 0); 
 }
 
-// --- CORE 0: DISPLAY BACKGROUND TASK (Priority 1) ---
-void DisplayTask(void * pvParameters) {
-    for(;;) {
-        if (forceUIUpdate) {
-            updateDisplay();
-            forceUIUpdate = false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10)); // Yields CPU so MIDI can run
-    }
-}
-
-// --- CORE 0: MIDI CONTROL TASK (Priority 2) ---
+// --- CORE 0: MIDI & UI CONTROL TASK ---
 void MidiTask(void * pvParameters) {
     for(;;) {
         Control_Surface.loop();
         
-        // --- 1. SMART CAROUSEL LOGIC ---
+        // --- 1. SMART CAROUSEL LOGIC (IO14) ---
         bool currentCarouselState = digitalRead(CAROUSEL_BUTTON_PIN);
         
         if (currentCarouselState == LOW && lastCarouselState == HIGH) {
@@ -387,17 +379,14 @@ void MidiTask(void * pvParameters) {
                 activeEffectMode++;
                 if (activeEffectMode > 4) activeEffectMode = 0;
 
-                // Turn off active modifiers
                 isHarmonizerMode = false;
                 isCapoMode = false;
                 feedbackRamp = 0.0f;
-                isFrozen = false; 
 
-                // Turn on the new mode
                 switch(activeEffectMode) {
                     case 0: break; 
-                    case 1: isFrozen = true; break;
-                    case 2: isFeedbackActive = true; break; // <--- TURN TOGGLE ON
+                    case 1: break;
+                    case 2: feedbackRamp = 1.0f; break;
                     case 3: isHarmonizerMode = true; break;
                     case 4: isCapoMode = true; break;
                 }
@@ -410,7 +399,7 @@ void MidiTask(void * pvParameters) {
             }
 
             updateLUT();
-            forceUIUpdate = true; // Alerts the Display Task!
+            forceUIUpdate = true; 
             vTaskDelay(pdMS_TO_TICKS(50)); 
         }
         lastCarouselState = currentCarouselState;
@@ -424,7 +413,7 @@ void MidiTask(void * pvParameters) {
         }
         lastButtonState = currentButtonState;
 
-        // --- 3. DEDICATED INTERVAL BUTTON ---
+        // --- 3. DEDICATED INTERVAL BUTTON (Pin 43) ---
         bool currentIntervalButtonState = digitalRead(INTERVAL_BUTTON_PIN);
         if (currentIntervalButtonState == LOW && lastIntervalButtonState == HIGH) {
             intervalButtonPressedTime = millis();
@@ -445,24 +434,21 @@ void MidiTask(void * pvParameters) {
         }
         lastIntervalButtonState = currentIntervalButtonState;
 
-        // --- 4. FEEDBACK TOGGLE & SWELL LOGIC ---
+        // --- 4. FEEDBACK SWELL LOGIC ---
         bool currentFbState = digitalRead(FEEDBACK_BUTTON_PIN);
-        
-        // Listen for the press-and-release (Toggle)
-        if (currentFbState == LOW && lastFbState == HIGH) {
-            isFeedbackActive = !isFeedbackActive; // Flip the state!
+        if (currentFbState != lastFbState) {
             forceUIUpdate = true;
-            vTaskDelay(pdMS_TO_TICKS(50)); 
+            lastFbState = currentFbState;
         }
-        lastFbState = currentFbState;
 
-        // Apply the smooth audio fade based on the toggle state
-        if (isFeedbackActive) { 
+        if (currentFbState == LOW) { 
             feedbackRamp = feedbackRamp + 0.01f; 
             if (feedbackRamp > 1.0f) feedbackRamp = 1.0f;
         } else { 
-            feedbackRamp = feedbackRamp - 0.02f; 
-            if (feedbackRamp < 0.0f) feedbackRamp = 0.0f;
+            if (activeEffectMode != 2) { 
+                feedbackRamp = feedbackRamp - 0.02f; 
+                if (feedbackRamp < 0.0f) feedbackRamp = 0.0f;
+            }
         }
     
         // --- 5. EXPRESSION PEDAL LOGIC ---
@@ -479,7 +465,12 @@ void MidiTask(void * pvParameters) {
         int safeIndex = constrain(calibratedMidi, 0, 16383);
         pitchShiftFactor = pitchShiftLUT[safeIndex];
 
-        // Notice: No updateDisplay() here anymore!
+        // --- 6. TRIGGER UI REDRAW ---
+        if (forceUIUpdate) {
+            updateDisplay();
+            forceUIUpdate = false;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(5)); 
     }
 }
@@ -510,13 +501,13 @@ void init_i2s_modern() {
 void setup() {
     Serial.begin(SERIAL_BAUDRATE);
 
-    // 1. Manually force the backlight OFF (Library can't override this now!)
+    // --- SCREEN HARDWARE INIT ---
     pinMode(15, OUTPUT); digitalWrite(15, HIGH); 
-    pinMode(38, OUTPUT); digitalWrite(38, LOW); 
-
-    // 2. Init and draw everything in the dark
+    pinMode(38, OUTPUT); digitalWrite(38, HIGH);
     tft.init();
     tft.setRotation(1); 
+    
+    // Create the invisible Sprite canvas in RAM!
     spr.createSprite(tft.width(), tft.height());
 
     tft.fillScreen(TFT_BLACK);
@@ -524,10 +515,6 @@ void setup() {
     tft.setTextSize(3);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.drawString("BOOTING...", tft.width() / 2, tft.height() / 2);
-
-    // 3. Give the LCD RAM 50ms to settle, THEN turn the lights on!
-    delay(50);
-    digitalWrite(38, HIGH);
 
     btmidi.setName("Whammy_S3");
     pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP);
@@ -548,9 +535,7 @@ void setup() {
     initTrigLUT();
     updateLUT();
 
-    // --- TASK CREATION: Notice the different priorities! ---
-    xTaskCreatePinnedToCore(DisplayTask, "Display", 8192, NULL, 1, NULL, 0); // Priority 1
-    xTaskCreatePinnedToCore(MidiTask, "Midi", 8192, NULL, 2, NULL, 0);       // Priority 2
+    xTaskCreatePinnedToCore(MidiTask, "Midi", 8192, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES - 1, NULL, 1);
 }
 

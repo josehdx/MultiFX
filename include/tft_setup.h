@@ -26,8 +26,8 @@
 #define TFT_D6   47
 #define TFT_D7   48
 
-#define TFT_BL   38
-#define TFT_BACKLIGHT_ON 1
+//#define TFT_BL   38
+//#define TFT_BACKLIGHT_ON 1
 
 #define LOAD_GLCD
 #define LOAD_FONT2

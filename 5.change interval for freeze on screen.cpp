@@ -510,23 +510,23 @@ void init_i2s_modern() {
 void setup() {
     Serial.begin(SERIAL_BAUDRATE);
 
-    // 1. Manually force the backlight OFF (Library can't override this now!)
-    pinMode(15, OUTPUT); digitalWrite(15, HIGH); 
-    pinMode(38, OUTPUT); digitalWrite(38, LOW); 
+    // 1. Turn on display power, but FORCE BACKLIGHT OFF
+    pinMode(15, OUTPUT); digitalWrite(15, HIGH); // Screen Power
+    pinMode(38, OUTPUT); digitalWrite(38, LOW);  // Backlight OFF
 
-    // 2. Init and draw everything in the dark
+    // 2. Initialize the screen quietly in the dark
     tft.init();
     tft.setRotation(1); 
     spr.createSprite(tft.width(), tft.height());
 
+    // 3. Wipe the leftover memory clean and draw the boot text
     tft.fillScreen(TFT_BLACK);
     tft.setTextDatum(MC_DATUM);
     tft.setTextSize(3);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.drawString("BOOTING...", tft.width() / 2, tft.height() / 2);
 
-    // 3. Give the LCD RAM 50ms to settle, THEN turn the lights on!
-    delay(50);
+    // 4. NOW turn on the backlight! (Clean fade-in)
     digitalWrite(38, HIGH);
 
     btmidi.setName("Whammy_S3");

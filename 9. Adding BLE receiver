@@ -35,10 +35,9 @@ i2s_chan_handle_t rx_chan;
 // --- DUAL SLEEP CONFIGURATION ---
 unsigned long lastActivityTime = 0;       // CPU Sleep Timer (2 Mins)
 unsigned long lastScreenActivityTime = 0; // Screen Timeout Timer (5 Mins)
-const unsigned long LIGHT_SLEEP_TIMEOUT = 60000; 
-const unsigned long SCREEN_OFF_TIMEOUT = 120000;  
+const unsigned long LIGHT_SLEEP_TIMEOUT = 120000; // 2 Minutes
+const unsigned long SCREEN_OFF_TIMEOUT = 300000;  // 5 Minutes
 bool isScreenOff = false;
-TaskHandle_t audioTaskHandle = NULL;
 
 // --- TFT DISPLAY & SPRITE OBJECTS ---
 TFT_eSPI tft = TFT_eSPI();
@@ -91,7 +90,7 @@ float effectMemory[5] = {
     12.0f,  // Memory Slot 0: Whammy
     12.0f,  // Memory Slot 1: Freeze
     12.0f,  // Memory Slot 2: Feedback
-    -5.0f,  // Memory Slot 3: Harmony
+    12.0f,  // Memory Slot 3: Harmony
     -2.0f   // Memory Slot 4: Capo
 };
 
@@ -135,55 +134,26 @@ void goToLightSleep() {
     digitalWrite(15, LOW);  // Screen Power OFF
     
     // 2. Configure the Boot Button (GPIO 0) as the wakeup trigger
+    // LOW level triggers wakeup because the button shorts to GND
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); 
     
-    // --- NEW: Force the internal pull-up resistor to stay ON during sleep ---
-    rtc_gpio_pullup_en(GPIO_NUM_0); 
-    rtc_gpio_pulldown_dis(GPIO_NUM_0);
+    // 3. Enter Light Sleep
+    esp_light_sleep_start();
+    rtc_gpio_deinit(GPIO_NUM_0); // CRITICAL: Releases pin 0 from RTC mode
+    pinMode(0, INPUT_PULLUP);    // Re-establish as standard input
 
-    // 3. Kill I2S Interrupts before sleep
-    if (audioTaskHandle != NULL) {
-        vTaskSuspend(audioTaskHandle); // Safely pause the DSP loop
-    }
-    i2s_channel_disable(tx_chan);      // Stop transmitting audio
-    i2s_channel_disable(rx_chan);      // Stop receiving audio
-    
-    // --- 4. THE FIX: TRAP THE ESP32 IN SLEEP ---
-    // Background tasks (like Bluetooth advertising or USB noise) will try to wake the 
-    // processor instantly. This loop forces it back to sleep unless the Boot button (EXT0) was pressed.
-    esp_sleep_wakeup_cause_t wakeup_reason;
-    do {
-        esp_light_sleep_start();
-        wakeup_reason = esp_sleep_get_wakeup_cause();
-    } while (wakeup_reason != ESP_SLEEP_WAKEUP_EXT0);
+    // --- CODE PAUSES HERE UNTIL WOKEN UP ---
 
-    // --- CODE PAUSES HERE UNTIL WOKEN UP BY THE BOOT BUTTON ---
-
-    // 5. Wake up! Instantly restore Audio
-    i2s_channel_enable(tx_chan);
-    i2s_channel_enable(rx_chan);
-    if (audioTaskHandle != NULL) {
-        vTaskResume(audioTaskHandle); // Unpause the DSP loop
-    }
-
-    // 6. Recovery sequence 
-    vTaskDelay(pdMS_TO_TICKS(200)); // Ignore the physical button "bounce"
-    rtc_gpio_deinit(GPIO_NUM_0);    // Releases pin 0 from RTC mode
-    pinMode(0, INPUT_PULLUP);       // Re-establish as standard input
-
+  // 4. Recovery sequence after waking up
+    lastActivityTime = millis();
     pinMode(15, OUTPUT); digitalWrite(15, HIGH); // Power to screen
+    
     tft.init(); 
     forceUIUpdate = true;
     delay(120); // Let hardware settle
     
-    pinMode(38, OUTPUT);    
+    pinMode(38, OUTPUT);    // Ensure pin is output
     digitalWrite(38, HIGH); // Lights on!
-    
-    // Reset all timers and state trackers
-    isScreenOff = false; 
-    lastActivityTime = millis();
-    lastScreenActivityTime = millis();
-    
     Serial.println("System Woken Up!");
 }
 
@@ -494,7 +464,6 @@ void MidiTask(void * pvParameters) {
     lastScreenActivityTime = millis(); 
 
     for(;;) {
-
         if (pitchShiftLUT[8192] == 0) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
         
         // This single line now handles sending pedals AND receiving callbacks!
@@ -569,15 +538,12 @@ void MidiTask(void * pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(50)); 
         }
         lastButtonState = currentButtonState;
-    
-        // --- UNIFIED BUTTON HEARTBEAT (Fix for the Reverse Bug) ---
-        // Keeps both timers alive and wakes screen if ANY button is pressed
-        if (currentCarouselState == LOW || currentBootState == LOW || currentButtonState == LOW) {
+        
+        // Interval & Feedback Resets Timer
+        if (digitalRead(INTERVAL_BUTTON_PIN) == LOW || digitalRead(FEEDBACK_BUTTON_PIN) == LOW) {
             lastActivityTime = millis();
-            lastScreenActivityTime = millis(); // <--- Keeps screen alive!
-            if (isScreenOff) turnScreenOn();   // <--- Wakes screen up!
         }
-    
+        // --------------------------------
 
         // 4. DUAL INDEPENDENT EXPRESSION PEDAL LOGIC
         filterPB.update();
@@ -589,8 +555,8 @@ void MidiTask(void * pvParameters) {
         analog_t calibratedA = map_PB_Full(raw14_A);
         analog_t calibratedB = map_PB_Full(raw14_B);
 
-bool movedA = false; // abs((int)calibratedA - (int)lastMidiA) > 8;
-bool movedB = false; // abs((int)calibratedB - (int)lastMidiB) > 8;     
+        bool movedA = abs((int)calibratedA - (int)lastMidiA) > 8;
+        bool movedB = abs((int)calibratedB - (int)lastMidiB) > 8;
 
         if (movedA || movedB) {
             if (isScreenOff) turnScreenOn(); 
@@ -719,10 +685,7 @@ void setup() {
     pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP);
     pinMode(FREEZE_BUTTON_PIN, INPUT_PULLUP); // Now dedicated pin 2
     pinMode(0, INPUT_PULLUP); // Boot button
-
-    // --- PLACE THE OVERRIDES HERE FOR YOUR TEST ---
-    pinMode(pinPB, INPUT_PULLUP);  // Ties A0 to High to stop noise
-    pinMode(pinPB2, INPUT_PULLUP); // Ties A2 to High to stop noise
+    pinMode(3, INPUT);
     
     FilteredAnalog<>::setupADC();
   // 1. Send MIDI OUT from the ESP32 to your phone/PC
@@ -748,7 +711,7 @@ void setup() {
 
     xTaskCreatePinnedToCore(DisplayTask, "Display", 8192, NULL, 1, NULL, 0); 
     xTaskCreatePinnedToCore(MidiTask, "Midi", 8192, NULL, 2, NULL, 0);       
-    xTaskCreatePinnedToCore(AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES - 1, &audioTaskHandle, 1);
+    xTaskCreatePinnedToCore(AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES - 1, NULL, 1);
 }
 
 void loop() { }

@@ -91,7 +91,7 @@ float effectMemory[5] = {
     12.0f,  // Memory Slot 0: Whammy
     12.0f,  // Memory Slot 1: Freeze
     12.0f,  // Memory Slot 2: Feedback
-    -5.0f,  // Memory Slot 3: Harmony
+    12.0f,  // Memory Slot 3: Harmony
     -2.0f   // Memory Slot 4: Capo
 };
 

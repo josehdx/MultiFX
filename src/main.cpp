@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/stream_buffer.h"
 #include "dsps_mul.h"
+#include "driver/rtc_io.h"
 
 // --- BARE-METAL PRE-BOOT ASSASSIN ---
 // This executes at the OS level BEFORE Arduino or setup() even exist!
@@ -66,7 +67,7 @@ float frozenMag[SAMPLES / 2] = {0};
 
 // --- HARDWARE PINS (Core 0) ---
 pin_t pinPB = A0;
-pin_t pinPB2 = 2;
+pin_t pinPB2 = A2;
 const int CAROUSEL_BUTTON_PIN = 14; 
 const int FREEZE_BUTTON_PIN = 2;    
 const int INTERVAL_BUTTON_PIN = 43; 
@@ -139,6 +140,8 @@ void goToLightSleep() {
     
     // 3. Enter Light Sleep
     esp_light_sleep_start();
+    rtc_gpio_deinit(GPIO_NUM_0); // CRITICAL: Releases pin 0 from RTC mode
+    pinMode(0, INPUT_PULLUP);    // Re-establish as standard input
 
     // --- CODE PAUSES HERE UNTIL WOKEN UP ---
 
@@ -455,6 +458,9 @@ void DisplayTask(void * pvParameters) {
 // --- CORE 0: MIDI CONTROL TASK (Priority 2) ---
 void MidiTask(void * pvParameters) {
     static bool lastBtState = false; 
+    static analog_t lastMidiA = 8192; // Track Pedal A independently
+    static analog_t lastMidiB = 8192; // Track Pedal B independently
+    
     lastActivityTime = millis(); 
     lastScreenActivityTime = millis(); 
 
@@ -462,101 +468,57 @@ void MidiTask(void * pvParameters) {
         if (pitchShiftLUT[8192] == 0) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
         Control_Surface.loop();
 
-        // --- 1. CPU TIMER RESET (BLUETOOTH ONLY) ---
+        // 1. Connectivity Check
         bool btConnected = btmidi.isConnected();
         if (btConnected != lastBtState) {
             if (!isScreenOff) forceUIUpdate = true;
             lastBtState = btConnected;
-            lastActivityTime = millis(); // Resets CPU Sleep Timer
+            lastActivityTime = millis(); 
         }
 
-        // --- 2. SCREEN TIMEOUT CHECK (5 MINS) ---
+        // 2. Sleep/Timeout Logic
         if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) {
             turnScreenOff();
         }
-
-        // --- 3. LIGHT SLEEP CHECK (2 MINS - NO BT) ---
         if (!btConnected && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) {
             goToLightSleep();
-            lastScreenActivityTime = millis(); // Reset screen timer on wake
+            lastScreenActivityTime = millis(); 
         }
 
-        // --- 4. BUTTONS (NO TIMER RESETS) ---
-        // Carousel and Boot buttons process logic but do NOT wake the screen
-        bool curC = digitalRead(CAROUSEL_BUTTON_PIN);
-        if (curC == LOW && lastCarouselState == HIGH) carouselPressedTime = millis();
-        else if (curC == HIGH && lastCarouselState == LOW) {
-            unsigned long dur = millis() - carouselPressedTime;
-            if (dur < 400) activeEffectMode = (activeEffectMode + 1) % 5;
-            else effectMemory[activeEffectMode] += 1.0f;
-            updateLUT(); 
-            if (!isScreenOff) forceUIUpdate = true; 
+        // 3. Button Logic (Carousel/Boot)
+        // ... [Keep your existing button logic here] ...
+
+        // 4. DUAL INDEPENDENT EXPRESSION PEDAL LOGIC
+        filterPB.update();
+        filterPB2.update();
+
+        analog_t raw14_A = map(filterPB.getValue(), 0, 4095, 0, 16383);
+        analog_t raw14_B = map(filterPB2.getValue(), 0, 4095, 0, 16383);
+
+        analog_t calibratedA = map_PB_Full(raw14_A);
+        analog_t calibratedB = map_PB_Full(raw14_B);
+
+        // Movement Threshold: Only act if movement > 8 units (avoids micro-jitter)
+        bool movedA = abs((int)calibratedA - (int)lastMidiA) > 8;
+        bool movedB = abs((int)calibratedB - (int)lastMidiB) > 8;
+
+        if (movedA || movedB) {
+            // Wake triggers
+            if (isScreenOff) turnScreenOn(); 
+            lastScreenActivityTime = millis(); 
+
+            // Priority Logic: Use the pedal that actually moved
+            analog_t activeMidi = movedB ? calibratedB : calibratedA;
+
+            // Update Audio Engine and MIDI Output
+            pitchShiftFactor = pitchShiftLUT[constrain(activeMidi, 0, 16383)];
+            Control_Surface.sendPitchBend(Channel_1, activeMidi);
+
+            // Update individual trackers
+            lastMidiA = calibratedA;
+            lastMidiB = calibratedB;
+            lastMidiSent = activeMidi;
         }
-        lastCarouselState = curC;
-
-       bool currentBootState = digitalRead(0); // GPIO 0
-if (currentBootState == LOW && lastBootState == HIGH) {
-    bootPressedTime = millis();
-    vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
-}
-else if (currentBootState == HIGH && lastBootState == LOW) {
-    unsigned long pressDuration = millis() - bootPressedTime;
-    
-    if (pressDuration < 400) {
-        // --- SHORT PRESS LOGIC ---
-        if (isScreenOff) {
-            // Wake the screen if it was off
-            turnScreenOn();
-            lastScreenActivityTime = millis();
-        } 
-        // If screen is already on, a quick press does nothing per your request.
-    } 
-    else {
-        // --- LONG PRESS (>=400ms) LOGIC ---
-        // Decrease the interval by a factor of 1
-        effectMemory[activeEffectMode] -= 1.0f;
-        if (effectMemory[activeEffectMode] < -24.0f) {
-            effectMemory[activeEffectMode] = -24.0f;
-        }
-        
-        updateLUT();
-        if (!isScreenOff) forceUIUpdate = true;
-        
-        // Optional: Keeping the device awake if the user is interacting with intervals
-        lastActivityTime = millis();
-    }
-    vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
-}
-lastBootState = currentBootState;
-
-       // --- 5. DUAL EXPRESSION PEDAL LOGIC (THE WAKE TRIGGER) ---
-filterPB.update();
-filterPB2.update(); // Update the second pot
-
-// Get values for both
-analog_t raw14_A = map(filterPB.getValue(), 0, 4095, 0, 16383);
-analog_t raw14_B = map(filterPB2.getValue(), 0, 4095, 0, 16383);
-
-// Calibrate both to your MIDI range
-analog_t calibratedA = map_PB_Full(raw14_A);
-analog_t calibratedB = map_PB_Full(raw14_B);
-
-// Check if EITHER pot has moved significantly
-if (calibratedA != lastMidiSent || calibratedB != lastMidiSent) {
-    // Determine which one moved (for this simple logic, we prioritize B if both move)
-    analog_t finalMidi = (calibratedB != lastMidiSent) ? calibratedB : calibratedA;
-
-    // WAKE SCREEN AND RESET SCREEN TIMER
-    if (isScreenOff) turnScreenOn(); 
-    lastScreenActivityTime = millis(); 
-
-    // Send the single MIDI Pitch Bend for both
-    Control_Surface.sendPitchBend(Channel_1, finalMidi);
-    lastMidiSent = finalMidi;
-
-    // Update the Audio Engine
-    pitchShiftFactor = pitchShiftLUT[constrain(finalMidi, 0, 16383)];
-}
 
         vTaskDelay(pdMS_TO_TICKS(5)); 
     }
@@ -572,8 +534,8 @@ void init_i2s_modern() {
         .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
-            .bclk = (gpio_num_t)11, 
-            .ws   = (gpio_num_t)15,
+            .bclk = (gpio_num_t)10, 
+            .ws   = (gpio_num_t)12,
             .dout = (gpio_num_t)16,
             .din  = (gpio_num_t)17,
             .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
@@ -613,9 +575,9 @@ void setup() {
 
     btmidi.setName("Whammy_S3");
     pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP);
-    pinMode(FREEZE_BUTTON_PIN, INPUT_PULLUP);
-    pinMode(INTERVAL_BUTTON_PIN, INPUT_PULLUP);
-    pinMode(FEEDBACK_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(FREEZE_BUTTON_PIN, INPUT_PULLUP); // Now dedicated pin 2
+    pinMode(0, INPUT_PULLUP); // Boot button
+    pinMode(3, INPUT);
     
     FilteredAnalog<>::setupADC();
     Control_Surface >> pipes >> btmidi;

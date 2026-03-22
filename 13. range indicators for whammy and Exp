@@ -557,13 +557,6 @@ void updateDisplay() {
     }
 
     spr.setTextSize(3);
-    // --- NEW: FEEDBACK STACKING INDICATOR ---
-    if (isFeedbackActive && activeEffectMode != 2) {
-        spr.setTextColor(TFT_RED, TFT_BLACK);
-        spr.drawString("* SCREAMING *", spr.width() / 2, spr.height() - 70);
-    }
-    
-    // --- EXISTING FREEZE INDICATOR ---
     if (isFrozen && activeEffectMode != 1) {
         spr.setTextColor(TFT_CYAN, TFT_BLACK);
         spr.drawString("* FROZEN *", spr.width() / 2, spr.height() - 40);
@@ -767,8 +760,8 @@ void MidiTask(void * pvParameters) {
         }
 
         vTaskDelay(pdMS_TO_TICKS(5)); // <--- ADD THIS YIELD
-    } 
-} 
+    } // <--- ADD THIS BRACE (Closes the for-loop)
+} // <--- ADD THIS BRACE (Closes MidiTask)
 
 
 void init_i2s_modern() {
@@ -884,13 +877,13 @@ bool channelMessageCallback(ChannelMessage cm) {
         isFrozen = false; 
 
         // Auto-Activate the new mode
-       switch(activeEffectMode) {
-                    case 0: break; // Whammy
-                    case 1: break; // FREEZE: Now defaults to OFF 
-                    case 2: break; // FEEDBACK: Now defaults to OFF
-                    case 3: isHarmonizerMode = true; break;
-                    case 4: isCapoMode = true; break;
-                }
+        switch(activeEffectMode) {
+            case 0: break; // Whammy
+            case 1: isFrozen = true; break;
+            case 2: isFeedbackActive = true; break; 
+            case 3: isHarmonizerMode = true; break;
+            case 4: isCapoMode = true; break;
+        }
 
         // Update the audio engine and the screen
         updateLUT();

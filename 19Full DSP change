@@ -1,0 +1,441 @@
+#pragma GCC optimize ("O3")
+#include <Arduino.h>
+#include <Control_Surface.h>
+#include <TFT_eSPI.h>
+#include <driver/i2s_std.h> 
+#include "driver/gpio.h" 
+#include "freertos/FreeRTOS.h"
+#include "dsps_mul.h"
+#include "dsps_add.h"
+#include "driver/rtc_io.h"
+#include <math.h>
+
+// --- BARE-METAL PRE-BOOT ASSASSIN ---
+void __attribute__((constructor)) pre_boot_kill_switch() {
+    gpio_set_direction(GPIO_NUM_38, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_38, 0); 
+    gpio_set_direction(GPIO_NUM_15, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_15, 0);
+    gpio_set_direction(GPIO_NUM_5, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_5, 0);
+}
+
+/// --- GLOBALS & I2S ---
+i2s_chan_handle_t tx_chan;
+i2s_chan_handle_t rx_chan;
+#define SAMPLING_FREQUENCY 44100 
+#define HOP_SIZE 64            
+
+// --- TIME-DOMAIN DSP BUFFERS (PSRAM) ---
+#define MAX_BUFFER_SIZE 65536
+#define BUFFER_MASK 0xFFFF 
+float* delayBuffer = nullptr;
+float* freezeBuffer = nullptr;
+float* fbDelayBuffer = nullptr; 
+int writeIndex = 0;
+int fbDelayWriteIdx = 0;
+
+// OPTIMIZATION: DRAM_ATTR forces LUT into internal Data RAM
+#define HANN_LUT_SIZE 1024
+DRAM_ATTR float hannLUT[HANN_LUT_SIZE];
+
+// Tap States
+float tap1 = 0.0f, tap2 = 512.0f; 
+float tap1_2 = 0.0f, tap2_2 = 512.0f;
+float currentWindowSize = 1024.0f; 
+
+// --- FREEZE STATE & ALL-PASS FILTERS ---
+volatile int freezeReadIdx = 0;
+const int freezeLength = 22050; // 0.5s loop
+bool wasFrozen = false;
+volatile float freezeRamp = 0.0f;
+
+// VST Match: All-Pass Buffers for Reverb Smear
+float apf1Buffer[503] = { 0.0f };
+int apf1Idx = 0;
+float apf2Buffer[433] = { 0.0f };
+int apf2Idx = 0;
+
+// --- INTERVAL CYCLER ---
+const float intervalList[] = {-12.0f, -7.0f, -5.0f, -2.0f, 0.0f, 2.0f, 5.0f, 7.0f, 12.0f};
+int currentIntervalIdx = 8; 
+
+// --- TIMING & SLEEP ---
+unsigned long lastActivityTime = 0;
+const unsigned long LIGHT_SLEEP_TIMEOUT = 60000; 
+const unsigned long SCREEN_OFF_TIMEOUT = 120000;
+bool isScreenOff = false;
+TaskHandle_t audioTaskHandle = NULL;
+
+// --- TFT DISPLAY ---
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite spr = TFT_eSprite(&tft); 
+volatile bool forceUIUpdate = true; 
+
+// --- EFFECT STATE ---
+int activeEffectMode = 0; 
+// FIX: Index 3 correctly set to 5.0f to match VST
+float effectMemory[8] = { 12.0f, 12.0f, 12.0f, 5.0f, -2.0f, -12.0f, -12.0f, 12.0f };
+
+volatile float pitchShiftFactor = 1.0f;
+volatile bool isWhammyActive = true; 
+volatile bool isFrozen = false;
+volatile bool isHarmonizerMode = false;
+volatile bool isSynthMode = false;
+volatile bool isPadMode = false;
+volatile bool isCapoMode = false; 
+volatile bool isFeedbackActive = false;
+
+volatile float feedbackRamp = 0.0f;
+float feedbackLfoPhase = 0.0f;
+float fbHpfState = 0.0f;
+float feedbackFilter = 0.0f;
+
+volatile int latencyMode = 1; 
+const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
+
+// --- PIN ASSIGNMENTS ---
+pin_t pinPB = A0;
+pin_t pinPB2 = A2;
+const int CAROUSEL_BUTTON_PIN = 14; 
+const int FREEZE_BUTTON_PIN = 2;    
+const int INTERVAL_BUTTON_PIN = 43; 
+const int FEEDBACK_BUTTON_PIN = 44; 
+
+bool lastCarouselState = HIGH;
+bool lastFreezeBtnState = HIGH;
+bool lastIntervalBtnState = HIGH;
+bool lastFbBtnState = HIGH;
+
+analog_t PBcenter1 = 8192, PBcenter2 = 8192;
+analog_t PBdeadzone1 = 950, PBdeadzone2 = 950;
+bool PBwasOffCenter1 = false, PBwasOffCenter2 = false;
+uint16_t lastMidiSent = 8192;
+volatile float ui_audio_level = 0.0f; 
+volatile float ui_output_level = 0.0f;
+
+FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB = pinPB;
+FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
+BluetoothMIDI_Interface btmidi;
+USBMIDI_Interface usbmidi;
+MIDI_PipeFactory<4> pipes;
+
+// --- INTERPOLATION ENGINE ---
+inline float IRAM_ATTR getHermiteSample(float tapPos, float* buffer, int writeIdx) {
+    int iTap = (int)tapPos;
+    float frac = tapPos - iTap;
+    int idx0 = (writeIdx - iTap + MAX_BUFFER_SIZE) & BUFFER_MASK;
+    __builtin_prefetch(&buffer[(idx0 - 4 + MAX_BUFFER_SIZE) & BUFFER_MASK]);
+    int idx_m1 = (idx0 + 1) & BUFFER_MASK;
+    int idx1 = (idx0 - 1 + MAX_BUFFER_SIZE) & BUFFER_MASK;
+    int idx2 = (idx0 - 2 + MAX_BUFFER_SIZE) & BUFFER_MASK;
+    float y0 = buffer[idx_m1], y1 = buffer[idx0], y2 = buffer[idx1], y3 = buffer[idx2];
+    float c1 = 0.5f * (y2 - y0);
+    float c2 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
+    float c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
+    return ((c3 * frac + c2) * frac + c1) * frac + y1;
+}
+
+analog_t map_PB(analog_t raw, analog_t center, analog_t deadzone, bool &offCenterFlag) {
+    raw = constrain(raw, 0, 16383);
+    if (raw <= 150) { offCenterFlag = true; return 0; }
+    if (raw >= 16233) { offCenterFlag = true; return 16383; }
+    if (raw <= center - deadzone) { offCenterFlag = true; return map(raw, 0, center - deadzone, 0, 8191); }
+    else if (raw >= center + deadzone) { offCenterFlag = true; return map(raw, center + deadzone, 16383, 8191, 16383); }
+    else { return 8192; }
+}
+
+void calibrateCenterAndDeadzone() {
+    for(int i=0; i<50; i++) { filterPB.update(); filterPB2.update(); delay(1); }
+    long s1 = 0, s2 = 0;
+    for (int i = 0; i < 500; i++) { filterPB.update(); filterPB2.update(); s1 += map(filterPB.getValue(), 0, 4095, 0, 16383); s2 += map(filterPB2.getValue(), 0, 4095, 0, 16383); delay(1); }
+    PBcenter1 = s1 / 500; PBcenter2 = s2 / 500;
+}
+
+void updateDisplay() {
+    spr.fillSprite(TFT_BLACK);
+    spr.setTextDatum(MC_DATUM);
+    int barHeight = 100, barY = 30;
+    int inFill = (int)(ui_audio_level * barHeight);
+    spr.drawRect(10, barY, 8, barHeight, TFT_DARKGREY);
+    spr.fillRect(10, barY + (barHeight - inFill), 8, inFill, (ui_audio_level > 0.9f ? TFT_RED : TFT_GREEN));
+    int outFill = (int)(ui_output_level * barHeight);
+    spr.drawRect(spr.width() - 18, barY, 8, barHeight, TFT_DARKGREY);
+    spr.fillRect(spr.width() - 18, barY + (barHeight - outFill), 8, outFill, (ui_output_level > 0.9f ? TFT_RED : TFT_GREEN));
+    bool active = (activeEffectMode == 0 && isWhammyActive) || (activeEffectMode == 1 && isFrozen) || (activeEffectMode == 2 && isFeedbackActive) || (activeEffectMode == 3 && isHarmonizerMode) || (activeEffectMode == 4 && isCapoMode) || (activeEffectMode == 5 && isSynthMode) || (activeEffectMode == 6 && isPadMode);
+    spr.fillCircle(spr.width() - 40, 25, 8, active ? TFT_GREEN : TFT_RED);
+    const char* names[] = {"WHAMMY", "FREEZE", "FEEDBACK", "HARMONY", "CAPO", "SYNTH", "PAD"};
+    spr.setTextSize(3); spr.setTextColor(TFT_ORANGE);
+    spr.drawString(names[activeEffectMode], spr.width() / 2 + 30, 40);
+    float val = (activeEffectMode == 5) ? effectMemory[6] : ((activeEffectMode == 6) ? effectMemory[7] : effectMemory[activeEffectMode]);
+    char buf[16]; sprintf(buf, "%s%.1f", val > 0 ? "+" : "", val);
+    spr.setTextSize(4); spr.setTextColor(TFT_WHITE);
+    spr.drawString(buf, spr.width() / 2, spr.height() / 2 + 10);
+    spr.pushSprite(0, 0);
+}
+
+void DisplayTask(void * pvParameters) {
+    for(;;) {
+        if (forceUIUpdate || (!isScreenOff && (ui_audio_level > 0.02f || ui_output_level > 0.02f))) { updateDisplay(); forceUIUpdate = false; }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// OPTIMIZATION: IRAM_ATTR locks DSP logic into internal RAM
+void IRAM_ATTR AudioDSPTask(void * pvParameters) {
+    static float dsp_out[HOP_SIZE];
+    static int32_t i2s_in[HOP_SIZE], i2s_out[HOP_SIZE];
+    static float synthEnv = 0.0f, synthFilter = 0.0f, padFilter = 0.0f, padEnv = 0.0f, inputEnvelope = 0.0f;
+    const float norm = 1.0f / 8388608.0f;
+    i2s_chan_info_t rx_info, tx_info;
+
+    for(;;) {
+        i2s_channel_get_info(rx_chan, &rx_info); i2s_channel_get_info(tx_chan, &tx_info);
+        size_t bytes_read;
+        i2s_channel_read(rx_chan, i2s_in, sizeof(i2s_in), &bytes_read, portMAX_DELAY);
+        
+        if (bytes_read > 0) {
+            float pIn = 0.0f, pOut = 0.0f;
+            float targetWin = LATENCY_WINDOWS[latencyMode];
+            if (currentWindowSize != targetWin) {
+                currentWindowSize = targetWin;
+                tap1 = 0.0f; tap2 = targetWin/2.0f; tap1_2 = 0.0f; tap2_2 = targetWin/2.0f;
+            }
+            
+            bool freezeActive = (activeEffectMode == 1 && isWhammyActive);
+            if (freezeActive && !wasFrozen) {
+                freezeReadIdx = 0;
+                for (int i = 0; i < freezeLength; i++) {
+                    int readPos = (writeIndex - freezeLength + i + MAX_BUFFER_SIZE) & BUFFER_MASK;
+                    freezeBuffer[i] = delayBuffer[readPos];
+                }
+            }
+            wasFrozen = freezeActive;
+
+            bool synth = isSynthMode, pad = isPadMode, harm = isHarmonizerMode, feedback = (activeEffectMode == 2);
+            
+            for (int i = 0; i < HOP_SIZE; i++) {
+                float input = (float)i2s_in[i] * norm; 
+                inputEnvelope = inputEnvelope * 0.99f + fabsf(input) * 0.01f;
+                float writeVal = input;
+                
+                // --- VST Match: Synth and Pad Generation ---
+                if (synth) { 
+                    synthEnv = (inputEnvelope > 0.005f) ? min(1.0f, synthEnv + 0.1f) : max(0.0f, synthEnv - 0.005f); 
+                    writeVal = sinf(writeVal * 45.0f); 
+                    synthFilter = synthFilter + (0.3f + 0.8f * synthEnv) * (writeVal - synthFilter);
+                    writeVal = synthFilter * 0.1f; 
+                }
+                else if (pad) { 
+                    padEnv = (inputEnvelope > 0.005f) ? min(1.0f, padEnv + 0.00002f) : max(0.0f, padEnv - 0.000005f); 
+                    writeVal *= padEnv; 
+                }
+
+                float freezeOut = 0.0f;
+                if (activeEffectMode == 1 && isWhammyActive) {
+                    freezeRamp = min(1.0f, freezeRamp + 0.0002f);
+                } else {
+                    freezeRamp = max(0.0f, freezeRamp - 0.00005f);
+                }
+
+                if (freezeRamp > 0.0f) {
+                    float phase = (float)freezeReadIdx / (float)freezeLength;
+                    int i1 = freezeReadIdx, i2 = (freezeReadIdx + freezeLength / 2) % freezeLength;
+                    int l1 = (int)(phase * (HANN_LUT_SIZE - 1)), l2 = (int)(fmodf(phase + 0.5f, 1.0f) * (HANN_LUT_SIZE - 1));
+                    float rawFreeze = (freezeBuffer[i1] * hannLUT[l1]) + (freezeBuffer[i2] * hannLUT[l2]);
+                    
+                    float d1 = apf1Buffer[apf1Idx]; 
+                    float a1 = -0.6f * rawFreeze + d1;
+                    apf1Buffer[apf1Idx] = rawFreeze + 0.6f * d1; 
+                    apf1Idx = (apf1Idx + 1) % 503;
+                    
+                    float d2 = apf2Buffer[apf2Idx]; 
+                    float a2 = -0.6f * a1 + d2;
+                    apf2Buffer[apf2Idx] = a1 + 0.6f * d2; 
+                    apf2Idx = (apf2Idx + 1) % 433;
+                    
+                    freezeOut = a2 * freezeRamp; 
+                    freezeReadIdx = (freezeReadIdx + 1) % freezeLength;
+                }
+
+                delayBuffer[writeIndex] = (activeEffectMode == 1 && freezeRamp > 0.0f) ? freezeOut : writeVal;
+
+                // Pitch Engine
+                float w1 = 0.0f, w2 = 0.0f;
+                float f1 = pitchShiftFactor, f2 = pitchShiftFactor;
+                if (feedback) {
+                    feedbackLfoPhase += (5.0f * TWO_PI) / SAMPLING_FREQUENCY;
+                    if (feedbackLfoPhase > TWO_PI) feedbackLfoPhase -= TWO_PI;
+                    float drift = powf(2.0f, (15.0f * sinf(feedbackLfoPhase)) / 1200.0f);
+                    f1 = 1.0f * drift; f2 = pitchShiftFactor * drift;
+                }
+                float r1 = 1.0f - f1, r2 = 1.0f - f2;
+                int idx1 = (int)((tap1/currentWindowSize)*(HANN_LUT_SIZE-1)), idx2 = (int)((tap2/currentWindowSize)*(HANN_LUT_SIZE-1));
+                w1 = (getHermiteSample(tap1, delayBuffer, writeIndex)*hannLUT[idx1]) + (getHermiteSample(tap2, delayBuffer, writeIndex)*hannLUT[idx2]);
+                
+                if (feedback || harm) {
+                    int idx1_2 = (int)((tap1_2/currentWindowSize)*(HANN_LUT_SIZE-1)), idx2_2 = (int)((tap2_2/currentWindowSize)*(HANN_LUT_SIZE-1));
+                    w2 = (getHermiteSample(tap1_2, delayBuffer, writeIndex)*hannLUT[idx1_2]) + (getHermiteSample(tap2_2, delayBuffer, writeIndex)*hannLUT[idx2_2]);
+                }
+                tap1 = fmodf(tap1 + r1 + currentWindowSize, currentWindowSize); tap2 = fmodf(tap2 + r1 + currentWindowSize, currentWindowSize);
+                tap1_2 = fmodf(tap1_2 + r2 + currentWindowSize, currentWindowSize); tap2_2 = fmodf(tap2_2 + r2 + currentWindowSize, currentWindowSize);
+                
+                writeIndex = (writeIndex + 1) & BUFFER_MASK;
+
+                // --- VST Match: Feedback Calculation ---
+                float feedbackOut = 0.0f;
+                if (feedback || feedbackRamp > 0.0f) {
+                    if (feedback && isWhammyActive) {
+                        feedbackRamp = (inputEnvelope > 0.005f) ? min(1.0f, feedbackRamp + 0.000011f) : max(0.0f, feedbackRamp - 0.005f);
+                    } else {
+                        feedbackRamp = max(0.0f, feedbackRamp - 0.0001f);
+                    }
+                    
+                    float bloom = constrain((feedbackRamp - 0.1f) * 2.0f, 0.0f, 1.0f);
+                    float bloomed = (w1 * (1.0f - bloom)) + (w2 * bloom);
+                    fbHpfState += 0.05f * (bloomed - fbHpfState);
+                    float scream = tanhf((bloomed - fbHpfState) * 30.0f);
+                    feedbackFilter = feedbackFilter * 0.9f + scream * 0.1f;
+                    float rawFb = feedbackFilter * powf(feedbackRamp, 3.0f) * 0.85f;
+                    int rIdx = (fbDelayWriteIdx - (int)(SAMPLING_FREQUENCY * (20.0f/1000.0f)) + 8192) % 8192;
+                    fbDelayBuffer[fbDelayWriteIdx] = rawFb; fbDelayWriteIdx = (fbDelayWriteIdx + 1) % 8192;
+                    feedbackOut = fbDelayBuffer[rIdx];
+                }
+
+                // --- VST Match: Master Dry/Wet Routing & Tails ---
+                float shiftedOutput = w1;
+                float currentWetBlend = 1.0f;
+                if (activeEffectMode == 1) currentWetBlend = 0.9f; 
+                else if (activeEffectMode == 6) currentWetBlend = 0.6f;
+
+                if (!isWhammyActive) {
+                    shiftedOutput = input + feedbackOut; // Bypass with tails
+                }
+                else if (harm) {
+                    shiftedOutput = input + ((w1 + w2) * 0.707f); 
+                }
+                else if (feedback) {
+                    shiftedOutput = input + feedbackOut;
+                }
+                else if (activeEffectMode == 1) { // Freeze
+                    shiftedOutput = input + (w1 * currentWetBlend); 
+                }
+                else if (pad) {
+                    padFilter = padFilter * 0.95f + w1 * 0.05f;
+                    float wetPad = padFilter * 3.0f * currentWetBlend; 
+                    shiftedOutput = input + wetPad;
+                }
+                else { // Whammy (0), Capo (4), Synth (5) are 100% Wet replacements
+                    shiftedOutput = (input * (1.0f - currentWetBlend)) + (w1 * currentWetBlend);
+                }
+
+                // Global Freeze Spillover Tail
+                if (freezeRamp > 0.0f && (activeEffectMode != 1 || !isWhammyActive)) {
+                    shiftedOutput += (freezeOut * 0.9f);
+                }
+
+                dsp_out[i] = shiftedOutput;
+                
+                if (fabsf(input) > pIn) pIn = fabsf(input); 
+                if (fabsf(shiftedOutput) > pOut) pOut = fabsf(shiftedOutput);
+            }
+            
+            // Final Output Scaling via SIMD
+            float sc = 8388607.0f; 
+            dsps_mul_f32(dsp_out, &sc, dsp_out, HOP_SIZE, 1, 0, 1);
+            
+            for(int i = 0; i < HOP_SIZE; i++) i2s_out[i] = (int32_t)constrain(dsp_out[i], -8388608.0f, 8388607.0f);
+            ui_audio_level = (pIn > ui_audio_level) ? pIn : ui_audio_level * 0.96f; 
+            ui_output_level = (pOut > ui_output_level) ? pOut : ui_output_level * 0.96f;
+            
+            size_t bw; 
+            i2s_channel_write(tx_chan, i2s_out, sizeof(i2s_out), &bw, portMAX_DELAY);
+        }
+    }
+}
+
+void MidiTask(void * pvParameters) {
+    for(;;) {
+        Control_Surface.loop(); filterPB.update(); filterPB2.update();
+        analog_t calPB1 = map_PB(map(filterPB.getValue(), 0, 4095, 0, 16383), PBcenter1, PBdeadzone1, PBwasOffCenter1);
+        if (abs((int)calPB1 - (int)lastMidiSent) > 32) {
+            pitchShiftFactor = powf(2.0f, (effectMemory[activeEffectMode] * (calPB1 - 8192.0f) / 8192.0f) / 12.0f);
+            lastMidiSent = calPB1; lastActivityTime = millis();
+        }
+        
+        if (digitalRead(CAROUSEL_BUTTON_PIN) == LOW && lastCarouselState == HIGH) {
+            activeEffectMode = (activeEffectMode + 1) % 7;
+            isHarmonizerMode = (activeEffectMode == 3); isCapoMode = (activeEffectMode == 4); isSynthMode = (activeEffectMode == 5); isPadMode = (activeEffectMode == 6);
+            
+            // VST Match: Freeze (1) defaults to OFF on switch, others default to ON
+            if (activeEffectMode == 1) isWhammyActive = false; 
+            else isWhammyActive = true;
+            
+            forceUIUpdate = true; vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (digitalRead(FREEZE_BUTTON_PIN) == LOW && lastFreezeBtnState == HIGH) { isFrozen = !isFrozen; forceUIUpdate = true; }
+        if (digitalRead(FEEDBACK_BUTTON_PIN) == LOW && lastFbBtnState == HIGH) { isFeedbackActive = !isFeedbackActive; forceUIUpdate = true; }
+        
+        if (digitalRead(INTERVAL_BUTTON_PIN) == LOW && lastIntervalBtnState == HIGH) {
+            currentIntervalIdx = (currentIntervalIdx + 1) % 9;
+            effectMemory[activeEffectMode] = intervalList[currentIntervalIdx];
+            forceUIUpdate = true; vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        lastCarouselState = digitalRead(CAROUSEL_BUTTON_PIN); lastFreezeBtnState = digitalRead(FREEZE_BUTTON_PIN);
+        lastFbBtnState = digitalRead(FEEDBACK_BUTTON_PIN); lastIntervalBtnState = digitalRead(INTERVAL_BUTTON_PIN);
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+bool channelMessageCallback(ChannelMessage cm) {
+    int newMode = -1;
+    if (cm.header == 0xC0 && cm.data1 <= 6) newMode = cm.data1;
+    else if (cm.header == 0xB0) {
+        if (cm.data1 == 3 && cm.data2 == 127) newMode = (activeEffectMode + 1) % 7;
+        else if (cm.data1 == 100) isWhammyActive = (cm.data2 >= 64);
+        else if (cm.data1 == 15 && cm.data2 == 127) latencyMode = (latencyMode + 1) % 4;
+        else if (cm.data1 == 110) isFrozen = (cm.data2 >= 64);
+        else if (cm.data1 == 111) isFeedbackActive = (cm.data2 >= 64);
+        else if (cm.data1 == 11) {
+            uint16_t m = map(cm.data2, 0, 127, 0, 16383);
+            pitchShiftFactor = powf(2.0f, (effectMemory[activeEffectMode] * (m - 8192.0f) / 8192.0f) / 12.0f);
+            lastMidiSent = m;
+        }
+    }
+    if (newMode != -1 && newMode != activeEffectMode) {
+        activeEffectMode = newMode; isHarmonizerMode = (newMode == 3); isCapoMode = (newMode == 4); isSynthMode = (newMode == 5); isPadMode = (newMode == 6);
+        isFeedbackActive = false; isFrozen = false; 
+        
+        if (activeEffectMode == 1) isWhammyActive = false; 
+        else isWhammyActive = true;
+        
+        forceUIUpdate = true;
+    }
+    return false;
+}
+
+void setup() {
+    pinMode(38, OUTPUT); digitalWrite(38, LOW); pinMode(15, OUTPUT); digitalWrite(15, HIGH);
+    pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP); pinMode(FREEZE_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(INTERVAL_BUTTON_PIN, INPUT_PULLUP); pinMode(FEEDBACK_BUTTON_PIN, INPUT_PULLUP);
+    delayBuffer = (float*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
+    fbDelayBuffer = (float*)heap_caps_malloc(8192 * sizeof(float), MALLOC_CAP_SPIRAM);
+    freezeBuffer = (float*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
+    memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float)); memset(fbDelayBuffer, 0, 8192 * sizeof(float));
+    for (int i = 0; i < HANN_LUT_SIZE; i++) hannLUT[i] = sinf(PI * ((float)i / (float)(HANN_LUT_SIZE - 1)));
+    FilteredAnalog<>::setupADC(); calibrateCenterAndDeadzone();
+    tft.init(); tft.setRotation(1); spr.createSprite(tft.width(), tft.height()); digitalWrite(38, HIGH);
+    Control_Surface >> pipes >> btmidi; Control_Surface >> pipes >> usbmidi;
+    usbmidi >> pipes >> Control_Surface; btmidi >> pipes >> Control_Surface;
+    Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); Control_Surface.begin();
+    i2s_chan_config_t c = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); c.dma_desc_num = 6; c.dma_frame_num = 128;
+    i2s_new_channel(&c, &tx_chan, &rx_chan);
+    i2s_std_config_t s = { .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLING_FREQUENCY), .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), .gpio_cfg = { .bclk = GPIO_NUM_10, .ws = GPIO_NUM_12, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } };
+    i2s_channel_init_std_mode(tx_chan, &s); i2s_channel_init_std_mode(rx_chan, &s);
+    i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan);
+    xTaskCreatePinnedToCore(DisplayTask, "UI", 8192, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(MidiTask, "Midi", 8192, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES - 1, &audioTaskHandle, 1);
+}
+void loop() {}

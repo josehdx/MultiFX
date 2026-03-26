@@ -92,6 +92,13 @@ float feedbackFilter = 0.0f;
 volatile int latencyMode = 1; 
 const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 
+// --- POWER SAVING GLOBALS ---
+unsigned long lastActivityTime = 0;       
+unsigned long lastScreenActivityTime = 0;
+const unsigned long LIGHT_SLEEP_TIMEOUT = 60000; 
+const unsigned long SCREEN_OFF_TIMEOUT = 120000;  
+bool isScreenOff = false;
+
 // --- PIN ASSIGNMENTS ---
 pin_t pinPB = 1;     // GPIO 1
 pin_t pinPB2 = 2;    // GPIO 2
@@ -128,6 +135,52 @@ FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
 BluetoothMIDI_Interface btmidi;
 USBMIDI_Interface usbmidi;
 MIDI_PipeFactory<4> pipes;
+
+// --- SLEEP FUNCTIONS ---
+void turnScreenOff() {
+    if (!isScreenOff) {
+        digitalWrite(38, LOW);
+        digitalWrite(15, LOW);
+        isScreenOff = true;
+    }
+}
+
+void turnScreenOn() {
+    if (isScreenOff) {
+        pinMode(15, OUTPUT);
+        digitalWrite(15, HIGH); 
+        tft.init(); 
+        delay(120);
+        pinMode(38, OUTPUT); 
+        digitalWrite(38, HIGH); 
+        isScreenOff = false;
+    }
+}
+
+void goToLightSleep() {
+    turnScreenOff();
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); 
+    rtc_gpio_pullup_en(GPIO_NUM_0); 
+    rtc_gpio_pulldown_dis(GPIO_NUM_0);
+    
+    if (audioTaskHandle != NULL) vTaskSuspend(audioTaskHandle); 
+    i2s_channel_disable(tx_chan);      
+    i2s_channel_disable(rx_chan);      
+    
+    esp_light_sleep_start();
+    
+    i2s_channel_enable(tx_chan);
+    i2s_channel_enable(rx_chan);
+    if (audioTaskHandle != NULL) vTaskResume(audioTaskHandle); 
+    
+    vTaskDelay(pdMS_TO_TICKS(200)); 
+    rtc_gpio_deinit(GPIO_NUM_0);    
+    pinMode(0, INPUT_PULLUP);
+    
+    turnScreenOn();
+    lastActivityTime = millis();
+    lastScreenActivityTime = millis();
+}
 
 // --- INTERPOLATION ENGINE ---
 inline float IRAM_ATTR getHermiteSample(float tapPos, float* buffer, int writeIdx) {
@@ -268,6 +321,8 @@ void updateLUT() {
 
 // --- SCREEN RENDER LOGIC ---
 void updateDisplay() {
+    if (isScreenOff) return;
+
     spr.fillSprite(TFT_BLACK);
     spr.setTextDatum(MC_DATUM);
     spr.setTextSize(1);
@@ -772,23 +827,38 @@ void MidiTask(void * pvParameters) {
 
     btnCar.state = digitalRead(CAROUSEL_BUTTON_PIN);
     btnCar.lastReading = btnCar.state;
-    
     btnFreeze.state = digitalRead(FREEZE_BUTTON_PIN);
     btnFreeze.lastReading = btnFreeze.state;
-    
     btnFb.state = digitalRead(FEEDBACK_BUTTON_PIN);
     btnFb.lastReading = btnFb.state;
-    
     btnInterval.state = digitalRead(INTERVAL_BUTTON_PIN);
     btnInterval.lastReading = btnInterval.state;
 
-    // FIX: Pre-configure GPIO 0 as an input to act as the "Crosstalk Shield"
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
+    
+    lastActivityTime = millis();
+    lastScreenActivityTime = millis();
 
     for(;;) {
         Control_Surface.loop();
 
-        // --- 1. CAROUSEL BUTTON (GPIO 14) ---
+        // --- POWER SAVING CORE LOGIC ---
+        // 1. Only Bluetooth connection status prevents the controller to sleep
+        if (btmidi.isConnected()) {
+            lastActivityTime = millis(); 
+        }
+
+        // 2. Light Sleep Trigger
+        if (!btmidi.isConnected() && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) {
+            goToLightSleep();
+        }
+
+        // 3. Screen Off Trigger
+        if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) {
+            turnScreenOff();
+        }
+
+        // --- BUTTON HANDLERS (Interactions removed from timer resets) ---
         if (btnCar.update(100)) {
             if (btnCar.state == LOW) {
                 btnCar.pressedTime = millis();
@@ -811,13 +881,11 @@ void MidiTask(void * pvParameters) {
                     } else {
                         isWhammyActive = true; 
                     }
-                    
                     updateLUT(); 
                 }
             }
         }
 
-        // --- FOOT BUTTONS HANDLING ---
         if (btnFreeze.update(100)) {
             if (btnFreeze.state == LOW) {
                 isFrozen = !isFrozen; 
@@ -844,11 +912,10 @@ void MidiTask(void * pvParameters) {
             }
         }
 
-        // --- EXPRESSION PEDAL MATH WITH CROSSTALK SHIELD ---
+        // --- EXPRESSION PEDAL MATH (ONLY source of Screen timer resets) ---
         filterPB.update(); 
         filterPB2.update(); 
         
-        // If physical button 0 is NOT pressed, process analog movement
         bool isGhostButtonActive = (digitalRead(BOOT_SENSE_PIN) == LOW);
 
         if (!isGhostButtonActive) {
@@ -861,11 +928,16 @@ void MidiTask(void * pvParameters) {
             int diffA = abs((int)calibratedA - (int)lastMidiA);
             int diffB = abs((int)calibratedB - (int)lastMidiB);
             
-        //bool movedA = abs((int)calibratedA - (int)lastMidiA) > 8;
-        //bool movedB = abs((int)calibratedB - (int)lastMidiB) > 8;    
-        
-                bool movedA = false;
-                bool movedB = false;
+            // THRESHOLD DETECTION: This is the ONLY logic that resets Screen Timers
+            if (diffA > 256 || diffB > 256) {
+                if (isScreenOff) turnScreenOn();
+                lastScreenActivityTime = millis();
+                // lastMidiSent = ... (Updates below)
+            }
+
+            // TEST MODE: Forced false, PBs disabled for MIDI/DSP action
+            bool movedA = false;
+            bool movedB = false;
 
             if (movedA || movedB) {
                 if (movedA) { 
@@ -877,13 +949,7 @@ void MidiTask(void * pvParameters) {
                     lastMidiB = calibratedB; 
                 }
 
-                analog_t activeMidi = 8192;
-                if (movedB) {
-                    activeMidi = calibratedB;
-                } else {
-                    activeMidi = calibratedA;
-                }
-                
+                analog_t activeMidi = movedB ? calibratedB : calibratedA;
                 pitchShiftFactor = pitchShiftLUT[constrain(activeMidi, 0, 16383)];
                 Control_Surface.sendPitchBend(Channel_1, activeMidi);
                 lastMidiSent = activeMidi;
@@ -907,20 +973,12 @@ bool channelMessageCallback(ChannelMessage cm) {
         isCapoMode = (activeEffectMode == 4); 
         isSynthMode = (activeEffectMode == 5); 
         isPadMode = (activeEffectMode == 6);
-        
-        if (activeEffectMode == 1) {
-            isWhammyActive = isFrozen; 
-        } else if (activeEffectMode == 2) {
-            isWhammyActive = isFeedbackActive;
-        } else {
-            isWhammyActive = true; 
-        }
-        
+        if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+        else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive;
+        else isWhammyActive = true; 
         updateLUT();
     }
     else if (cm.header == 0xB0) {
-        
-        // --- CC 3: TOE/HIGH CONTROL ---
         if (cm.data1 == 3) {
             if (cm.data2 >= 64) {
                 cc3Timer = millis();
@@ -929,29 +987,15 @@ bool channelMessageCallback(ChannelMessage cm) {
             else if (cc3Active) {
                 cc3Active = false;
                 unsigned long dur = millis() - cc3Timer;
-                
                 if (activeEffectMode == 0) {
-                    float delta = 0.0f;
-                    if (dur < 1500) {
-                        delta = 1.0f;
-                    } else {
-                        delta = -1.0f;
-                    }
-                    effectMemory[0] = constrain(effectMemory[0] + delta, -24.0f, 24.0f);
+                    effectMemory[0] = constrain(effectMemory[0] + (dur < 1500 ? 1.0f : -1.0f), -24.0f, 24.0f);
                 } else {
-                    int slot = activeEffectMode;
-                    if (activeEffectMode == 5) {
-                        slot = 6;
-                    } else if (activeEffectMode == 6) {
-                        slot = 7;
-                    }
+                    int slot = (activeEffectMode == 5) ? 6 : (activeEffectMode == 6 ? 7 : activeEffectMode);
                     effectMemory[slot] = constrain(effectMemory[slot] + 1.0f, -24.0f, 24.0f);
                 }
                 updateLUT();
             }
         }
-        
-        // --- CC 15: HEEL/LOW CONTROL ---
         else if (cm.data1 == 15) {
             if (cm.data2 >= 64) {
                 cc15Timer = millis();
@@ -960,77 +1004,45 @@ bool channelMessageCallback(ChannelMessage cm) {
             else if (cc15Active) {
                 cc15Active = false;
                 unsigned long dur = millis() - cc15Timer;
-                
                 if (activeEffectMode == 0) {
-                    float delta = 0.0f;
-                    if (dur < 1500) {
-                        delta = 1.0f;
-                    } else {
-                        delta = -1.0f;
-                    }
-                    effectMemory[5] = constrain(effectMemory[5] + delta, -24.0f, 24.0f);
+                    effectMemory[5] = constrain(effectMemory[5] + (dur < 1500 ? 1.0f : -1.0f), -24.0f, 24.0f);
                 } else {
-                    int slot = activeEffectMode;
-                    if (activeEffectMode == 5) {
-                        slot = 6;
-                    } else if (activeEffectMode == 6) {
-                        slot = 7;
-                    }
+                    int slot = (activeEffectMode == 5) ? 6 : (activeEffectMode == 6 ? 7 : activeEffectMode);
                     effectMemory[slot] = constrain(effectMemory[slot] - 1.0f, -24.0f, 24.0f);
                 }
                 updateLUT();
             }
         }
-        
-        // --- MASTER BYPASS ---
         else if (cm.data1 == 100) { 
             isWhammyActive = (cm.data2 >= 64); 
-            if (activeEffectMode == 1) {
-                isFrozen = isWhammyActive; 
-            }
-            if (activeEffectMode == 2) {
-                isFeedbackActive = isWhammyActive; 
-            }
+            if (activeEffectMode == 1) isFrozen = isWhammyActive;
+            if (activeEffectMode == 2) isFeedbackActive = isWhammyActive;
         }
-        
-        // --- FREEZE TOGGLE ---
         else if (cm.data1 == 110) { 
             isFrozen = (cm.data2 >= 64); 
-            if (activeEffectMode == 1) {
-                isWhammyActive = isFrozen; 
-            }
+            if (activeEffectMode == 1) isWhammyActive = isFrozen; 
         }
-        
-        // --- FEEDBACK TOGGLE ---
         else if (cm.data1 == 111) { 
             isFeedbackActive = (cm.data2 >= 64); 
-            if (activeEffectMode == 2) {
-                isWhammyActive = isFeedbackActive; 
-            }
+            if (activeEffectMode == 2) isWhammyActive = isFeedbackActive; 
         }
-        
-        // --- EXPRESSION CC OVERRIDE ---
         else if (cm.data1 == 11) { 
             uint16_t m = map(cm.data2, 0, 127, 0, 16383); 
             currentCC11 = m; 
             pitchShiftFactor = pitchShiftLUT[m]; 
         }
     }
-    
     return false;
 }
 
 void setup() {
     pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP);
-    
     pinMode(38, OUTPUT); 
     digitalWrite(38, LOW); 
-    
     pinMode(15, OUTPUT); 
     digitalWrite(15, HIGH);
     
     Serial.begin(115200);
-    
     tft.init(); 
     tft.setRotation(1); 
     spr.createSprite(tft.width(), tft.height()); 
@@ -1041,17 +1053,12 @@ void setup() {
     tft.drawString("BOOTING...", tft.width() / 2, tft.height() / 2);
     
     delay(120); 
-    
     digitalWrite(38, HIGH); 
-    
     btmidi.setName("Whammy_S3");
     
     pinMode(FREEZE_BUTTON_PIN, INPUT_PULLUP); 
     pinMode(INTERVAL_BUTTON_PIN, INPUT_PULLUP); 
     pinMode(FEEDBACK_BUTTON_PIN, INPUT_PULLUP);
-
-    //pinMode(pinPB, INPUT);
-    //pinMode(pinPB2, INPUT);
     
     pinMode(pinPB, INPUT_PULLUP); 
     pinMode(pinPB2, INPUT_PULLUP);
@@ -1100,6 +1107,4 @@ void setup() {
     xTaskCreatePinnedToCore(AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES - 1, &audioTaskHandle, 1);
 }
 
-void loop() {
-    // Left intentionally empty; Tasks handle all logic
-}
+void loop() {}

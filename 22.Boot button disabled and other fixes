@@ -37,6 +37,7 @@ int fbDelayWriteIdx = 0;
 
 #define HANN_LUT_SIZE 1024
 DRAM_ATTR float hannLUT[HANN_LUT_SIZE];
+float pitchShiftLUT[16384]; 
 
 // Tap States
 float tap1 = 0.0f, tap2 = 512.0f; 
@@ -58,66 +59,52 @@ int apf2Idx = 0;
 const float intervalList[] = {-12.0f, -7.0f, -5.0f, -2.0f, 0.0f, 2.0f, 5.0f, 7.0f, 12.0f};
 int currentIntervalIdx = 8; 
 
-// --- RESTORED: DUAL SLEEP CONFIGURATION ---
-unsigned long lastActivityTime = 0;       
-unsigned long lastScreenActivityTime = 0;
-const unsigned long LIGHT_SLEEP_TIMEOUT = 60000; 
-const unsigned long SCREEN_OFF_TIMEOUT = 120000;  
-bool isScreenOff = false;
-TaskHandle_t audioTaskHandle = NULL;
+TaskHandle_t audioTaskHandle = NULL; 
 
 // --- TFT DISPLAY ---
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite spr = TFT_eSprite(&tft); 
-volatile bool forceUIUpdate = true; 
 
 // --- EFFECT STATE ---
 int activeEffectMode = 0; 
 float effectMemory[8] = { 12.0f, 12.0f, 12.0f, 5.0f, -2.0f, -12.0f, -12.0f, 12.0f };
-
 volatile float pitchShiftFactor = 1.0f;
+
+// The Master Bypass for whatever mode is currently on screen
 volatile bool isWhammyActive = true; 
+
+// Global independent effect flags
 volatile bool isFrozen = false;
+volatile bool isFeedbackActive = false;
+
 volatile bool isHarmonizerMode = false;
 volatile bool isSynthMode = false;
 volatile bool isPadMode = false;
 volatile bool isCapoMode = false; 
-volatile bool isFeedbackActive = false;
 
 volatile float feedbackRamp = 0.0f;
 float feedbackLfoPhase = 0.0f;
 float fbHpfState = 0.0f;
 float feedbackFilter = 0.0f;
-
 volatile int latencyMode = 1; 
 const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 
 // --- PIN ASSIGNMENTS ---
-pin_t pinPB = A0;
-pin_t pinPB2 = A2;
+pin_t pinPB = A0;   
+pin_t pinPB2 = A1;  
 const int CAROUSEL_BUTTON_PIN = 14; 
-const int FREEZE_BUTTON_PIN = 2;    
-const int INTERVAL_BUTTON_PIN = 43; 
-const int FEEDBACK_BUTTON_PIN = 44; 
-
-bool lastCarouselState = HIGH;
-bool lastBootState = HIGH;      
-bool lastFreezeBtnState = HIGH;
-bool lastIntervalBtnState = HIGH;
-bool lastFbBtnState = HIGH;
-
-unsigned long carouselPressedTime = 0; 
-unsigned long bootPressedTime = 0;     
+const int FREEZE_BUTTON_PIN = 18;    
+const int INTERVAL_BUTTON_PIN = 21; 
+const int FEEDBACK_BUTTON_PIN = 13;  // FIX: Moved completely off of the LCD Data Bus (was 47)
 
 uint16_t lastMidiSent = 8192;
 volatile uint16_t currentPB1 = 8192;
 volatile uint16_t currentPB2 = 8192;
 volatile uint16_t currentCC11 = 0;
-
 volatile float ui_audio_level = 0.0f; 
 volatile float ui_output_level = 0.0f;
 
-// --- RESTORED: INDEPENDENT DUAL CALIBRATION VARIABLES ---
+// --- INDEPENDENT DUAL CALIBRATION VARIABLES ---
 double PBdeadzoneMultiplier = 14;
 double PBdeadzoneMinimum = 950;
 double PBdeadzoneMaximum = 1600;
@@ -154,59 +141,6 @@ inline float IRAM_ATTR getHermiteSample(float tapPos, float* buffer, int writeId
     return ((c3 * frac + c2) * frac + c1) * frac + y1;
 }
 
-// --- RESTORED: SLEEP LOGIC ---
-void goToLightSleep() {
-    digitalWrite(38, LOW);  
-    digitalWrite(15, LOW);  
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); 
-    rtc_gpio_pullup_en(GPIO_NUM_0); 
-    rtc_gpio_pulldown_dis(GPIO_NUM_0);
-    if (audioTaskHandle != NULL) vTaskSuspend(audioTaskHandle); 
-    i2s_channel_disable(tx_chan);      
-    i2s_channel_disable(rx_chan);      
-    esp_sleep_wakeup_cause_t wakeup_reason;
-    do {
-        esp_light_sleep_start();
-        wakeup_reason = esp_sleep_get_wakeup_cause();
-    } while (wakeup_reason != ESP_SLEEP_WAKEUP_EXT0);
-    i2s_channel_enable(tx_chan);
-    i2s_channel_enable(rx_chan);
-    if (audioTaskHandle != NULL) vTaskResume(audioTaskHandle); 
-    vTaskDelay(pdMS_TO_TICKS(200)); 
-    rtc_gpio_deinit(GPIO_NUM_0);    
-    pinMode(0, INPUT_PULLUP);
-    pinMode(15, OUTPUT); digitalWrite(15, HIGH); 
-    tft.init(); 
-    forceUIUpdate = true;
-    delay(120); 
-    pinMode(38, OUTPUT);    
-    digitalWrite(38, HIGH); 
-    isScreenOff = false; 
-    lastActivityTime = millis();
-    lastScreenActivityTime = millis();
-}
-
-void turnScreenOff() {
-    if (!isScreenOff) {
-        digitalWrite(38, LOW);  
-        digitalWrite(15, LOW);
-        isScreenOff = true;
-    }
-}
-
-void turnScreenOn() {
-    if (isScreenOff) {
-        pinMode(15, OUTPUT);
-        digitalWrite(15, HIGH); 
-        tft.init(); 
-        forceUIUpdate = true;
-        delay(120);
-        pinMode(38, OUTPUT); digitalWrite(38, HIGH); 
-        isScreenOff = false;
-    }
-}
-
-// --- RESTORED: DYNAMIC MAPPING FUNCTION ---
 analog_t map_PB(analog_t raw, analog_t center, analog_t deadzone, bool &offCenterFlag) {
     raw = constrain(raw, PBminimumValue, PBmaximumValue);
     if (raw <= PBminimumValue + 150) { offCenterFlag = true; return 0; }
@@ -216,10 +150,8 @@ analog_t map_PB(analog_t raw, analog_t center, analog_t deadzone, bool &offCente
     else { return 8192; }
 }
 
-// --- RESTORED: INDEPENDENT DUAL CALIBRATION LOGIC ---
 void calibrateCenterAndDeadzone() {
   for(int i=0; i<50; i++) { filterPB.update(); filterPB2.update(); delay(1); }
-  
   int iNumberOfSamples = 750;
   analog_t calibPBLow1 = 16383; analog_t calibPBHigh1 = 0; long lSampleSumPB1 = 0;
   analog_t calibPBLow2 = 16383; analog_t calibPBHigh2 = 0; long lSampleSumPB2 = 0;
@@ -227,7 +159,6 @@ void calibrateCenterAndDeadzone() {
   for (int iSample = 1; iSample <= iNumberOfSamples; iSample++) {
     filterPB.update(); 
     filterPB2.update();
-
     analog_t raw12_1 = filterPB.getValue();
     analog_t calibPB1 = map(raw12_1, 0, 4095, 0, 16383);
     lSampleSumPB1 += calibPB1;
@@ -239,21 +170,43 @@ void calibrateCenterAndDeadzone() {
     lSampleSumPB2 += calibPB2;
     if (calibPB2 < calibPBLow2) { calibPBLow2 = calibPB2; } 
     if (calibPB2 > calibPBHigh2) { calibPBHigh2 = calibPB2; } 
-
     delay(1);
   }
   
   PBcenter1 = lSampleSumPB1 / iNumberOfSamples;
   PBdeadzone1 = (analog_t)constrain(((calibPBHigh1 - calibPBLow1) * PBdeadzoneMultiplier), PBdeadzoneMinimum, PBdeadzoneMaximum);
-
   PBcenter2 = lSampleSumPB2 / iNumberOfSamples;
   PBdeadzone2 = (analog_t)constrain(((calibPBHigh2 - calibPBLow2) * PBdeadzoneMultiplier), PBdeadzoneMinimum, PBdeadzoneMaximum);
 }
 
-// --- RESTORED: ADVANCED SCREEN RENDER LOGIC ---
+void updateLUT() {
+    for (int i = 0; i < 16384; i++) {
+        float totalShift = 0.0f;
+        if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 3 ||
+            activeEffectMode == 4 || activeEffectMode == 5 || activeEffectMode == 6) {
+            
+            float normalizedThrow = (float(i) - 8192.0f) / 8192.0f;
+            float dynamicBend = (normalizedThrow >= 0.0f) ? (effectMemory[0] * normalizedThrow) : (effectMemory[5] * std::abs(normalizedThrow));
+            
+            float basePitch = 0.0f;
+            if (activeEffectMode == 4) basePitch = effectMemory[4]; 
+            else if (activeEffectMode == 5) basePitch = effectMemory[6]; 
+            else if (activeEffectMode == 6) basePitch = effectMemory[7]; 
+            
+            totalShift = basePitch + dynamicBend;
+        } else if (activeEffectMode == 2) {
+            float intervals[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f };
+            totalShift = intervals[currentIntervalIdx % 5];
+        }
+        pitchShiftLUT[i] = powf(2.0f, totalShift / 12.0f);
+    }
+}
+
+// --- SCREEN RENDER LOGIC ---
 void updateDisplay() {
     spr.fillSprite(TFT_BLACK);
     spr.setTextDatum(MC_DATUM);
+    spr.setTextSize(1);
 
     int barWidth = 8;
     int barHeight = 100;
@@ -265,7 +218,6 @@ void updateDisplay() {
     uint32_t inColor = (ui_audio_level > 0.90f) ? TFT_RED : TFT_GREEN;
     spr.drawRect(inX, barY, barWidth, barHeight, TFT_DARKGREY);
     spr.fillRect(inX, barY + (barHeight - inFillHeight), barWidth, inFillHeight, inColor);
-    spr.setTextSize(1);
     spr.setTextColor(TFT_WHITE, TFT_BLACK);
     spr.drawString("IN", inX + (barWidth/2), barY + barHeight + 10);
 
@@ -277,16 +229,8 @@ void updateDisplay() {
     spr.fillRect(outX, barY + (barHeight - outFillHeight), barWidth, outFillHeight, outColor);
     spr.drawString("OUT", outX + (barWidth/2), barY + barHeight + 10);
 
-    bool isCurrentEffectActive = false;
-    switch(activeEffectMode) {
-        case 0: isCurrentEffectActive = isWhammyActive; break; 
-        case 1: isCurrentEffectActive = isWhammyActive; break;
-        case 2: isCurrentEffectActive = isFeedbackActive; break;
-        case 3: isCurrentEffectActive = isHarmonizerMode; break;
-        case 4: isCurrentEffectActive = isCapoMode; break;
-        case 5: isCurrentEffectActive = isSynthMode; break;
-        case 6: isCurrentEffectActive = isPadMode; break;
-    }
+    // Indicator Dot shows the Bypass state of the active UI mode
+    bool isCurrentEffectActive = isWhammyActive; 
     uint32_t ledColor = isCurrentEffectActive ? TFT_GREEN : TFT_RED;
     spr.fillCircle(spr.width() - 40, 25, 8, ledColor);
     spr.drawCircle(spr.width() - 40, 25, 8, TFT_WHITE);
@@ -346,7 +290,7 @@ void updateDisplay() {
     }
 
     spr.setTextSize(3);
-    if (feedbackRamp > 0.0f && activeEffectMode != 2) {
+    if ((isFeedbackActive || feedbackRamp > 0.0f) && activeEffectMode != 2) {
         spr.setTextColor(TFT_RED, TFT_BLACK);
         spr.drawString("* SCREAMING *", spr.width() / 2, spr.height() - 70);
         int swellWidth = (int)(feedbackRamp * 100);
@@ -355,11 +299,20 @@ void updateDisplay() {
         spr.fillRect(swellX, spr.height() - 55, swellWidth, 6, TFT_RED); 
     }
     
-    if (freezeRamp > 0.0f && activeEffectMode != 1) {
+    if ((isFrozen || freezeRamp > 0.0f) && activeEffectMode != 1) {
         spr.setTextColor(TFT_CYAN, TFT_BLACK);
         spr.drawString("* FROZEN *", spr.width() / 2, spr.height() - 40);
     }
     
+    spr.setTextSize(1);
+    spr.setTextColor(TFT_WHITE);
+    int rectW = 40, rectH = 16;
+    int rectX = outX - rectW - 6; 
+    int rectY = (spr.height() / 2) - (rectH / 2); 
+    spr.drawRect(rectX, rectY, rectW, rectH, TFT_DARKGREY);
+    const char* latLabels[] = {"U.Low", "Low", "Mid", "High"};
+    spr.drawString(latLabels[latencyMode], rectX + rectW/2, rectY + rectH/2);
+
     if (activeEffectMode == 0) {
         spr.setTextSize(1);
         int btX = spr.width() / 2 + 40; 
@@ -380,12 +333,13 @@ void updateDisplay() {
             spr.drawString("BT: Waiting", spr.width() / 2, spr.height() - 20);
         }
     }
+
     spr.pushSprite(0, 0);
 }
 
 void DisplayTask(void * pvParameters) {
     for(;;) {
-        if (forceUIUpdate || (!isScreenOff && (ui_audio_level > 0.02f || ui_output_level > 0.02f))) { updateDisplay(); forceUIUpdate = false; }
+        updateDisplay(); 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -411,7 +365,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 tap1 = 0.0f; tap2 = targetWin/2.0f; tap1_2 = 0.0f; tap2_2 = targetWin/2.0f;
             }
             
-            bool freezeActive = (activeEffectMode == 1 && isWhammyActive);
+            bool freezeActive = ((activeEffectMode == 1 && isWhammyActive) || isFrozen);            
             if (freezeActive && !wasFrozen) {
                 freezeReadIdx = 0;
                 for (int i = 0; i < freezeLength; i++) {
@@ -421,8 +375,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             }
             wasFrozen = freezeActive;
 
-            bool synth = isSynthMode, pad = isPadMode, harm = isHarmonizerMode, feedback = (activeEffectMode == 2);
+            bool synth = isSynthMode, pad = isPadMode, harm = isHarmonizerMode, feedback = ((activeEffectMode == 2 && isWhammyActive) || isFeedbackActive);
             
+            #pragma GCC unroll 4
             for (int i = 0; i < HOP_SIZE; i++) {
                 float input = (float)i2s_in[i] * norm; 
                 inputEnvelope = inputEnvelope * 0.99f + fabsf(input) * 0.01f;
@@ -441,7 +396,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 }
 
                 float freezeOut = 0.0f;
-                if (activeEffectMode == 1 && isWhammyActive) {
+                if (freezeActive) {
                     freezeRamp = min(1.0f, freezeRamp + 0.0002f);
                 } else {
                     freezeRamp = max(0.0f, freezeRamp - 0.00005f);
@@ -450,7 +405,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 if (freezeRamp > 0.0f) {
                     float phase = (float)freezeReadIdx / (float)freezeLength;
                     int i1 = freezeReadIdx, i2 = (freezeReadIdx + freezeLength / 2) % freezeLength;
-                    int l1 = (int)(phase * (HANN_LUT_SIZE - 1)), l2 = (int)(fmodf(phase + 0.5f, 1.0f) * (HANN_LUT_SIZE - 1));
+                    
+                    float phase2 = phase + 0.5f;
+                    if (phase2 >= 1.0f) phase2 -= 1.0f;
+
+                    int l1 = (int)(phase * (HANN_LUT_SIZE - 1)), l2 = (int)(phase2 * (HANN_LUT_SIZE - 1));
                     float rawFreeze = (freezeBuffer[i1] * hannLUT[l1]) + (freezeBuffer[i2] * hannLUT[l2]);
                     
                     float d1 = apf1Buffer[apf1Idx]; 
@@ -467,7 +426,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     freezeReadIdx = (freezeReadIdx + 1) % freezeLength;
                 }
 
-                delayBuffer[writeIndex] = (activeEffectMode == 1 && freezeRamp > 0.0f) ? freezeOut : writeVal;
+                delayBuffer[writeIndex] = (freezeActive && freezeRamp > 0.0f) ? freezeOut : writeVal;
 
                 // Pitch Engine
                 float w1 = 0.0f, w2 = 0.0f;
@@ -478,6 +437,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float drift = powf(2.0f, (15.0f * sinf(feedbackLfoPhase)) / 1200.0f);
                     f1 = 1.0f * drift; f2 = pitchShiftFactor * drift;
                 }
+                
                 float r1 = 1.0f - f1, r2 = 1.0f - f2;
                 int idx1 = (int)((tap1/currentWindowSize)*(HANN_LUT_SIZE-1)), idx2 = (int)((tap2/currentWindowSize)*(HANN_LUT_SIZE-1));
                 w1 = (getHermiteSample(tap1, delayBuffer, writeIndex)*hannLUT[idx1]) + (getHermiteSample(tap2, delayBuffer, writeIndex)*hannLUT[idx2]);
@@ -486,15 +446,29 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     int idx1_2 = (int)((tap1_2/currentWindowSize)*(HANN_LUT_SIZE-1)), idx2_2 = (int)((tap2_2/currentWindowSize)*(HANN_LUT_SIZE-1));
                     w2 = (getHermiteSample(tap1_2, delayBuffer, writeIndex)*hannLUT[idx1_2]) + (getHermiteSample(tap2_2, delayBuffer, writeIndex)*hannLUT[idx2_2]);
                 }
-                tap1 = fmodf(tap1 + r1 + currentWindowSize, currentWindowSize); tap2 = fmodf(tap2 + r1 + currentWindowSize, currentWindowSize);
-                tap1_2 = fmodf(tap1_2 + r2 + currentWindowSize, currentWindowSize); tap2_2 = fmodf(tap2_2 + r2 + currentWindowSize, currentWindowSize);
+
+                tap1 += r1;
+                while (tap1 >= currentWindowSize) tap1 -= currentWindowSize;
+                while (tap1 < 0.0f) tap1 += currentWindowSize;
+
+                tap2 += r1;
+                while (tap2 >= currentWindowSize) tap2 -= currentWindowSize;
+                while (tap2 < 0.0f) tap2 += currentWindowSize;
+
+                tap1_2 += r2;
+                while (tap1_2 >= currentWindowSize) tap1_2 -= currentWindowSize;
+                while (tap1_2 < 0.0f) tap1_2 += currentWindowSize;
+
+                tap2_2 += r2;
+                while (tap2_2 >= currentWindowSize) tap2_2 -= currentWindowSize;
+                while (tap2_2 < 0.0f) tap2_2 += currentWindowSize;
                 
                 writeIndex = (writeIndex + 1) & BUFFER_MASK;
 
                 // --- VST Match: Feedback Calculation ---
                 float feedbackOut = 0.0f;
                 if (feedback || feedbackRamp > 0.0f) {
-                    if (feedback && isWhammyActive) {
+                    if (feedback) {
                         feedbackRamp = (inputEnvelope > 0.005f) ? min(1.0f, feedbackRamp + 0.000011f) : max(0.0f, feedbackRamp - 0.005f);
                     } else {
                         feedbackRamp = max(0.0f, feedbackRamp - 0.0001f);
@@ -505,7 +479,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     fbHpfState += 0.05f * (bloomed - fbHpfState);
                     float scream = tanhf((bloomed - fbHpfState) * 30.0f);
                     feedbackFilter = feedbackFilter * 0.9f + scream * 0.1f;
-                    float rawFb = feedbackFilter * powf(feedbackRamp, 3.0f) * 0.85f;
+                    
+                    float r = feedbackRamp;
+                    float rampCubed = r * r * r; 
+                    float rawFb = feedbackFilter * rampCubed * 0.85f;
+                    
                     int rIdx = (fbDelayWriteIdx - (int)(SAMPLING_FREQUENCY * (20.0f/1000.0f)) + 8192) % 8192;
                     fbDelayBuffer[fbDelayWriteIdx] = rawFb; fbDelayWriteIdx = (fbDelayWriteIdx + 1) % 8192;
                     feedbackOut = fbDelayBuffer[rIdx];
@@ -539,7 +517,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 }
 
                 // Global Freeze Spillover Tail
-                if (freezeRamp > 0.0f && (activeEffectMode != 1 || !isWhammyActive)) {
+                if (freezeRamp > 0.0f && (!freezeActive || activeEffectMode != 1)) {
                     shiftedOutput += (freezeOut * 0.9f);
                 }
 
@@ -553,6 +531,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float sc = 8388607.0f; 
             dsps_mul_f32(dsp_out, &sc, dsp_out, HOP_SIZE, 1, 0, 1);
             
+            #pragma GCC unroll 4
             for(int i = 0; i < HOP_SIZE; i++) i2s_out[i] = (int32_t)constrain(dsp_out[i], -8388608.0f, 8388607.0f);
             ui_audio_level = (pIn > ui_audio_level) ? pIn : ui_audio_level * 0.96f; 
             ui_output_level = (pOut > ui_output_level) ? pOut : ui_output_level * 0.96f;
@@ -563,225 +542,192 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     }
 }
 
-// --- RESTORED: MIDI TASK WITH DUAL PEDALS & WAKEUP LOGIC ---
+// --- BULLETPROOF NON-BLOCKING DEBOUNCE STRUCT ---
+struct DebouncedButton {
+    uint8_t pin;
+    bool state = HIGH;
+    bool lastReading = HIGH;
+    unsigned long lastDebounceTime = 0;
+    unsigned long pressedTime = 0;
+    bool isActive = false;
+    
+    DebouncedButton(uint8_t p) : pin(p) {}
+    
+    bool update(unsigned long debounceDelay = 50) {
+        bool currentReading = digitalRead(pin);
+        bool stateChanged = false;
+        
+        if (currentReading != lastReading) {
+            lastDebounceTime = millis();
+        }
+        
+        if ((millis() - lastDebounceTime) > debounceDelay) {
+            if (currentReading != state) {
+                state = currentReading;
+                stateChanged = true;
+            }
+        }
+        lastReading = currentReading;
+        return stateChanged;
+    }
+};
+
+// --- MIDI TASK ---
 void MidiTask(void * pvParameters) {
     static bool lastBtState = false; 
     static analog_t lastMidiA = 8192;
     static analog_t lastMidiB = 8192; 
-    
-    lastActivityTime = millis(); 
-    lastScreenActivityTime = millis();
+
+    static DebouncedButton btnCar(CAROUSEL_BUTTON_PIN);
+    static DebouncedButton btnFreeze(FREEZE_BUTTON_PIN);
+    static DebouncedButton btnFb(FEEDBACK_BUTTON_PIN);
+    static DebouncedButton btnInterval(INTERVAL_BUTTON_PIN);
+
+    btnCar.state = digitalRead(CAROUSEL_BUTTON_PIN);
+    btnCar.lastReading = btnCar.state;
+    btnFreeze.state = digitalRead(FREEZE_BUTTON_PIN);
+    btnFreeze.lastReading = btnFreeze.state;
+    btnFb.state = digitalRead(FEEDBACK_BUTTON_PIN);
+    btnFb.lastReading = btnFb.state;
+    btnInterval.state = digitalRead(INTERVAL_BUTTON_PIN);
+    btnInterval.lastReading = btnInterval.state;
 
     for(;;) {
         Control_Surface.loop();
 
         bool btConnected = btmidi.isConnected();
         if (btConnected != lastBtState) {
-            if (!isScreenOff) forceUIUpdate = true;
             lastBtState = btConnected;
-            lastActivityTime = millis(); 
         }
 
-        if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) {
-            turnScreenOff();
-        }
-        if (!btConnected && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) {
-            goToLightSleep();
-            lastScreenActivityTime = millis(); 
-        }
-
-        // --- 1. CAROUSEL BUTTON (IO14) LOGIC WITH LONG PRESS ---
-        bool currentCarouselState = digitalRead(CAROUSEL_BUTTON_PIN);
-        if (currentCarouselState == LOW && lastCarouselState == HIGH) {
-            carouselPressedTime = millis();
-            vTaskDelay(pdMS_TO_TICKS(50)); 
-        }
-        else if (currentCarouselState == HIGH && lastCarouselState == LOW) {
-            unsigned long pressDuration = millis() - carouselPressedTime;
-            if (pressDuration < 400) {
-                activeEffectMode = (activeEffectMode + 1) % 7;
-                isHarmonizerMode = (activeEffectMode == 3); isCapoMode = (activeEffectMode == 4); isSynthMode = (activeEffectMode == 5); isPadMode = (activeEffectMode == 6);
+        // --- 1. CAROUSEL BUTTON (GPIO 14) ---
+        if (btnCar.update(100)) {
+            if (btnCar.state == LOW) {
+                btnCar.pressedTime = millis();
+                btnCar.isActive = true; 
+            } else if (btnCar.state == HIGH && btnCar.isActive) {
+                btnCar.isActive = false; 
+                unsigned long dur = millis() - btnCar.pressedTime;
                 
-                if (activeEffectMode == 1) isWhammyActive = false; 
-                else isWhammyActive = true;
-                
-                forceUIUpdate = true; 
-            } else {
-                int memSlot = activeEffectMode;
-                if (activeEffectMode == 0) memSlot = 0; // Toe
-                else if (activeEffectMode == 5) memSlot = 6;
-                else if (activeEffectMode == 6) memSlot = 7;
-
-                if (pressDuration < 1500) effectMemory[memSlot] += 1.0f;
-                else effectMemory[memSlot] -= 1.0f;
-
-                if (effectMemory[memSlot] > 24.0f) effectMemory[memSlot] = 24.0f;
-                if (effectMemory[memSlot] < -24.0f) effectMemory[memSlot] = -24.0f;
-                forceUIUpdate = true; lastActivityTime = millis();
+                if (dur < 400) { 
+                    activeEffectMode = (activeEffectMode + 1) % 7; 
+                    isHarmonizerMode = (activeEffectMode == 3); isCapoMode = (activeEffectMode == 4); isSynthMode = (activeEffectMode == 5); isPadMode = (activeEffectMode == 6); 
+                    
+                    if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+                    else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive;
+                    else isWhammyActive = true; 
+                    
+                } else if (dur >= 800 && dur < 1500) { 
+                    int memSlot = (activeEffectMode == 0) ? 0 : (activeEffectMode == 5 ? 6 : (activeEffectMode == 6 ? 7 : activeEffectMode)); 
+                    effectMemory[memSlot] = constrain(effectMemory[memSlot] + 1.0f, -24.0f, 24.0f); 
+                } else if (dur >= 1500) { 
+                    int memSlot = (activeEffectMode == 0) ? 0 : (activeEffectMode == 5 ? 6 : (activeEffectMode == 6 ? 7 : activeEffectMode));
+                    float delta = (activeEffectMode == 0) ? -1.0f : 1.0f;
+                    effectMemory[memSlot] = constrain(effectMemory[memSlot] + delta, -24.0f, 24.0f); 
+                }
+                updateLUT(); 
             }
         }
-        lastCarouselState = currentCarouselState;
 
-        // --- 2. BOOT BUTTON (GPIO 0) LOGIC WITH LONG PRESS ---
-        bool currentBootState = digitalRead(0);
-        if (currentBootState == LOW && lastBootState == HIGH) {
-            bootPressedTime = millis();
-            vTaskDelay(pdMS_TO_TICKS(50));
-        } else if (currentBootState == HIGH && lastBootState == LOW) {
-            unsigned long pressDuration = millis() - bootPressedTime;
-            if (pressDuration >= 400) { 
-                int memSlot = activeEffectMode;
-                if (activeEffectMode == 0) memSlot = 5; // Heel
-                else if (activeEffectMode == 5) memSlot = 6;
-                else if (activeEffectMode == 6) memSlot = 7;
-
-                if (pressDuration < 1500) effectMemory[memSlot] -= 1.0f;
-                else effectMemory[memSlot] += 1.0f;
-
-                if (effectMemory[memSlot] > 24.0f) effectMemory[memSlot] = 24.0f;
-                if (effectMemory[memSlot] < -24.0f) effectMemory[memSlot] = -24.0f;
-                
-                forceUIUpdate = true;
+        // --- FOOT BUTTONS HANDLING ---
+        if (btnFreeze.update(100)) {
+            if (btnFreeze.state == LOW) {
+                isFrozen = !isFrozen; 
+                if (activeEffectMode == 1) isWhammyActive = isFrozen; 
             }
-            lastActivityTime = millis();
         }
-        lastBootState = currentBootState;
 
-        // --- FREEZE BUTTON ---
-        bool currentFreezeBtnState = digitalRead(FREEZE_BUTTON_PIN);
-        if (currentFreezeBtnState == LOW && lastFreezeBtnState == HIGH) { 
-            isWhammyActive = !isWhammyActive; // Acts as master ON/OFF for Freeze
-            forceUIUpdate = true; lastActivityTime = millis();
-            vTaskDelay(pdMS_TO_TICKS(50));
+        if (btnFb.update(100)) {
+            if (btnFb.state == LOW) {
+                isFeedbackActive = !isFeedbackActive; 
+                if (activeEffectMode == 2) isWhammyActive = isFeedbackActive; 
+            }
         }
-        lastFreezeBtnState = currentFreezeBtnState;
-
-        // --- FEEDBACK BUTTON ---
-        bool currentFbBtnState = digitalRead(FEEDBACK_BUTTON_PIN);
-        if (currentFbBtnState == LOW && lastFbBtnState == HIGH) { 
-            isFeedbackActive = !isFeedbackActive; 
-            forceUIUpdate = true; lastActivityTime = millis();
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-        lastFbBtnState = currentFbBtnState;
         
-        // --- INTERVAL BUTTON ---
-        bool currentIntervalBtnState = digitalRead(INTERVAL_BUTTON_PIN);
-        if (currentIntervalBtnState == LOW && lastIntervalBtnState == HIGH) {
-            currentIntervalIdx = (currentIntervalIdx + 1) % 9;
-            effectMemory[activeEffectMode] = intervalList[currentIntervalIdx];
-            forceUIUpdate = true; lastActivityTime = millis();
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-        lastIntervalBtnState = currentIntervalBtnState;
-
-        if (currentCarouselState == LOW || currentBootState == LOW || currentFreezeBtnState == LOW || currentFbBtnState == LOW || currentIntervalBtnState == LOW) {
-            lastActivityTime = millis();
-            lastScreenActivityTime = millis(); 
-            if (isScreenOff) turnScreenOn();   
+        if (btnInterval.update(100)) {
+            if (btnInterval.state == LOW) {
+                currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
+                effectMemory[activeEffectMode] = intervalList[currentIntervalIdx]; 
+                updateLUT(); 
+            }
         }
 
-        // --- RESTORED: DUAL PEDAL READING AND MIDI ASSIGNMENT ---
-        filterPB.update();
-        filterPB2.update();
-        analog_t raw14_A = map(filterPB.getValue(), 0, 4095, 0, 16383);
-        analog_t raw14_B = map(filterPB2.getValue(), 0, 4095, 0, 16383);
-        analog_t calibratedA = map_PB(raw14_A, PBcenter1, PBdeadzone1, PBwasOffCenter1);
-        analog_t calibratedB = map_PB(raw14_B, PBcenter2, PBdeadzone2, PBwasOffCenter2);
-
-        currentPB1 = calibratedA;
-        currentPB2 = calibratedB;
-
-        bool movedA = abs((int)calibratedA - (int)lastMidiA) > 8;
-        bool movedB = abs((int)calibratedB - (int)lastMidiB) > 8; 
+        // --- EXPRESSION PEDAL MATH ---
+        filterPB.update(); 
+        filterPB2.update(); 
+        analog_t raw14_A = map(filterPB.getValue(), 0, 4095, 0, 16383); 
+        analog_t raw14_B = map(filterPB2.getValue(), 0, 4095, 0, 16383); 
+        analog_t calibratedA = map_PB(raw14_A, PBcenter1, PBdeadzone1, PBwasOffCenter1); 
+        analog_t calibratedB = map_PB(raw14_B, PBcenter2, PBdeadzone2, PBwasOffCenter2); 
+        
+        //bool movedA = abs((int)calibratedA - (int)lastMidiA) > 64;
+        //bool movedB = abs((int)calibratedB - (int)lastMidiB) > 64;
+        
+        bool movedA = false; // abs((int)calibratedA - (int)lastMidiA) > 8;
+        bool movedB = false; // abs((int)calibratedB - (int)lastMidiB) > 8;          
 
         if (movedA || movedB) {
-            if (isScreenOff) turnScreenOn();
-            lastScreenActivityTime = millis(); 
-            lastActivityTime = millis();
+            if (movedA) { currentPB1 = calibratedA; lastMidiA = calibratedA; }
+            if (movedB) { currentPB2 = calibratedB; lastMidiB = calibratedB; }
 
             analog_t activeMidi = movedB ? calibratedB : calibratedA;
-            
-            // Base pitch shift math derived directly from the VST
-            float basePitch = 0.0f;
-            if (activeEffectMode == 4) basePitch = effectMemory[4]; 
-            else if (activeEffectMode == 5) basePitch = effectMemory[6]; 
-            else if (activeEffectMode == 6) basePitch = effectMemory[7]; 
-            
-            float normalizedThrow = (activeMidi - 8192.0f) / 8192.0f;
-            float dynamicBend = (normalizedThrow >= 0.0f) ? (effectMemory[0] * normalizedThrow) : (effectMemory[5] * std::abs(normalizedThrow));
-            float totalShift = basePitch + dynamicBend;
-
-            if (activeEffectMode == 2) {
-                float intervals[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f };
-                totalShift = intervals[currentIntervalIdx % 5];
-            }
-
-            pitchShiftFactor = powf(2.0f, totalShift / 12.0f);
+            pitchShiftFactor = pitchShiftLUT[constrain(activeMidi, 0, 16383)];
             
             Control_Surface.sendPitchBend(Channel_1, activeMidi);
-            lastMidiA = calibratedA;
-            lastMidiB = calibratedB;
             lastMidiSent = activeMidi;
-            
-            forceUIUpdate = true;
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
-// --- RESTORED: MIDI CALLBACK WITH WAKEUP LOGIC ---
+// --- MIDI CALLBACK ---
 bool channelMessageCallback(ChannelMessage cm) {
     int newMode = -1;
     if (cm.header == 0xC0 && cm.data1 <= 6) newMode = cm.data1;
     else if (cm.header == 0xB0) {
-        if (cm.data1 == 3 && cm.data2 == 127) newMode = (activeEffectMode + 1) % 7;
-        else if (cm.data1 == 100) { isWhammyActive = (cm.data2 >= 64); forceUIUpdate = true; if(isScreenOff) turnScreenOn(); lastActivityTime = millis(); lastScreenActivityTime = millis(); }
-        else if (cm.data1 == 15 && cm.data2 == 127) latencyMode = (latencyMode + 1) % 4;
-        else if (cm.data1 == 110) { isFrozen = (cm.data2 >= 64); forceUIUpdate = true; if(isScreenOff) turnScreenOn(); lastActivityTime = millis(); lastScreenActivityTime = millis(); }
-        else if (cm.data1 == 111) { isFeedbackActive = (cm.data2 >= 64); forceUIUpdate = true; if(isScreenOff) turnScreenOn(); lastActivityTime = millis(); lastScreenActivityTime = millis(); }
+        if (cm.data1 == 3 && cm.data2 >= 64) {
+            newMode = (activeEffectMode + 1) % 7;
+        }
+        else if (cm.data1 == 100) { 
+            isWhammyActive = (cm.data2 >= 64); 
+            if (activeEffectMode == 1) isFrozen = isWhammyActive;
+            if (activeEffectMode == 2) isFeedbackActive = isWhammyActive;
+        }
+        else if (cm.data1 == 15 && cm.data2 >= 64) { 
+            latencyMode = (latencyMode + 1) % 4; 
+        }
+        else if (cm.data1 == 110) { 
+            isFrozen = (cm.data2 >= 64); 
+            if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+        }
+        else if (cm.data1 == 111) { 
+            isFeedbackActive = (cm.data2 >= 64); 
+            if (activeEffectMode == 2) isWhammyActive = isFeedbackActive; 
+        }
         else if (cm.data1 == 11) {
             uint16_t m = map(cm.data2, 0, 127, 0, 16383);
             currentCC11 = m;
-
-            // Direct Math match
-            float basePitch = 0.0f;
-            if (activeEffectMode == 4) basePitch = effectMemory[4]; 
-            else if (activeEffectMode == 5) basePitch = effectMemory[6]; 
-            else if (activeEffectMode == 6) basePitch = effectMemory[7]; 
-            float normalizedThrow = (m - 8192.0f) / 8192.0f;
-            float dynamicBend = (normalizedThrow >= 0.0f) ? (effectMemory[0] * normalizedThrow) : (effectMemory[5] * std::abs(normalizedThrow));
-            float totalShift = basePitch + dynamicBend;
-            if (activeEffectMode == 2) totalShift = 0.0f; 
-
-            pitchShiftFactor = powf(2.0f, totalShift / 12.0f);
+            pitchShiftFactor = pitchShiftLUT[m];
             lastMidiSent = m;
-            forceUIUpdate = true; if(isScreenOff) turnScreenOn(); lastActivityTime = millis(); lastScreenActivityTime = millis();
         }
     }
     if (newMode != -1 && newMode != activeEffectMode) {
         activeEffectMode = newMode; isHarmonizerMode = (newMode == 3); isCapoMode = (newMode == 4); isSynthMode = (newMode == 5); isPadMode = (newMode == 6);
-        isFeedbackActive = false; isFrozen = false; 
         
-        if (activeEffectMode == 1) isWhammyActive = false; 
-        else isWhammyActive = true;
-        
-        forceUIUpdate = true;
-        if (isScreenOff) turnScreenOn(); 
-        lastActivityTime = millis();
-        lastScreenActivityTime = millis();
+        if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+        else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive;
+        else isWhammyActive = true; 
     }
     return false;
 }
 
 void setup() {
+    pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP);
     pinMode(38, OUTPUT); digitalWrite(38, LOW); pinMode(15, OUTPUT); digitalWrite(15, HIGH);
     
-    // --- RESTORED: SERIAL INITIALIZATION ---
     Serial.begin(115200);
 
-    // --- RESTORED: ADVANCED DISPLAY INIT ---
     tft.init(); tft.setRotation(1); spr.createSprite(tft.width(), tft.height()); 
     tft.fillScreen(TFT_BLACK);
     tft.setTextDatum(MC_DATUM);
@@ -792,12 +738,14 @@ void setup() {
     delay(120);
     digitalWrite(38, HIGH);
 
-    // --- RESTORED: BLUETOOTH NAME ---
     btmidi.setName("Whammy_S3");
 
-    pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP); pinMode(FREEZE_BUTTON_PIN, INPUT_PULLUP);
-    pinMode(INTERVAL_BUTTON_PIN, INPUT_PULLUP); pinMode(FEEDBACK_BUTTON_PIN, INPUT_PULLUP);
-    pinMode(0, INPUT_PULLUP);
+    pinMode(FREEZE_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(INTERVAL_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(FEEDBACK_BUTTON_PIN, INPUT_PULLUP);
+
+    pinMode(pinPB, INPUT);
+    pinMode(pinPB2, INPUT);
 
     delayBuffer = (float*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     fbDelayBuffer = (float*)heap_caps_malloc(8192 * sizeof(float), MALLOC_CAP_SPIRAM);
@@ -806,13 +754,16 @@ void setup() {
     for (int i = 0; i < HANN_LUT_SIZE; i++) hannLUT[i] = sinf(PI * ((float)i / (float)(HANN_LUT_SIZE - 1)));
     FilteredAnalog<>::setupADC(); calibrateCenterAndDeadzone();
     
+    // FIX: Initializes the pitch table BEFORE audio DSP starts to prevent silent boots
+    updateLUT(); 
+    
     Control_Surface >> pipes >> btmidi; Control_Surface >> pipes >> usbmidi;
     usbmidi >> pipes >> Control_Surface; btmidi >> pipes >> Control_Surface;
     Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); Control_Surface.begin();
     
-    i2s_chan_config_t c = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); c.dma_desc_num = 6; c.dma_frame_num = 128;
+    i2s_chan_config_t c = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); c.dma_desc_num = 3; c.dma_frame_num = 64;
     i2s_new_channel(&c, &tx_chan, &rx_chan);
-    i2s_std_config_t s = { .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLING_FREQUENCY), .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), .gpio_cfg = { .bclk = GPIO_NUM_10, .ws = GPIO_NUM_12, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } };
+    i2s_std_config_t s = { .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLING_FREQUENCY), .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), .gpio_cfg = { .bclk = GPIO_NUM_10, .ws = GPIO_NUM_11, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } };
     i2s_channel_init_std_mode(tx_chan, &s); i2s_channel_init_std_mode(rx_chan, &s);
     i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan);
     

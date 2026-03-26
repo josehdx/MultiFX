@@ -157,47 +157,25 @@ void turnScreenOn() {
     }
 }
 
-void IRAM_ATTR wakeup_isr() {
-    // Dummy ISR required to register the wakeup event properly in the ESP32 Arduino Core
-}
-
 void goToLightSleep() {
     turnScreenOff();
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); 
+    rtc_gpio_pullup_en(GPIO_NUM_0); 
+    rtc_gpio_pulldown_dis(GPIO_NUM_0);
     
-    if (audioTaskHandle != NULL) {
-        vTaskSuspend(audioTaskHandle); 
-    }
-    
+    if (audioTaskHandle != NULL) vTaskSuspend(audioTaskHandle); 
     i2s_channel_disable(tx_chan);      
     i2s_channel_disable(rx_chan);      
     
-    // --- BULLETPROOF LIGHT SLEEP WAKEUP (ESP32-S3) ---
-    // 1. Explicitly force the pull-up resistor to remain ON while sleeping so it doesn't float
-    gpio_sleep_set_direction(GPIO_NUM_14, GPIO_MODE_INPUT);
-    gpio_sleep_set_pull_mode(GPIO_NUM_14, GPIO_PULLUP_ONLY);
-    
-    // 2. Attach interrupt to register the hardware event
-    attachInterrupt(digitalPinToInterrupt(CAROUSEL_BUTTON_PIN), wakeup_isr, LOW);
-    
-    // 3. Enable the pin as a wakeup source
-    gpio_wakeup_enable(GPIO_NUM_14, GPIO_INTR_LOW_LEVEL);
-    esp_sleep_enable_gpio_wakeup();
-    
-    // 4. Enter Sleep
     esp_light_sleep_start();
-    
-    // 5. Cleanup after waking up
-    detachInterrupt(digitalPinToInterrupt(CAROUSEL_BUTTON_PIN));
-    gpio_wakeup_disable(GPIO_NUM_14);
     
     i2s_channel_enable(tx_chan);
     i2s_channel_enable(rx_chan);
-    
-    if (audioTaskHandle != NULL) {
-        vTaskResume(audioTaskHandle); 
-    }
+    if (audioTaskHandle != NULL) vTaskResume(audioTaskHandle); 
     
     vTaskDelay(pdMS_TO_TICKS(200)); 
+    rtc_gpio_deinit(GPIO_NUM_0);    
+    pinMode(0, INPUT_PULLUP);
     
     turnScreenOn();
     lastActivityTime = millis();
@@ -343,9 +321,7 @@ void updateLUT() {
 
 // --- SCREEN RENDER LOGIC ---
 void updateDisplay() {
-    if (isScreenOff) {
-        return;
-    }
+    if (isScreenOff) return;
 
     spr.fillSprite(TFT_BLACK);
     spr.setTextDatum(MC_DATUM);
@@ -872,17 +848,17 @@ void MidiTask(void * pvParameters) {
             lastActivityTime = millis(); 
         }
 
-        // 2. Light Sleep Trigger (Timeout)
+        // 2. Light Sleep Trigger
         if (!btmidi.isConnected() && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) {
             goToLightSleep();
         }
 
-        // 3. Screen Off Trigger (Timeout)
+        // 3. Screen Off Trigger
         if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) {
             turnScreenOff();
         }
 
-        // --- BUTTON HANDLERS (Interactions do not reset timers) ---
+        // --- BUTTON HANDLERS (Interactions removed from timer resets) ---
         if (btnCar.update(100)) {
             if (btnCar.state == LOW) {
                 btnCar.pressedTime = millis();
@@ -952,15 +928,14 @@ void MidiTask(void * pvParameters) {
             int diffA = abs((int)calibratedA - (int)lastMidiA);
             int diffB = abs((int)calibratedB - (int)lastMidiB);
             
-            // THRESHOLD DETECTION: This logic resets ONLY Screen Timers
+            // THRESHOLD DETECTION: This is the ONLY logic that resets Screen Timers
             if (diffA > 256 || diffB > 256) {
-                if (isScreenOff) {
-                    turnScreenOn();
-                }
+                if (isScreenOff) turnScreenOn();
                 lastScreenActivityTime = millis();
+                // lastMidiSent = ... (Updates below)
             }
 
-            // TEST MODE: PBs movements do not send MIDI/DSP data
+            // TEST MODE: Forced false, PBs disabled for MIDI/DSP action
             bool movedA = false;
             bool movedB = false;
 
@@ -1085,8 +1060,8 @@ void setup() {
     pinMode(INTERVAL_BUTTON_PIN, INPUT_PULLUP); 
     pinMode(FEEDBACK_BUTTON_PIN, INPUT_PULLUP);
     
-    pinMode(pinPB, INPUT); 
-    pinMode(pinPB2, INPUT);
+    pinMode(pinPB, INPUT_PULLUP); 
+    pinMode(pinPB2, INPUT_PULLUP);
     
     delayBuffer = (float*)heap_caps_malloc(MAX_BUFFER_SIZE * 4, MALLOC_CAP_SPIRAM);
     fbDelayBuffer = (float*)heap_caps_malloc(8192 * 4, MALLOC_CAP_SPIRAM);

@@ -5,3 +5,34 @@ For Whammy effect, Long Press MIDI CC 3 ≥ 1500 ms :, Decrements the Toe/high i
 for whammy effect, short press Midi CC 15, from 0 ms to 1500 ms, Increments the heel/low interval value (+1.0). For all other modes, it decrements the active interval (-1.0).
 ements the active interval (-1.0).
 For Whammy effect, Long Press MIDI CC 15 ≥ 1500 ms :, Decrements the heel/low interval value (-1.0). For all other modes, it decr
+
+
+
+cpu optimizzations on 24:
+<
+implement:
+
+
+
+a pre-calculated 1024-value Look-Up Table (LUT) for the LFO 
+
+
+
+use a Waveshaper LUT.
+
+
+
+use hard-clipper.
+
+
+
+use bitwise masking 
+
+
+
+Use the ESP-IDF ADC Continuous Mode (DMA). 
+
+
+
+Convert the delayBuffer to 16-bit integers
+>

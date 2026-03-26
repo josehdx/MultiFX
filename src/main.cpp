@@ -58,7 +58,7 @@ int apf2Idx = 0;
 const float intervalList[] = {-12.0f, -7.0f, -5.0f, -2.0f, 0.0f, 2.0f, 5.0f, 7.0f, 12.0f};
 int currentIntervalIdx = 8; 
 
-// --- RESTORED: DUAL SLEEP CONFIGURATION ---
+// --- DUAL SLEEP CONFIGURATION ---
 unsigned long lastActivityTime = 0;       
 unsigned long lastScreenActivityTime = 0;
 const unsigned long LIGHT_SLEEP_TIMEOUT = 60000; 
@@ -117,7 +117,7 @@ volatile uint16_t currentCC11 = 0;
 volatile float ui_audio_level = 0.0f; 
 volatile float ui_output_level = 0.0f;
 
-// --- RESTORED: INDEPENDENT DUAL CALIBRATION VARIABLES ---
+// --- INDEPENDENT DUAL CALIBRATION VARIABLES ---
 double PBdeadzoneMultiplier = 14;
 double PBdeadzoneMinimum = 950;
 double PBdeadzoneMaximum = 1600;
@@ -154,7 +154,7 @@ inline float IRAM_ATTR getHermiteSample(float tapPos, float* buffer, int writeId
     return ((c3 * frac + c2) * frac + c1) * frac + y1;
 }
 
-// --- RESTORED: SLEEP LOGIC ---
+// --- SLEEP LOGIC ---
 void goToLightSleep() {
     digitalWrite(38, LOW);  
     digitalWrite(15, LOW);  
@@ -206,7 +206,7 @@ void turnScreenOn() {
     }
 }
 
-// --- RESTORED: DYNAMIC MAPPING FUNCTION ---
+// --- DYNAMIC MAPPING FUNCTION ---
 analog_t map_PB(analog_t raw, analog_t center, analog_t deadzone, bool &offCenterFlag) {
     raw = constrain(raw, PBminimumValue, PBmaximumValue);
     if (raw <= PBminimumValue + 150) { offCenterFlag = true; return 0; }
@@ -216,7 +216,7 @@ analog_t map_PB(analog_t raw, analog_t center, analog_t deadzone, bool &offCente
     else { return 8192; }
 }
 
-// --- RESTORED: INDEPENDENT DUAL CALIBRATION LOGIC ---
+// --- INDEPENDENT DUAL CALIBRATION LOGIC ---
 void calibrateCenterAndDeadzone() {
   for(int i=0; i<50; i++) { filterPB.update(); filterPB2.update(); delay(1); }
   
@@ -250,7 +250,7 @@ void calibrateCenterAndDeadzone() {
   PBdeadzone2 = (analog_t)constrain(((calibPBHigh2 - calibPBLow2) * PBdeadzoneMultiplier), PBdeadzoneMinimum, PBdeadzoneMaximum);
 }
 
-// --- RESTORED: ADVANCED SCREEN RENDER LOGIC ---
+// --- SCREEN RENDER LOGIC ---
 void updateDisplay() {
     spr.fillSprite(TFT_BLACK);
     spr.setTextDatum(MC_DATUM);
@@ -450,7 +450,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 if (freezeRamp > 0.0f) {
                     float phase = (float)freezeReadIdx / (float)freezeLength;
                     int i1 = freezeReadIdx, i2 = (freezeReadIdx + freezeLength / 2) % freezeLength;
-                    int l1 = (int)(phase * (HANN_LUT_SIZE - 1)), l2 = (int)(fmodf(phase + 0.5f, 1.0f) * (HANN_LUT_SIZE - 1));
+                    
+                    // OPTIMIZATION: Removed fmodf for basic phase-wrapping arithmetic
+                    float phase2 = phase + 0.5f;
+                    if (phase2 >= 1.0f) phase2 -= 1.0f;
+
+                    int l1 = (int)(phase * (HANN_LUT_SIZE - 1)), l2 = (int)(phase2 * (HANN_LUT_SIZE - 1));
                     float rawFreeze = (freezeBuffer[i1] * hannLUT[l1]) + (freezeBuffer[i2] * hannLUT[l2]);
                     
                     float d1 = apf1Buffer[apf1Idx]; 
@@ -478,6 +483,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float drift = powf(2.0f, (15.0f * sinf(feedbackLfoPhase)) / 1200.0f);
                     f1 = 1.0f * drift; f2 = pitchShiftFactor * drift;
                 }
+                
                 float r1 = 1.0f - f1, r2 = 1.0f - f2;
                 int idx1 = (int)((tap1/currentWindowSize)*(HANN_LUT_SIZE-1)), idx2 = (int)((tap2/currentWindowSize)*(HANN_LUT_SIZE-1));
                 w1 = (getHermiteSample(tap1, delayBuffer, writeIndex)*hannLUT[idx1]) + (getHermiteSample(tap2, delayBuffer, writeIndex)*hannLUT[idx2]);
@@ -486,8 +492,23 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     int idx1_2 = (int)((tap1_2/currentWindowSize)*(HANN_LUT_SIZE-1)), idx2_2 = (int)((tap2_2/currentWindowSize)*(HANN_LUT_SIZE-1));
                     w2 = (getHermiteSample(tap1_2, delayBuffer, writeIndex)*hannLUT[idx1_2]) + (getHermiteSample(tap2_2, delayBuffer, writeIndex)*hannLUT[idx2_2]);
                 }
-                tap1 = fmodf(tap1 + r1 + currentWindowSize, currentWindowSize); tap2 = fmodf(tap2 + r1 + currentWindowSize, currentWindowSize);
-                tap1_2 = fmodf(tap1_2 + r2 + currentWindowSize, currentWindowSize); tap2_2 = fmodf(tap2_2 + r2 + currentWindowSize, currentWindowSize);
+
+                // OPTIMIZATION: Replaced fmodf() with efficient while/if arithmetic bounds-checking
+                tap1 += r1;
+                while (tap1 >= currentWindowSize) tap1 -= currentWindowSize;
+                while (tap1 < 0.0f) tap1 += currentWindowSize;
+
+                tap2 += r1;
+                while (tap2 >= currentWindowSize) tap2 -= currentWindowSize;
+                while (tap2 < 0.0f) tap2 += currentWindowSize;
+
+                tap1_2 += r2;
+                while (tap1_2 >= currentWindowSize) tap1_2 -= currentWindowSize;
+                while (tap1_2 < 0.0f) tap1_2 += currentWindowSize;
+
+                tap2_2 += r2;
+                while (tap2_2 >= currentWindowSize) tap2_2 -= currentWindowSize;
+                while (tap2_2 < 0.0f) tap2_2 += currentWindowSize;
                 
                 writeIndex = (writeIndex + 1) & BUFFER_MASK;
 
@@ -505,7 +526,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     fbHpfState += 0.05f * (bloomed - fbHpfState);
                     float scream = tanhf((bloomed - fbHpfState) * 30.0f);
                     feedbackFilter = feedbackFilter * 0.9f + scream * 0.1f;
-                    float rawFb = feedbackFilter * powf(feedbackRamp, 3.0f) * 0.85f;
+                    
+                    // OPTIMIZATION: Replaced powf(x, 3.0f) with raw multiplication mapping cubic feedbackSwellCurve
+                    float r = feedbackRamp;
+                    float rampCubed = r * r * r; 
+                    float rawFb = feedbackFilter * rampCubed * 0.85f;
+                    
                     int rIdx = (fbDelayWriteIdx - (int)(SAMPLING_FREQUENCY * (20.0f/1000.0f)) + 8192) % 8192;
                     fbDelayBuffer[fbDelayWriteIdx] = rawFb; fbDelayWriteIdx = (fbDelayWriteIdx + 1) % 8192;
                     feedbackOut = fbDelayBuffer[rIdx];
@@ -563,7 +589,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     }
 }
 
-// --- RESTORED: MIDI TASK WITH DUAL PEDALS & WAKEUP LOGIC ---
+// --- MIDI TASK WITH DUAL PEDALS & WAKEUP LOGIC ---
 void MidiTask(void * pvParameters) {
     static bool lastBtState = false; 
     static analog_t lastMidiA = 8192;
@@ -681,7 +707,7 @@ void MidiTask(void * pvParameters) {
             if (isScreenOff) turnScreenOn();   
         }
 
-        // --- RESTORED: DUAL PEDAL READING AND MIDI ASSIGNMENT ---
+        // --- DUAL PEDAL READING AND MIDI ASSIGNMENT ---
         filterPB.update();
         filterPB2.update();
         analog_t raw14_A = map(filterPB.getValue(), 0, 4095, 0, 16383);
@@ -692,8 +718,8 @@ void MidiTask(void * pvParameters) {
         currentPB1 = calibratedA;
         currentPB2 = calibratedB;
 
-        bool movedA = abs((int)calibratedA - (int)lastMidiA) > 8;
-        bool movedB = abs((int)calibratedB - (int)lastMidiB) > 8; 
+        bool movedA = false; // abs((int)calibratedA - (int)lastMidiA) > 8;
+        bool movedB = false; // abs((int)calibratedB - (int)lastMidiB) > 8; 
 
         if (movedA || movedB) {
             if (isScreenOff) turnScreenOn();
@@ -731,7 +757,7 @@ void MidiTask(void * pvParameters) {
     }
 }
 
-// --- RESTORED: MIDI CALLBACK WITH WAKEUP LOGIC ---
+// --- MIDI CALLBACK WITH WAKEUP LOGIC ---
 bool channelMessageCallback(ChannelMessage cm) {
     int newMode = -1;
     if (cm.header == 0xC0 && cm.data1 <= 6) newMode = cm.data1;
@@ -778,10 +804,8 @@ bool channelMessageCallback(ChannelMessage cm) {
 void setup() {
     pinMode(38, OUTPUT); digitalWrite(38, LOW); pinMode(15, OUTPUT); digitalWrite(15, HIGH);
     
-    // --- RESTORED: SERIAL INITIALIZATION ---
     Serial.begin(115200);
 
-    // --- RESTORED: ADVANCED DISPLAY INIT ---
     tft.init(); tft.setRotation(1); spr.createSprite(tft.width(), tft.height()); 
     tft.fillScreen(TFT_BLACK);
     tft.setTextDatum(MC_DATUM);
@@ -792,13 +816,15 @@ void setup() {
     delay(120);
     digitalWrite(38, HIGH);
 
-    // --- RESTORED: BLUETOOTH NAME ---
     btmidi.setName("Whammy_S3");
 
     pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP); pinMode(FREEZE_BUTTON_PIN, INPUT_PULLUP);
     pinMode(INTERVAL_BUTTON_PIN, INPUT_PULLUP); pinMode(FEEDBACK_BUTTON_PIN, INPUT_PULLUP);
     pinMode(0, INPUT_PULLUP);
 
+    pinMode(pinPB, INPUT_PULLUP);
+    pinMode(pinPB2, INPUT_PULLUP);
+    
     delayBuffer = (float*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     fbDelayBuffer = (float*)heap_caps_malloc(8192 * sizeof(float), MALLOC_CAP_SPIRAM);
     freezeBuffer = (float*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
@@ -810,7 +836,8 @@ void setup() {
     usbmidi >> pipes >> Control_Surface; btmidi >> pipes >> Control_Surface;
     Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); Control_Surface.begin();
     
-    i2s_chan_config_t c = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); c.dma_desc_num = 6; c.dma_frame_num = 128;
+    // OPTIMIZATION: Lowered DMA buffer size for lower physical latency
+    i2s_chan_config_t c = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); c.dma_desc_num = 3; c.dma_frame_num = 64;
     i2s_new_channel(&c, &tx_chan, &rx_chan);
     i2s_std_config_t s = { .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLING_FREQUENCY), .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), .gpio_cfg = { .bclk = GPIO_NUM_10, .ws = GPIO_NUM_12, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } };
     i2s_channel_init_std_mode(tx_chan, &s); i2s_channel_init_std_mode(rx_chan, &s);

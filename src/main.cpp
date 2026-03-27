@@ -100,7 +100,7 @@ const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 unsigned long lastActivityTime = 0;       
 unsigned long lastScreenActivityTime = 0;
 const unsigned long LIGHT_SLEEP_TIMEOUT = 60000; 
-const unsigned long SCREEN_OFF_TIMEOUT = 120000;  
+const unsigned long SCREEN_OFF_TIMEOUT = 600000;  
 bool isScreenOff = false;
 
 // --- PIN ASSIGNMENTS ---

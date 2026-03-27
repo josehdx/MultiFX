@@ -1,33 +1,29 @@
-Change this:
+            int diffA = abs((int)calibratedA - (int)lastMidiA);
+            int diffB = abs((int)calibratedB - (int)lastMidiB);
+            
+            // THRESHOLD DETECTION: This logic resets ONLY Screen Timers
+            if (diffA > 256 || diffB > 256) {
+                if (isScreenOff) turnScreenOn();
+                lastScreenActivityTime = millis();
+            }
 
-C++
-        // RESTORED: Actually check if the pedals moved more than 8 units
-        bool movedA = abs((int)calibratedA - (int)lastMidiA) > 8;
-        bool movedB = abs((int)calibratedB - (int)lastMidiB) > 8;     
-To this:
+            // ACTIVE MODE
+            bool movedA = diffA > 8;
+            bool movedB = diffB > 8;
 
-C++
-        // OVERRIDDEN FOR TESTING: Force pedals to never "move"
-        bool movedA = false;
-        bool movedB = false;    
-2. Re-apply the Hardware Clamps
-If nothing is plugged into the analog pins, they act like little antennas and pick up electromagnetic noise from the room. We need to digitally tie them to 3.3V so they sit perfectly still.
 
-Scroll down to your setup() function (around line 730) and uncomment those two lines we previously turned off:
 
-Change this:
+to this
 
-C++
-    // --- PLACE THE OVERRIDES HERE FOR YOUR TEST ---
-        //pinMode(pinPB, INPUT);
-        //pinMode(pinPB2, INPUT);
-    
-    FilteredAnalog<>::setupADC();
-To this:
+            int diffA = abs((int)calibratedA - (int)lastMidiA);
+            int diffB = abs((int)calibratedB - (int)lastMidiB);
+            
+            // THRESHOLD DETECTION: Only PB1 (diffA) can wake the screen now
+            if (diffA > 256) {
+                if (isScreenOff) turnScreenOn();
+                lastScreenActivityTime = millis();
+            }
 
-C++
-    // --- PLACE THE OVERRIDES HERE FOR YOUR TEST ---
-    pinMode(pinPB, INPUT_PULLUP);
-    pinMode(pinPB2, INPUT_PULLUP);
-    
-    FilteredAnalog<>::setupADC();
+            // ACTIVE MODE
+            bool movedA = diffA > 8;
+            bool movedB = false; // PB2 is forced OFF and will be completely ignored

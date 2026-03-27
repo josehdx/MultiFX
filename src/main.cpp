@@ -109,7 +109,7 @@ pin_t pinPB2 = 2;    // GPIO 2
 const int BOOT_SENSE_PIN = 0; 
 const int CAROUSEL_BUTTON_PIN = 14; 
 const int FREEZE_BUTTON_PIN = 18;    
-const int INTERVAL_BUTTON_PIN = 21; 
+const int INTERVAL_BUTTON_PIN = 44; 
 const int FEEDBACK_BUTTON_PIN = 13;  
 
 uint16_t lastMidiSent = 8192;
@@ -912,8 +912,8 @@ void MidiTask(void * pvParameters) {
             }
 
             // TEST MODE: PBs movements do not send MIDI/DSP data
-            bool movedA = false;
-            bool movedB = false;
+            bool movedA = diffA > 8;
+            bool movedB = diffB > 8;
 
             if (movedA || movedB) {
                 if (movedA) { 

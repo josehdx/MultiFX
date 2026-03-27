@@ -75,6 +75,7 @@ TaskHandle_t audioTaskHandle = NULL;
 // --- TFT DISPLAY ---
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite spr = TFT_eSprite(&tft); 
+volatile bool forceUIUpdate = true; // Added for screen UI force refresh
 
 // --- EFFECT STATE ---
 int activeEffectMode = 0; 
@@ -102,6 +103,7 @@ unsigned long lastScreenActivityTime = 0;
 const unsigned long LIGHT_SLEEP_TIMEOUT = 60000; 
 const unsigned long SCREEN_OFF_TIMEOUT = 600000;  
 bool isScreenOff = false;
+volatile bool wakeupPending = false; // Added to trigger async boot
 
 // --- PIN ASSIGNMENTS ---
 pin_t pinPB = 1;     // GPIO 1
@@ -150,14 +152,9 @@ void turnScreenOff() {
 }
 
 void turnScreenOn() {
-    if (isScreenOff) {
-        pinMode(15, OUTPUT);
-        digitalWrite(15, HIGH); 
-        tft.init(); 
-        delay(120);
-        pinMode(38, OUTPUT); 
-        digitalWrite(38, HIGH); 
-        isScreenOff = false;
+    // Completely non-blocking. Offloads logic to DisplayTask.
+    if (isScreenOff && !wakeupPending) {
+        wakeupPending = true;
     }
 }
 
@@ -335,8 +332,6 @@ void updateLUT() {
 
 // --- SCREEN RENDER LOGIC ---
 void updateDisplay() {
-    if (isScreenOff) return;
-
     spr.fillSprite(TFT_BLACK);
     spr.setTextDatum(MC_DATUM);
     spr.setTextSize(1);
@@ -469,7 +464,24 @@ void updateDisplay() {
 
 void DisplayTask(void * pvParameters) {
     for(;;) {
-        updateDisplay(); 
+        // Asynchronous Wakeup
+        if (wakeupPending) {
+            pinMode(15, OUTPUT);
+            digitalWrite(15, HIGH); 
+            tft.init(); 
+            vTaskDelay(pdMS_TO_TICKS(120)); // FreeRTOS Yielding delay
+            pinMode(38, OUTPUT); 
+            digitalWrite(38, HIGH); 
+            
+            isScreenOff = false;
+            wakeupPending = false;
+            forceUIUpdate = true; // Ensure UI updates once it turns on
+        }
+
+        if (forceUIUpdate || (!isScreenOff && (ui_audio_level > 0.02f || ui_output_level > 0.02f))) {
+            updateDisplay();
+            forceUIUpdate = false;
+        }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -860,6 +872,7 @@ void MidiTask(void * pvParameters) {
                     }
                     updateLUT(); 
                 }
+                forceUIUpdate = true;
             }
         }
 
@@ -869,6 +882,7 @@ void MidiTask(void * pvParameters) {
                 if (activeEffectMode == 1) {
                     isWhammyActive = isFrozen; 
                 }
+                forceUIUpdate = true;
             }
         }
 
@@ -878,6 +892,7 @@ void MidiTask(void * pvParameters) {
                 if (activeEffectMode == 2) {
                     isWhammyActive = isFeedbackActive; 
                 }
+                forceUIUpdate = true;
             }
         }
         
@@ -886,6 +901,7 @@ void MidiTask(void * pvParameters) {
                 currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
                 effectMemory[activeEffectMode] = intervalList[currentIntervalIdx]; 
                 updateLUT(); 
+                forceUIUpdate = true;
             }
         }
 
@@ -905,16 +921,17 @@ void MidiTask(void * pvParameters) {
             int diffA = abs((int)calibratedA - (int)lastMidiA);
             int diffB = abs((int)calibratedB - (int)lastMidiB);
             
-            // THRESHOLD DETECTION: This logic resets ONLY Screen Timers
+            // THRESHOLD DETECTION: This logic triggers waking and updates timers
             if (diffA > 256 || diffB > 256) {
                 if (isScreenOff) turnScreenOn();
                 lastScreenActivityTime = millis();
+                forceUIUpdate = true;
             }
 
-            // TEST MODE: PBs movements do not send MIDI/DSP data
+            // ACTIVE MODE
             bool movedA = diffA > 8;
-            bool movedB = diffB > 8;
-
+            bool movedB = false; // PB2 is forced OFF and will be completely ignored
+            
             if (movedA || movedB) {
                 if (movedA) { 
                     currentPB1 = calibratedA; 
@@ -929,6 +946,7 @@ void MidiTask(void * pvParameters) {
                 pitchShiftFactor = pitchShiftLUT[constrain(activeMidi, 0, 16383)];
                 Control_Surface.sendPitchBend(Channel_1, activeMidi);
                 lastMidiSent = activeMidi;
+                forceUIUpdate = true;
             }
         }
 
@@ -953,6 +971,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive;
         else isWhammyActive = true; 
         updateLUT();
+        forceUIUpdate = true;
     }
     else if (cm.header == 0xB0) {
         if (cm.data1 == 3) {
@@ -970,6 +989,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[slot] = constrain(effectMemory[slot] + 1.0f, -24.0f, 24.0f);
                 }
                 updateLUT();
+                forceUIUpdate = true;
             }
         }
         else if (cm.data1 == 15) {
@@ -987,25 +1007,30 @@ bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[slot] = constrain(effectMemory[slot] - 1.0f, -24.0f, 24.0f);
                 }
                 updateLUT();
+                forceUIUpdate = true;
             }
         }
         else if (cm.data1 == 100) { 
             isWhammyActive = (cm.data2 >= 64); 
             if (activeEffectMode == 1) isFrozen = isWhammyActive;
             if (activeEffectMode == 2) isFeedbackActive = isWhammyActive;
+            forceUIUpdate = true;
         }
         else if (cm.data1 == 110) { 
             isFrozen = (cm.data2 >= 64); 
             if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+            forceUIUpdate = true;
         }
         else if (cm.data1 == 111) { 
             isFeedbackActive = (cm.data2 >= 64); 
             if (activeEffectMode == 2) isWhammyActive = isFeedbackActive; 
+            forceUIUpdate = true;
         }
         else if (cm.data1 == 11) { 
             uint16_t m = map(cm.data2, 0, 127, 0, 16383); 
             currentCC11 = m; 
             pitchShiftFactor = pitchShiftLUT[m]; 
+            forceUIUpdate = true;
         }
     }
     return false;

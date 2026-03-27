@@ -101,7 +101,7 @@ const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 unsigned long lastActivityTime = 0;       
 unsigned long lastScreenActivityTime = 0;
 const unsigned long LIGHT_SLEEP_TIMEOUT = 60000; 
-const unsigned long SCREEN_OFF_TIMEOUT = 120000;  
+const unsigned long SCREEN_OFF_TIMEOUT = 65000;  
 bool isScreenOff = false;
 volatile bool wakeupPending = false; // Added to trigger async boot
 
@@ -809,7 +809,6 @@ struct DebouncedButton {
 void MidiTask(void * pvParameters) {
     static analog_t lastMidiA = 8192;
     static analog_t lastMidiB = 8192; 
-    static bool lastBtState = false; // Added to track BT connection changes
 
     static DebouncedButton btnCar(CAROUSEL_BUTTON_PIN);
     static DebouncedButton btnFreeze(FREEZE_BUTTON_PIN);
@@ -833,22 +832,13 @@ void MidiTask(void * pvParameters) {
     for(;;) {
         Control_Surface.loop();
 
-        // --- BT STATE TRACKING ---
-        bool currentBtState = btmidi.isConnected();
-        if (currentBtState != lastBtState) {
-            lastBtState = currentBtState;
-            forceUIUpdate = true;
-            if (isScreenOff) turnScreenOn();
-            lastActivityTime = millis();
-        }
-
         // 1. Only Bluetooth connection status prevents the controller to sleep
-        if (currentBtState) {
+        if (btmidi.isConnected()) {
             lastActivityTime = millis(); 
         }
 
         // 2. Light Sleep Trigger
-        if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) {
+        if (!btmidi.isConnected() && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) {
             goToLightSleep();
         }
 
@@ -931,15 +921,17 @@ void MidiTask(void * pvParameters) {
             int diffA = abs((int)calibratedA - (int)lastMidiA);
             int diffB = abs((int)calibratedB - (int)lastMidiB);
             
-            // THRESHOLD DETECTION: Disabled for testing
+            // THRESHOLD DETECTION: This logic triggers waking and updates timers
+            // Commented out to prevent noisy floating pins from waking the screen
             /*
-            if (diffA > 256) {
+            if (diffA > 256 || diffB > 256) {
                 if (isScreenOff) turnScreenOn();
                 lastScreenActivityTime = millis();
+                forceUIUpdate = true;
             }
             */
 
-            // ACTIVE MODE: Disabled for testing
+            // ACTIVE MODE
             bool movedA = false; // diffA > 8; // PB1 forced OFF
             bool movedB = false; // PB2 forced OFF
             

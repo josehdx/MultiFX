@@ -298,43 +298,46 @@ void calibrateCenterAndDeadzone() {
 }
 
 void updateLUT() {
-    for (int i = 0; i < 16384; i++) {
-        float totalShift = 0.0f;
+    bool isStaticIntervalMode = (activeEffectMode == 2);
+    
+    if (isStaticIntervalMode) {
+        float intervals[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f };
+        float staticTotalShift = intervals[currentIntervalIdx % 5];
+        float staticRatio = powf(2.0f, staticTotalShift / 12.0f);
         
-        if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 3 ||
-            activeEffectMode == 4 || activeEffectMode == 5 || activeEffectMode == 6 || activeEffectMode == 7) {
-            
+        for (int i = 0; i < 16384; i++) {
+            pitchShiftLUT[i] = staticRatio;
+        }
+    } else {
+        float basePitch = 0.0f;
+        if (isCapoMode) {
+            basePitch += effectMemory[4]; 
+        }
+        
+        if (activeEffectMode == 5) {
+            basePitch += effectMemory[6]; 
+        } else if (activeEffectMode == 6) {
+            basePitch += effectMemory[7]; 
+        } else if (activeEffectMode == 7) {
+            basePitch += effectMemory[8]; 
+        }
+        
+        float toeBend = effectMemory[0];
+        float heelBend = effectMemory[5];
+        
+        for (int i = 0; i < 16384; i++) {
             float normalizedThrow = (float(i) - 8192.0f) / 8192.0f;
             float dynamicBend = 0.0f;
             
             if (normalizedThrow >= 0.0f) {
-                dynamicBend = effectMemory[0] * normalizedThrow;
+                dynamicBend = toeBend * normalizedThrow;
             } else {
-                dynamicBend = effectMemory[5] * std::abs(normalizedThrow);
+                dynamicBend = heelBend * std::abs(normalizedThrow);
             }
             
-            float basePitch = 0.0f;
-            
-            if (isCapoMode) {
-                basePitch += effectMemory[4]; 
-            }
-            
-            if (activeEffectMode == 5) {
-                basePitch += effectMemory[6]; 
-            } else if (activeEffectMode == 6) {
-                basePitch += effectMemory[7]; 
-            } else if (activeEffectMode == 7) {
-                basePitch += effectMemory[8]; 
-            }
-            
-            totalShift = basePitch + dynamicBend;
-            
-        } else if (activeEffectMode == 2) {
-            float intervals[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f };
-            totalShift = intervals[currentIntervalIdx % 5];
+            float totalShift = basePitch + dynamicBend;
+            pitchShiftLUT[i] = powf(2.0f, totalShift / 12.0f);
         }
-        
-        pitchShiftLUT[i] = powf(2.0f, totalShift / 12.0f);
     }
 }
 
@@ -573,7 +576,8 @@ void DisplayTask(void * pvParameters) {
             forceUIUpdate = false;
         }
         
-        vTaskDelay(pdMS_TO_TICKS(20));
+        // REDUCED DELAY: Screen updates 4x faster to eliminate visual latency
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -1058,15 +1062,13 @@ void MidiTask(void * pvParameters) {
             int diffA = abs((int)calibratedA - (int)lastMidiA);
             int diffB = abs((int)calibratedB - (int)lastMidiB);
             
-            // THRESHOLD DETECTION: Only PB1 (diffA) can wake the screen now
             if (diffA > 256) {
                 if (isScreenOff) turnScreenOn();
                 lastScreenActivityTime = millis();
             }
 
-            // ACTIVE MODE
-            bool movedA = false;
-            bool movedB = false; //
+            bool movedA = diffA > 8; 
+            bool movedB = false; 
             
             if (movedA || movedB) {
                 if (movedA) { 

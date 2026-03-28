@@ -1055,8 +1055,18 @@ void MidiTask(void * pvParameters) {
             analog_t calibratedA = map_PB(raw14_A, PBcenter1, PBdeadzone1, PBwasOffCenter1); 
             analog_t calibratedB = map_PB(raw14_B, PBcenter2, PBdeadzone2, PBwasOffCenter2); 
             
-            bool movedA = false; 
-            bool movedB = false; 
+            int diffA = abs((int)calibratedA - (int)lastMidiA);
+            int diffB = abs((int)calibratedB - (int)lastMidiB);
+            
+            // THRESHOLD DETECTION: Only PB1 (diffA) can wake the screen now
+            if (diffA > 256) {
+                if (isScreenOff) turnScreenOn();
+                lastScreenActivityTime = millis();
+            }
+
+            // ACTIVE MODE
+            bool movedA = false;
+            bool movedB = false; //
             
             if (movedA || movedB) {
                 if (movedA) { 

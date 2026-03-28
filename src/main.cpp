@@ -100,8 +100,8 @@ const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 // --- POWER SAVING GLOBALS ---
 unsigned long lastActivityTime = 0;       
 unsigned long lastScreenActivityTime = 0;
-const unsigned long LIGHT_SLEEP_TIMEOUT = 60000; 
-const unsigned long SCREEN_OFF_TIMEOUT = 120000;  
+const unsigned long LIGHT_SLEEP_TIMEOUT = 600000; 
+const unsigned long SCREEN_OFF_TIMEOUT = 900000;  
 bool isScreenOff = false;
 volatile bool wakeupPending = false; // Added to trigger async boot
 
@@ -967,11 +967,6 @@ void MidiTask(void * pvParameters) {
 
 // --- MIDI CALLBACK ---
 bool channelMessageCallback(ChannelMessage cm) {
-    static unsigned long cc3Timer = 0;
-    static bool cc3Active = false;
-    static unsigned long cc15Timer = 0;
-    static bool cc15Active = false;
-
     if (cm.header == 0xC0 && cm.data1 <= 6) {
         activeEffectMode = cm.data1; 
         isHarmonizerMode = (activeEffectMode == 3); 
@@ -985,42 +980,86 @@ bool channelMessageCallback(ChannelMessage cm) {
         forceUIUpdate = true;
     }
     else if (cm.header == 0xB0) {
-        if (cm.data1 == 3) {
-            if (cm.data2 >= 64) {
-                cc3Timer = millis();
-                cc3Active = true;
-            } 
-            else if (cc3Active) {
-                cc3Active = false;
-                unsigned long dur = millis() - cc3Timer;
-                if (activeEffectMode == 0) {
-                    effectMemory[0] = constrain(effectMemory[0] + (dur < 1500 ? 1.0f : -1.0f), -24.0f, 24.0f);
-                } else {
-                    int slot = (activeEffectMode == 5) ? 6 : (activeEffectMode == 6 ? 7 : activeEffectMode);
-                    effectMemory[slot] = constrain(effectMemory[slot] + 1.0f, -24.0f, 24.0f);
+        
+        // --- CAROUSEL NAVIGATION (CC 4 & CC 5) ---
+        if (cm.data1 == 5 && cm.data2 == 0) { // Forward
+            activeEffectMode = (activeEffectMode + 1) % 7;
+            isHarmonizerMode = (activeEffectMode == 3); 
+            isCapoMode = (activeEffectMode == 4); 
+            isSynthMode = (activeEffectMode == 5); 
+            isPadMode = (activeEffectMode == 6);
+            if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+            else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive;
+            else isWhammyActive = true; 
+            updateLUT();
+            forceUIUpdate = true;
+        }
+        else if (cm.data1 == 4 && cm.data2 == 0) { // Backward
+            activeEffectMode = (activeEffectMode == 0) ? 6 : (activeEffectMode - 1);
+            isHarmonizerMode = (activeEffectMode == 3); 
+            isCapoMode = (activeEffectMode == 4); 
+            isSynthMode = (activeEffectMode == 5); 
+            isPadMode = (activeEffectMode == 6);
+            if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+            else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive;
+            else isWhammyActive = true; 
+            updateLUT();
+            forceUIUpdate = true;
+        }
+        
+        // --- LATENCY CAROUSEL (CC 6) ---
+        else if (cm.data1 == 6 && cm.data2 == 0) { 
+            latencyMode = (latencyMode + 1) % 4;
+            forceUIUpdate = true;
+        }
+        
+        // --- CC 3 LOGIC ---
+        else if (cm.data1 == 3) {
+            if (activeEffectMode == 0) { // Whammy Effect
+                if (cm.data2 == 0) {
+                    // CC 3, Value 0: Increase Heel/Low
+                    effectMemory[5] = constrain(effectMemory[5] + 1.0f, -24.0f, 24.0f);
+                } else if (cm.data2 == 127) {
+                    // CC 3, Value 127: Decrease Heel/Low
+                    effectMemory[5] = constrain(effectMemory[5] - 1.0f, -24.0f, 24.0f);
                 }
                 updateLUT();
                 forceUIUpdate = true;
-            }
-        }
-        else if (cm.data1 == 15) {
-            if (cm.data2 >= 64) {
-                cc15Timer = millis();
-                cc15Active = true;
-            } 
-            else if (cc15Active) {
-                cc15Active = false;
-                unsigned long dur = millis() - cc15Timer;
-                if (activeEffectMode == 0) {
-                    effectMemory[5] = constrain(effectMemory[5] + (dur < 1500 ? 1.0f : -1.0f), -24.0f, 24.0f);
-                } else {
+            } else { // Any Other Effect
+                if (cm.data2 == 127) {
+                    // CC 3, Value 127: Reduce active interval
                     int slot = (activeEffectMode == 5) ? 6 : (activeEffectMode == 6 ? 7 : activeEffectMode);
                     effectMemory[slot] = constrain(effectMemory[slot] - 1.0f, -24.0f, 24.0f);
+                    updateLUT();
+                    forceUIUpdate = true;
+                }
+            }
+        }
+        
+        // --- CC 15 LOGIC ---
+        else if (cm.data1 == 15) {
+            if (activeEffectMode == 0) { // Whammy Effect
+                if (cm.data2 == 0) {
+                    // CC 15, Value 0: Increase Toe/High
+                    effectMemory[0] = constrain(effectMemory[0] + 1.0f, -24.0f, 24.0f);
+                } else if (cm.data2 == 127) {
+                    // CC 15, Value 127: Decrease Toe/High
+                    effectMemory[0] = constrain(effectMemory[0] - 1.0f, -24.0f, 24.0f);
                 }
                 updateLUT();
                 forceUIUpdate = true;
+            } else { // Any Other Effect
+                if (cm.data2 == 0) {
+                    // CC 15, Value 0: Increase active interval
+                    int slot = (activeEffectMode == 5) ? 6 : (activeEffectMode == 6 ? 7 : activeEffectMode);
+                    effectMemory[slot] = constrain(effectMemory[slot] + 1.0f, -24.0f, 24.0f);
+                    updateLUT();
+                    forceUIUpdate = true;
+                }
             }
         }
+        
+        // --- BYPASS & TOGGLES ---
         else if (cm.data1 == 100) { 
             isWhammyActive = (cm.data2 >= 64); 
             if (activeEffectMode == 1) isFrozen = isWhammyActive;

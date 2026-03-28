@@ -82,7 +82,7 @@ int activeEffectMode = 0;
 float effectMemory[8] = { 12.0f, 12.0f, 12.0f, 5.0f, -2.0f, -12.0f, -12.0f, 12.0f };
 volatile float pitchShiftFactor = 1.0f;
 
-volatile bool isWhammyActive = true; 
+volatile bool isWhammyActive = true;  // ENABLED by default
 volatile bool isFrozen = false;
 volatile bool isFeedbackActive = false;
 volatile bool isHarmonizerMode = false;
@@ -101,7 +101,7 @@ const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 unsigned long lastActivityTime = 0;       
 unsigned long lastScreenActivityTime = 0;
 const unsigned long LIGHT_SLEEP_TIMEOUT = 600000; 
-const unsigned long SCREEN_OFF_TIMEOUT = 900000;  
+const unsigned long SCREEN_OFF_TIMEOUT = 1200000;  
 bool isScreenOff = false;
 volatile bool wakeupPending = false; // Added to trigger async boot
 
@@ -294,6 +294,7 @@ void calibrateCenterAndDeadzone() {
     PBdeadzone2 = (analog_t)constrain(((calibPBHigh2 - calibPBLow2) * PBdeadzoneMultiplier), PBdeadzoneMinimum, PBdeadzoneMaximum);
 }
 
+// --- UPDATED LUT CALCULATION ---
 void updateLUT() {
     for (int i = 0; i < 16384; i++) {
         float totalShift = 0.0f;
@@ -311,12 +312,14 @@ void updateLUT() {
             }
             
             float basePitch = 0.0f;
-            if (activeEffectMode == 4) {
-                basePitch = effectMemory[4]; 
-            } else if (activeEffectMode == 5) {
-                basePitch = effectMemory[6]; 
+            if (isCapoMode) {
+                basePitch += effectMemory[4]; 
+            }
+            
+            if (activeEffectMode == 5) {
+                basePitch += effectMemory[6]; 
             } else if (activeEffectMode == 6) {
-                basePitch = effectMemory[7]; 
+                basePitch += effectMemory[7]; 
             }
             
             totalShift = basePitch + dynamicBend;
@@ -330,7 +333,7 @@ void updateLUT() {
     }
 }
 
-// --- SCREEN RENDER LOGIC ---
+// --- UPDATED SCREEN RENDER LOGIC ---
 void updateDisplay() {
     spr.fillSprite(TFT_BLACK);
     spr.setTextDatum(MC_DATUM);
@@ -342,9 +345,7 @@ void updateDisplay() {
 
     int inX = 10;
     int inFillHeight = (int)(ui_audio_level * barHeight);
-    if (inFillHeight > barHeight) {
-        inFillHeight = barHeight;
-    }
+    if (inFillHeight > barHeight) inFillHeight = barHeight;
     
     uint32_t inColor = (ui_audio_level > 0.90f) ? TFT_RED : TFT_GREEN;
     spr.drawRect(inX, barY, barWidth, barHeight, TFT_DARKGREY);
@@ -354,17 +355,20 @@ void updateDisplay() {
 
     int outX = spr.width() - 18;
     int outFillHeight = (int)(ui_output_level * barHeight);
-    if (outFillHeight > barHeight) {
-        outFillHeight = barHeight;
-    }
+    if (outFillHeight > barHeight) outFillHeight = barHeight;
     
     uint32_t outColor = (ui_output_level > 0.90f) ? TFT_RED : TFT_GREEN;
     spr.drawRect(outX, barY, barWidth, barHeight, TFT_DARKGREY);
     spr.fillRect(outX, barY + (barHeight - outFillHeight), barWidth, outFillHeight, outColor);
     spr.drawString("OUT", outX + (barWidth / 2), barY + barHeight + 10);
 
-    // Indicator Dot
+    // Indicator Dot updated to reflect exactly what screen we are on
     bool isCurrentEffectActive = isWhammyActive; 
+    if (activeEffectMode == 1) isCurrentEffectActive = isFrozen;
+    else if (activeEffectMode == 2) isCurrentEffectActive = isFeedbackActive;
+    else if (activeEffectMode == 3) isCurrentEffectActive = isHarmonizerMode;
+    else if (activeEffectMode == 4) isCurrentEffectActive = isCapoMode;
+
     uint32_t ledColor = isCurrentEffectActive ? TFT_GREEN : TFT_RED;
     spr.fillCircle(spr.width() - 40, 25, 8, ledColor);
     spr.drawCircle(spr.width() - 40, 25, 8, TFT_WHITE);
@@ -433,14 +437,31 @@ void updateDisplay() {
     }
 
     spr.setTextSize(3);
-    if ((isFeedbackActive || feedbackRamp > 0.0f) && activeEffectMode != 2) {
+    
+    // Background effect stacking (Only shows when ON and looking at a DIFFERENT screen)
+    int bgY = spr.height() - 40;
+    
+    // CHANGED: Removed the ramp checks so the banners vanish instantly!
+    if (isFrozen && activeEffectMode != 1) {
+        spr.setTextColor(TFT_CYAN, TFT_BLACK);
+        spr.drawString("* FROZEN *", spr.width() / 2, bgY);
+        bgY -= 30;
+    }
+    if (isFeedbackActive && activeEffectMode != 2) {
         spr.setTextColor(TFT_RED, TFT_BLACK);
-        spr.drawString("* SCREAMING *", spr.width() / 2, spr.height() - 70);
+        spr.drawString("* SCREAMING *", spr.width() / 2, bgY);
+        bgY -= 30;
     }
     
-    if ((isFrozen || freezeRamp > 0.0f) && activeEffectMode != 1) {
-        spr.setTextColor(TFT_CYAN, TFT_BLACK);
-        spr.drawString("* FROZEN *", spr.width() / 2, spr.height() - 40);
+    if (isHarmonizerMode && activeEffectMode != 3) {
+        spr.setTextColor(TFT_MAGENTA, TFT_BLACK);
+        spr.drawString("* HARMONY *", spr.width() / 2, bgY);
+        bgY -= 30;
+    }
+    if (isCapoMode && activeEffectMode != 4) {
+        spr.setTextColor(TFT_GREEN, TFT_BLACK);
+        spr.drawString("* CAPO *", spr.width() / 2, bgY);
+        bgY -= 30;
     }
     
     spr.setTextSize(1);
@@ -527,8 +548,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 freezeReadIdx = 0;
                 for (int i = 0; i < freezeLength; i++) {
                     int readPos = (writeIndex - freezeLength + i + MAX_BUFFER_SIZE) & BUFFER_MASK;
-                    
-                    // OPTIMIZATION: Convert 16-bit to float for Hann precision inside freeze buffer
                     freezeBuffer[i] = delayBuffer[readPos] * (1.0f / 32768.0f);
                 }
             }
@@ -551,7 +570,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         synthEnv = max(0.0f, synthEnv - 0.005f);
                     }
                     
-                    // OPTIMIZATION: Waveshaper LUT (replaces heavy sinf)
                     int lutIdx = (int)((writeVal + 1.0f) * (WAVE_LUT_SIZE / 2.0f));
                     if (lutIdx < 0) lutIdx = 0;
                     else if (lutIdx >= WAVE_LUT_SIZE) lutIdx = WAVE_LUT_SIZE - 1;
@@ -582,7 +600,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     int i1 = freezeReadIdx;
                     int i2 = freezeReadIdx + freezeLength / 2;
                     
-                    // OPTIMIZATION: Branch logic replaces modulo
                     if (i2 >= freezeLength) i2 -= freezeLength;
                     
                     float phase2 = phase + 0.5f;
@@ -596,7 +613,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float a1 = -0.6f * rawFreeze + d1;
                     apf1Buffer[apf1Idx] = rawFreeze + 0.6f * d1; 
                     
-                    // OPTIMIZATION: Branch logic
                     apf1Idx++; if (apf1Idx >= 503) apf1Idx = 0;
                     
                     float d2 = apf2Buffer[apf2Idx]; 
@@ -612,7 +628,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
 
                 float valToWrite = (freezeActive && freezeRamp > 0.0f) ? freezeOut : writeVal;
                 
-                // OPTIMIZATION: Convert incoming float back down to 16-bit payload for PSRAM
                 delayBuffer[writeIndex] = (int16_t)constrain(valToWrite * 32767.0f, -32768.0f, 32767.0f);
 
                 float f1 = pitchShiftFactor;
@@ -622,9 +637,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     feedbackLfoPhase += (5.0f * LFO_LUT_SIZE) / SAMPLING_FREQUENCY;
                     if (feedbackLfoPhase >= LFO_LUT_SIZE) feedbackLfoPhase -= LFO_LUT_SIZE;
                     
-                    // OPTIMIZATION: Direct LUT read (bypasses heavy powf and sinf)
                     float drift = lfoLUT[(int)feedbackLfoPhase];
-                    
                     f1 = 1.0f * drift; 
                     f2 = pitchShiftFactor * drift;
                 }
@@ -682,7 +695,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float bloomed = (w1 * (1.0f - bloom)) + (w2 * bloom);
                     fbHpfState += 0.05f * (bloomed - fbHpfState);
                     
-                    // OPTIMIZATION: Hard-clipper boundary constraint instead of heavy tanhf()
                     float driven = (bloomed - fbHpfState) * 30.0f;
                     float scream = driven > 1.0f ? 1.0f : (driven < -1.0f ? -1.0f : driven);
                     
@@ -692,7 +704,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float rampCubed = r * r * r; 
                     float rawFb = feedbackFilter * rampCubed * 0.85f;
                     
-                    // OPTIMIZATION: Bitwise masking for power-of-2 delay lines (8192)
                     int rIdx = (fbDelayWriteIdx - (int)(SAMPLING_FREQUENCY * (20.0f / 1000.0f)) + 8192) & 8191;
                     fbDelayBuffer[fbDelayWriteIdx] = rawFb; 
                     fbDelayWriteIdx = (fbDelayWriteIdx + 1) & 8191;
@@ -868,18 +879,8 @@ void MidiTask(void * pvParameters) {
                 
                 if (dur < 400) { 
                     activeEffectMode = (activeEffectMode + 1) % 7; 
-                    isHarmonizerMode = (activeEffectMode == 3); 
-                    isCapoMode = (activeEffectMode == 4); 
                     isSynthMode = (activeEffectMode == 5); 
                     isPadMode = (activeEffectMode == 6); 
-                    
-                    if (activeEffectMode == 1) {
-                        isWhammyActive = isFrozen; 
-                    } else if (activeEffectMode == 2) {
-                        isWhammyActive = isFeedbackActive;
-                    } else {
-                        isWhammyActive = true; 
-                    }
                     updateLUT(); 
                 }
                 forceUIUpdate = true;
@@ -889,9 +890,6 @@ void MidiTask(void * pvParameters) {
         if (btnFreeze.update(100)) {
             if (btnFreeze.state == LOW) {
                 isFrozen = !isFrozen; 
-                if (activeEffectMode == 1) {
-                    isWhammyActive = isFrozen; 
-                }
                 forceUIUpdate = true;
             }
         }
@@ -899,9 +897,6 @@ void MidiTask(void * pvParameters) {
         if (btnFb.update(100)) {
             if (btnFb.state == LOW) {
                 isFeedbackActive = !isFeedbackActive; 
-                if (activeEffectMode == 2) {
-                    isWhammyActive = isFeedbackActive; 
-                }
                 forceUIUpdate = true;
             }
         }
@@ -969,13 +964,8 @@ void MidiTask(void * pvParameters) {
 bool channelMessageCallback(ChannelMessage cm) {
     if (cm.header == 0xC0 && cm.data1 <= 6) {
         activeEffectMode = cm.data1; 
-        isHarmonizerMode = (activeEffectMode == 3); 
-        isCapoMode = (activeEffectMode == 4); 
         isSynthMode = (activeEffectMode == 5); 
         isPadMode = (activeEffectMode == 6);
-        if (activeEffectMode == 1) isWhammyActive = isFrozen; 
-        else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive;
-        else isWhammyActive = true; 
         updateLUT();
         forceUIUpdate = true;
     }
@@ -984,25 +974,15 @@ bool channelMessageCallback(ChannelMessage cm) {
         // --- CAROUSEL NAVIGATION (CC 4 & CC 5) ---
         if (cm.data1 == 5 && cm.data2 == 0) { // Forward
             activeEffectMode = (activeEffectMode + 1) % 7;
-            isHarmonizerMode = (activeEffectMode == 3); 
-            isCapoMode = (activeEffectMode == 4); 
             isSynthMode = (activeEffectMode == 5); 
             isPadMode = (activeEffectMode == 6);
-            if (activeEffectMode == 1) isWhammyActive = isFrozen; 
-            else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive;
-            else isWhammyActive = true; 
             updateLUT();
             forceUIUpdate = true;
         }
         else if (cm.data1 == 4 && cm.data2 == 0) { // Backward
             activeEffectMode = (activeEffectMode == 0) ? 6 : (activeEffectMode - 1);
-            isHarmonizerMode = (activeEffectMode == 3); 
-            isCapoMode = (activeEffectMode == 4); 
             isSynthMode = (activeEffectMode == 5); 
             isPadMode = (activeEffectMode == 6);
-            if (activeEffectMode == 1) isWhammyActive = isFrozen; 
-            else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive;
-            else isWhammyActive = true; 
             updateLUT();
             forceUIUpdate = true;
         }
@@ -1059,21 +1039,29 @@ bool channelMessageCallback(ChannelMessage cm) {
             }
         }
         
+        // --- GLOBAL HARMONY & CAPO (CC 20 & CC 21) ---
+        else if (cm.data1 == 20) { 
+            isHarmonizerMode = (cm.data2 >= 64); 
+            forceUIUpdate = true;
+        }
+        else if (cm.data1 == 21) { 
+            isCapoMode = (cm.data2 >= 64); 
+            updateLUT(); // Important so basePitch recalculates!
+            forceUIUpdate = true;
+        }
+        
         // --- BYPASS & TOGGLES ---
         else if (cm.data1 == 100) { 
             isWhammyActive = (cm.data2 >= 64); 
-            if (activeEffectMode == 1) isFrozen = isWhammyActive;
-            if (activeEffectMode == 2) isFeedbackActive = isWhammyActive;
+            updateLUT();
             forceUIUpdate = true;
         }
         else if (cm.data1 == 110) { 
             isFrozen = (cm.data2 >= 64); 
-            if (activeEffectMode == 1) isWhammyActive = isFrozen; 
             forceUIUpdate = true;
         }
         else if (cm.data1 == 111) { 
             isFeedbackActive = (cm.data2 >= 64); 
-            if (activeEffectMode == 2) isWhammyActive = isFeedbackActive; 
             forceUIUpdate = true;
         }
         else if (cm.data1 == 11) { 

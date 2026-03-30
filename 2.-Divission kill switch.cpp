@@ -98,14 +98,13 @@ float feedbackFilter = 0.0f;
 volatile int latencyMode = 1; 
 const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 
-// --- POWER SAVING & UI GLOBALS ---
+// --- POWER SAVING GLOBALS ---
 unsigned long lastActivityTime = 0;       
 unsigned long lastScreenActivityTime = 0;
 const unsigned long LIGHT_SLEEP_TIMEOUT = 600000; 
 const unsigned long SCREEN_OFF_TIMEOUT = 1200000;  
 bool isScreenOff = false;
 volatile bool wakeupPending = false; 
-volatile float core1_load = 0.0f; // NEW: Holds the CPU load percentage
 
 // --- PIN ASSIGNMENTS ---
 pin_t pinPB = 1;     
@@ -337,7 +336,6 @@ void updateDisplay() {
     spr.setTextDatum(MC_DATUM);
     spr.setTextSize(1);
 
-    // --- BLUETOOTH & CPU METER MOVED TO TOP ---
     if (btmidi.isConnected()) {
         spr.setTextColor(TFT_GREEN, TFT_BLACK);
         spr.drawString("BT: Connected", spr.width() / 2, 10);
@@ -345,12 +343,6 @@ void updateDisplay() {
         spr.setTextColor(TFT_YELLOW, TFT_BLACK);
         spr.drawString("BT: Waiting", spr.width() / 2, 10);
     }
-
-    // NEW: CPU Meter Display
-    spr.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    char cpuStr[16];
-    sprintf(cpuStr, "CPU:%2d%%", (int)core1_load);
-    spr.drawString(cpuStr, 30, 10);
 
     int barWidth = 8;
     int barHeight = 100;
@@ -506,7 +498,6 @@ void updateDisplay() {
         spr.drawString(intervalStr, spr.width() / 2, spr.height() / 2 + 10);
     }
 
-    // --- DYNAMIC 3-COLUMN BANNER GRID ---
     spr.setTextSize(2);
     int bannerCount = 0;
     auto drawBanner = [&](const char* text, uint32_t color) {
@@ -593,9 +584,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
         i2s_channel_read(rx_chan, i2s_in, sizeof(i2s_in), &bytes_read, portMAX_DELAY);
         
         if (bytes_read > 0) {
-            // NEW: Record exact CPU cycle before DSP begins
-            uint32_t start_cycles = xthal_get_ccount();
-
             float pIn = 0.0f;
             float pOut = 0.0f;
             
@@ -1063,15 +1051,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 }
             }
             
-            // NEW: Record end cycle and calculate % of available cycles used
-            // 240MHz CPU at 96kHz with 64 sample buffer gives exactly 160,000 cycles per block
-            uint32_t end_cycles = xthal_get_ccount();
-            float current_load = ((float)(end_cycles - start_cycles) / 160000.0f) * 100.0f;
-            if (current_load > 100.0f) current_load = 100.0f;
-            
-            // Low-pass filter the UI readout for readability
-            core1_load = core1_load * 0.95f + current_load * 0.05f;
-
             float sc = 8388607.0f; 
             dsps_mul_f32(dsp_out, &sc, dsp_out, HOP_SIZE, 1, 0, 1);
             

@@ -641,6 +641,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float chorusLfoPhase = 0.0f;
     static float swellGain = 0.0f; 
     
+    // FIX 1: DC Blocker state variables to strip hardware rumble
+    static float dc_state_in = 0.0f;
+    static float dc_state_out = 0.0f;
+    
     // FIX: 32-bit standard I2S MSB scaling (2^31)
     const float norm = 1.0f / 2147483648.0f; 
     i2s_chan_info_t rx_info; 
@@ -693,7 +697,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             // FIX: Loop bounds updated to HOP_SIZE * 2
             for (int i = 0; i < HOP_SIZE * 2; i += 2) {
-                float input = (float)i2s_in[i] * norm; 
+                
+                // FIX 1: Hardware DC-Offset Blocker (High-Pass Filter)
+                float raw_input = (float)i2s_in[i] * norm;
+                float input = raw_input - dc_state_in + 0.995f * dc_state_out;
+                dc_state_in = raw_input;
+                dc_state_out = input;
+                 
                 inputEnvelope = inputEnvelope * 0.99f + fabsf(input) * 0.01f;
                 
                 if (swell) {
@@ -820,17 +830,17 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 int idx1 = (int)(tap1 * hannMultiplier);
                 int idx2 = (int)(tap2 * hannMultiplier);
                 
-                // FIX: Upgraded to Cubic Hermite Interpolation for zero aliasing
-                float w1 = (getHermiteSample(tap1, delayBuffer, writeIndex) * hannLUT[idx1]) + 
-                           (getHermiteSample(tap2, delayBuffer, writeIndex) * hannLUT[idx2]);
+                // FIX 2: Upgraded to Cubic Hermite Interpolation with +1.0f safety boundary
+                float w1 = (getHermiteSample(tap1 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx1]) + 
+                           (getHermiteSample(tap2 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx2]);
                            
                 float w2 = 0.0f;
                 if (feedback || harm || chorus) {
                     int idx1_2 = (int)(tap1_2 * hannMultiplier);
                     int idx2_2 = (int)(tap2_2 * hannMultiplier);
                     
-                    w2 = (getHermiteSample(tap1_2, delayBuffer, writeIndex) * hannLUT[idx1_2]) + 
-                         (getHermiteSample(tap2_2, delayBuffer, writeIndex) * hannLUT[idx2_2]);
+                    w2 = (getHermiteSample(tap1_2 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx1_2]) + 
+                         (getHermiteSample(tap2_2 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx2_2]);
                 }
 
                 float r1 = 1.0f - f1;
@@ -892,8 +902,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     feedbackOut = fbDelayBuffer[rIdx];
                 }
 
-                // FIX: Upgraded to Cubic Hermite Interpolation
-                float compensatedDry = getHermiteSample(currentWindowSize / 2.0f, delayBuffer, writeIndex);
+                // FIX 2: Upgraded to Cubic Hermite Interpolation
+                float compensatedDry = getHermiteSample((currentWindowSize / 2.0f) + 1.0f, delayBuffer, writeIndex);
                 float shiftedOutput = w1;
                 float currentWetBlend = 1.0f;
                 
@@ -958,16 +968,17 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 i2s_out[i] = (int32_t)fmaxf(-2147483648.0f, fminf(dsp_out[i], 2147483647.0f));
             }
             
+            // FIX 3: Smooth visual decay for UI Meters
             if (pIn > ui_audio_level) {
                 ui_audio_level = pIn; 
             } else {
-                ui_audio_level = ui_audio_level * 0.96f;
+                ui_audio_level = ui_audio_level * 0.995f; 
             }
             
             if (pOut > ui_output_level) {
                 ui_output_level = pOut; 
             } else {
-                ui_output_level = ui_output_level * 0.96f;
+                ui_output_level = ui_output_level * 0.995f; 
             }
             
             size_t bw; 
@@ -1518,15 +1529,14 @@ void setup() {
     pinMode(pinPB, INPUT); 
     pinMode(pinPB2, INPUT);
     
-    // FIX: Move critical delay loops to lightning-fast Internal SRAM
-    delayBuffer = (int16_t*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    fbDelayBuffer = (float*)heap_caps_malloc(8192 * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    
-    // Freeze buffer is huge (192KB), it perfectly stays in PSRAM
+    // FIX: Returned audio buffers to MALLOC_CAP_SPIRAM to prevent 
+    // internal SRAM fragmentation "MEMORY ERROR" crashing on boot.
+    delayBuffer = (int16_t*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    fbDelayBuffer = (float*)heap_caps_malloc(8192 * 4, MALLOC_CAP_SPIRAM);
     freezeBuffer = (float*)heap_caps_malloc(MAX_BUFFER_SIZE * 4, MALLOC_CAP_SPIRAM);
     
     if (delayBuffer == NULL || fbDelayBuffer == NULL || freezeBuffer == NULL) {
-        Serial.println("FATAL ERROR: Failed to allocate DSP buffers!");
+        Serial.println("FATAL ERROR: Failed to allocate DSP buffers in PSRAM!");
         tft.fillScreen(TFT_RED);
         tft.drawString("MEMORY ERROR", tft.width() / 2, tft.height() / 2);
         while(1) { 

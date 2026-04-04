@@ -321,7 +321,6 @@ void updateLUT() {
     
     if (isStaticIntervalMode) {
         float intervals[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f };
-        // FIX 3: Isolated Feedback Interval state applied here to prevent desync
         float staticTotalShift = intervals[feedbackIntervalIdx % 5];
         float staticRatio = powf(2.0f, staticTotalShift / 12.0f);
         
@@ -331,18 +330,14 @@ void updateLUT() {
     } else {
         float basePitch = 0.0f;
         
+        // MODIFIED: Freeze (1), Harmony (3), and Chorus (7) are removed from Base Pitch
+        // so that pitchShiftLUT contains ONLY the pure physical bend applied to w1 (Dry).
         if (isCapoMode) {
             basePitch += effectMemory[4]; 
-        }
-        
-        if (activeEffectMode == 1 || activeEffectMode == 3) {
-            basePitch += effectMemory[activeEffectMode];
         } else if (activeEffectMode == 5) {
             basePitch += effectMemory[6]; 
         } else if (activeEffectMode == 6) {
             basePitch += effectMemory[7]; 
-        } else if (activeEffectMode == 7) {
-            basePitch += effectMemory[8]; 
         }
         
         float toeBend = effectMemory[0];
@@ -542,7 +537,7 @@ void updateDisplay() {
 
     int textX = spr.width() / 2 + 35; 
 
-    if (activeEffectMode == 0 || activeEffectMode == 8) { 
+    if (activeEffectMode == 0 || activeEffectMode == 8 || activeEffectMode == 1) { 
         char topStr[16]; 
         char botStr[16];
         spr.setTextSize(3); 
@@ -725,7 +720,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float pIn = 0.0f;
             float pOut = 0.0f;
             
-            // FIX 1: Loop accurately jumps by 2 for correct Stereo Interleaving
             for (int i = 0; i < HOP_SIZE * 2; i += 2) {
                 
                 float raw_input = (float)i2s_in[i] * norm;
@@ -836,24 +830,27 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 delayBuffer[writeIndex] = (int16_t)fmaxf(-32768.0f, fminf(finalWriteVal * 32767.0f, 32767.0f));
 
+                // MODIFIED: f1 strictly holds the physical pedal bend (Bent Dry signal)
                 float f1 = pitchShiftFactor;
                 float f2 = pitchShiftFactor;
                 
-                if (chorus) { 
+                if (harm) {
+                    // MODIFIED: f2 multiplies the bent dry by the harmony interval
+                    f2 = pitchShiftFactor * powf(2.0f, effectMemory[3] / 12.0f);
+                }
+                else if (chorus) { 
                     chorusLfoPhase += chorusPhaseInc;
                     if (chorusLfoPhase >= LFO_LUT_SIZE) {
                         chorusLfoPhase -= LFO_LUT_SIZE;
                     }
                     
                     int p1 = (int)chorusLfoPhase;
-                    int p2 = p1 + 512;
-                    if (p2 >= 1024) {
-                        p2 -= 1024;
-                    }
                     
-                    f1 = pitchShiftFactor * lfoLUT[p1]; 
-                    f2 = pitchShiftFactor * lfoLUT[p2]; 
-                } else if (feedback) { 
+                    // MODIFIED: f2 creates a bent chorus voice that tracks alongside the bent dry
+                    float chorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
+                    f2 = pitchShiftFactor * chorusRatio * lfoLUT[p1]; 
+                } 
+                else if (feedback) { 
                     feedbackLfoPhase += feedbackPhaseInc;
                     if (feedbackLfoPhase >= LFO_LUT_SIZE) {
                         feedbackLfoPhase -= LFO_LUT_SIZE;
@@ -938,7 +935,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     feedbackOut = fbDelayBuffer[rIdx];
                 }
 
-                float compensatedDry = getHermiteSample((currentWindowSize / 2.0f) + 1.0f, delayBuffer, writeIndex);
                 float shiftedOutput = w1;
                 float currentWetBlend = 1.0f;
                 
@@ -951,9 +947,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 if (!isWhammyActive) {
                     shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f); 
                 } else if (harm) {
-                    shiftedOutput = (compensatedDry * 0.6f) + ((w1 + w2) * 0.5f); 
+                    // MODIFIED: Mixes Bent Dry (w1) with Bent Harmony (w2)
+                    shiftedOutput = (w1 * 0.6f) + (w2 * 0.5f); 
                 } else if (chorus) {
-                    shiftedOutput = (compensatedDry * 0.6f) + ((w1 + w2) * 0.5f); 
+                    // MODIFIED: Mixes Bent Dry (w1) with Bent Chorus Voice (w2)
+                    shiftedOutput = (w1 * 0.6f) + (w2 * 0.5f); 
                 } else if (feedback) {
                     shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f);
                 } else if (activeEffectMode == 1) {
@@ -970,7 +968,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     shiftedOutput = (shiftedOutput * 0.6f) + (freezeOut * 0.7f);
                 }
 
-                // FIX 2: Multiply final result by Swell and Volume MIDI Gains
                 float finalOutput = shiftedOutput * swellGain * volumePedalGain; 
                 
                 dsp_out[i] = finalOutput; 
@@ -1179,12 +1176,15 @@ void MidiTask(void * pvParameters) {
         if (btnInterval.update(100)) {
             if (btnInterval.state == LOW) {
                 if (activeEffectMode == 2) {
-                    // FIX 3: Isolated Feedback Array wrap math applied here
                     feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
                 } else {
                     currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
                     
                     int slot = activeEffectMode;
+                    
+                    // MODIFIED: Freeze Mode maps interval button to Toe Bend
+                    if (slot == 1) slot = 0; 
+                    
                     if (slot == 5) slot = 6;
                     else if (slot == 6) slot = 7;
                     else if (slot == 7) slot = 8;
@@ -1462,7 +1462,8 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 18) {
             if (activeEffectMode == 8) return false;
             
-            if (activeEffectMode == 0) {
+            // MODIFIED: Freeze Mode maps CC18 to Toe Bend
+            if (activeEffectMode == 0 || activeEffectMode == 1) {
                 if (cm.data2 < 64) {
                     effectMemory[0] = constrain(effectMemory[0] + 1.0f, -24.0f, 24.0f);
                 } else {
@@ -1475,7 +1476,6 @@ bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[4] = constrain(effectMemory[4] - 1.0f, -24.0f, 24.0f);
                 }
             } else if (activeEffectMode == 2) {
-                // FIX 3: Isolated Feedback Array wrap math applied here
                 if (cm.data2 < 64) {
                     feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
                 } else {
@@ -1499,7 +1499,8 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 17) {
             if (activeEffectMode == 8) return false;
             
-            if (activeEffectMode == 0) {
+            // MODIFIED: Freeze Mode maps CC17 to Heel Bend
+            if (activeEffectMode == 0 || activeEffectMode == 1) {
                 if (cm.data2 < 64) {
                     effectMemory[5] = constrain(effectMemory[5] + 1.0f, -24.0f, 24.0f);
                 } else {
@@ -1512,7 +1513,6 @@ bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[4] = constrain(effectMemory[4] - 0.01f, -24.0f, 24.0f);
                 }
             } else if (activeEffectMode == 2) {
-                // FIX 3: Isolated Feedback Array wrap math applied here
                 if (cm.data2 < 64) {
                     feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
                 } else {

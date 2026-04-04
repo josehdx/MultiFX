@@ -69,7 +69,7 @@ int apf2Idx = 0;
 // --- INTERVAL CYCLERS ---
 const float intervalList[] = {-12.0f, -7.0f, -5.0f, -2.0f, 0.0f, 2.0f, 5.0f, 7.0f, 12.0f};
 int currentIntervalIdx = 8; 
-int feedbackIntervalIdx = 0; 
+volatile int feedbackIntervalIdx = 0; 
 
 TaskHandle_t audioTaskHandle = NULL; 
 
@@ -80,7 +80,6 @@ volatile bool forceUIUpdate = true;
 
 // --- EFFECT STATE ---
 volatile int activeEffectMode = 0; 
-// 10 elements to prevent overflow. Index 4 holds Capo Intervals AND Cents (e.g., 2.50 = 2 Intervals, 50 Cents)
 volatile float effectMemory[10] = { 12.0f, 12.0f, 12.0f, 5.0f, -2.0f, -12.0f, -12.0f, 12.0f, 0.0f, 0.0f };
 volatile float pitchShiftFactor = 1.0f;
 
@@ -93,6 +92,9 @@ volatile bool isPadMode = false;
 volatile bool isCapoMode = false; 
 volatile bool isChorusMode = false; 
 volatile bool isSwellMode = false; 
+
+// FIX: Global volatile for Swell reset (Hot Start Fix)
+volatile float swellGain = 0.0f; 
 
 // NEW: VOLUME EFFECT VARIABLES
 volatile bool isVolumeMode = false; 
@@ -209,7 +211,6 @@ inline float IRAM_ATTR getHermiteSample(float tapPos, int16_t* buffer, int write
     int iTap = (int)tapPos;
     float frac = tapPos - iTap;
     
-    // Grab 4 adjacent samples for a smooth curve
     int idx0 = (writeIdx - iTap + 1 + MAX_BUFFER_SIZE) & BUFFER_MASK;
     int idx1 = (writeIdx - iTap + MAX_BUFFER_SIZE) & BUFFER_MASK;
     int idx2 = (writeIdx - iTap - 1 + MAX_BUFFER_SIZE) & BUFFER_MASK;
@@ -221,7 +222,6 @@ inline float IRAM_ATTR getHermiteSample(float tapPos, int16_t* buffer, int write
     float y2 = buffer[idx2] * scale;
     float y3 = buffer[idx3] * scale;
     
-    // Compute Hermite polynomial
     float c0 = y1;
     float c1 = 0.5f * (y2 - y0);
     float c2 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
@@ -639,7 +639,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float padEnv = 0.0f;
     static float inputEnvelope = 0.0f;
     static float chorusLfoPhase = 0.0f;
-    static float swellGain = 0.0f; 
     
     // FIX 1: DC Blocker state variables to strip hardware rumble
     static float dc_state_in = 0.0f;
@@ -725,11 +724,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         synthEnv = fmaxf(0.0f, synthEnv - 0.005f);
                     }
                     
-                    int lutIdx = (int)((writeVal + 1.0f) * 1024.0f);
+                    // FIX: Robust symmetric LUT index calculation
+                    int lutIdx = (int)( (writeVal + 1.0f) * 0.5f * (WAVE_LUT_SIZE - 1) );
                     if (lutIdx < 0) {
                         lutIdx = 0;
-                    } else if (lutIdx > 2047) {
-                        lutIdx = 2047;
+                    } else if (lutIdx >= WAVE_LUT_SIZE) {
+                        lutIdx = WAVE_LUT_SIZE - 1;
                     }
                     
                     writeVal = synthLUT[lutIdx]; 
@@ -744,10 +744,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     writeVal *= padEnv;
                 }
 
-                if (freezeActive) {
-                    freezeRamp = fminf(1.0f, freezeRamp + 0.0002f);
-                } else {
-                    freezeRamp = fmaxf(0.0f, freezeRamp - 0.00005f);
+                if (freezeRamp > 0.0f || freezeActive) {
+                    if (freezeActive) freezeRamp = fminf(1.0f, freezeRamp + 0.0002f);
+                    else freezeRamp = fmaxf(0.0f, freezeRamp - 0.00005f);
                 }
 
                 float freezeOut = 0.0f;
@@ -1107,6 +1106,7 @@ void MidiTask(void * pvParameters) {
                         isWhammyActive = isChorusMode;
                     } else if (activeEffectMode == 8) {
                         isWhammyActive = isSwellMode;
+                        swellGain = 0.0f; // FIX: Reset gain on transition
                     } else {
                         isWhammyActive = true; 
                         isVolumeMode = false;
@@ -1288,6 +1288,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isWhammyActive = isChorusMode;
             } else if (activeEffectMode == 8) {
                 isWhammyActive = isSwellMode;
+                swellGain = 0.0f; // FIX: Reset gain on transition
             } else {
                 isWhammyActive = true; 
                 isVolumeMode = false; 
@@ -1316,6 +1317,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isWhammyActive = isChorusMode;
             } else if (activeEffectMode == 8) {
                 isWhammyActive = isSwellMode;
+                swellGain = 0.0f; // FIX: Reset gain on transition
             } else {
                 isWhammyActive = true; 
                 isVolumeMode = false; 
@@ -1413,6 +1415,7 @@ bool channelMessageCallback(ChannelMessage cm) {
             isSwellMode = (cm.data2 >= 64); 
             if (activeEffectMode == 8) {
                 isWhammyActive = isSwellMode; 
+                swellGain = 0.0f; // FIX: Reset gain on transition
             }
             forceUIUpdate = true; 
         }
@@ -1529,8 +1532,7 @@ void setup() {
     pinMode(pinPB, INPUT); 
     pinMode(pinPB2, INPUT);
     
-    // FIX: Returned audio buffers to MALLOC_CAP_SPIRAM to prevent 
-    // internal SRAM fragmentation "MEMORY ERROR" crashing on boot.
+    // PSRAM Allocation to prevent memory fragmentation crashes
     delayBuffer = (int16_t*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     fbDelayBuffer = (float*)heap_caps_malloc(8192 * 4, MALLOC_CAP_SPIRAM);
     freezeBuffer = (float*)heap_caps_malloc(MAX_BUFFER_SIZE * 4, MALLOC_CAP_SPIRAM);
@@ -1573,7 +1575,7 @@ void setup() {
     Control_Surface.begin();
     
     i2s_chan_config_t c = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
-    // FIX: Boost DMA frames to absorb Bluetooth latency
+    // Boost DMA frames to absorb Bluetooth latency
     c.dma_desc_num = 6; 
     c.dma_frame_num = 256; 
     c.auto_clear = true; 

@@ -76,6 +76,7 @@ TaskHandle_t audioTaskHandle = NULL;
 // --- TFT DISPLAY ---
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite spr = TFT_eSprite(&tft); 
+TFT_eSprite meterSpr = TFT_eSprite(&tft); // FIX 3: Isolated sprite for ultra-fast meter redraws
 volatile bool forceUIUpdate = true; 
 
 // --- EFFECT STATE ---
@@ -341,7 +342,14 @@ void updateLUT() {
         float heelBend = effectMemory[5];
         
         for (int i = 0; i < 16384; i++) {
-            float normalizedThrow = (float(i) - 8192.0f) / 8192.0f;
+            // FIX 2: Precise asymmetric scaling bounds so extreme TOE hits exactly 1.0 multiplier
+            float normalizedThrow;
+            if (i >= 8192) {
+                normalizedThrow = (float)(i - 8192) / 8191.0f;
+            } else {
+                normalizedThrow = (float)(i - 8192) / 8192.0f;
+            }
+            
             float dynamicBend = 0.0f;
             
             if (normalizedThrow >= 0.0f) {
@@ -354,6 +362,37 @@ void updateLUT() {
             pitchShiftLUT[i] = powf(2.0f, totalShift / 12.0f);
         }
     }
+}
+
+// FIX 3: Extracted lightweight volume meters for uncapped, flicker-free rendering
+void updateMeters() {
+    int barHeight = 98;
+    
+    // Draw Left IN Meter
+    int inFillHeight = (int)(ui_audio_level * barHeight);
+    if (inFillHeight > barHeight) {
+        inFillHeight = barHeight;
+    }
+    uint32_t inColor = TFT_GREEN;
+    if (ui_audio_level > 0.90f) {
+        inColor = TFT_RED;
+    }
+    meterSpr.fillSprite(TFT_BLACK);
+    meterSpr.fillRect(0, barHeight - inFillHeight, 6, inFillHeight, inColor);
+    meterSpr.pushSprite(11, 31);
+    
+    // Draw Right OUT Meter
+    int outFillHeight = (int)(ui_output_level * barHeight);
+    if (outFillHeight > barHeight) {
+        outFillHeight = barHeight;
+    }
+    uint32_t outColor = TFT_GREEN;
+    if (ui_output_level > 0.90f) {
+        outColor = TFT_RED;
+    }
+    meterSpr.fillSprite(TFT_BLACK);
+    meterSpr.fillRect(0, barHeight - outFillHeight, 6, outFillHeight, outColor);
+    meterSpr.pushSprite(spr.width() - 17, 31);
 }
 
 void updateDisplay() {
@@ -379,36 +418,14 @@ void updateDisplay() {
     int barY = 30;
 
     int inX = 10;
-    int inFillHeight = (int)(ui_audio_level * barHeight);
-    
-    if (inFillHeight > barHeight) {
-        inFillHeight = barHeight;
-    }
-    
-    uint32_t inColor = TFT_GREEN;
-    if (ui_audio_level > 0.90f) {
-        inColor = TFT_RED;
-    }
     
     spr.drawRect(inX, barY, barWidth, barHeight, TFT_DARKGREY);
-    spr.fillRect(inX, barY + (barHeight - inFillHeight), barWidth, inFillHeight, inColor);
     spr.setTextColor(TFT_WHITE, TFT_BLACK);
     spr.drawString("IN", inX + (barWidth / 2), barY + barHeight + 10);
 
     int outX = spr.width() - 18;
-    int outFillHeight = (int)(ui_output_level * barHeight);
-    
-    if (outFillHeight > barHeight) {
-        outFillHeight = barHeight;
-    }
-    
-    uint32_t outColor = TFT_GREEN;
-    if (ui_output_level > 0.90f) {
-        outColor = TFT_RED;
-    }
     
     spr.drawRect(outX, barY, barWidth, barHeight, TFT_DARKGREY);
-    spr.fillRect(outX, barY + (barHeight - outFillHeight), barWidth, outFillHeight, outColor);
     spr.drawString("OUT", outX + (barWidth / 2), barY + barHeight + 10);
 
     bool isCurrentEffectActive = isWhammyActive; 
@@ -600,6 +617,9 @@ void updateDisplay() {
     spr.drawString(latLabels[latencyMode], outX - 26, (spr.height() / 2));
     
     spr.pushSprite(0, 0);
+    
+    // FIX 3: Render meters after static UI is drawn
+    updateMeters();
 }
 
 void DisplayTask(void * pvParameters) {
@@ -618,9 +638,12 @@ void DisplayTask(void * pvParameters) {
             forceUIUpdate = true;
         }
         
-        if (forceUIUpdate || (!isScreenOff && (ui_audio_level > 0.02f || ui_output_level > 0.02f))) { 
+        // FIX 3: Only redraw large static TFT on demand, but render light meters continuously
+        if (forceUIUpdate) { 
             updateDisplay(); 
             forceUIUpdate = false; 
+        } else if (!isScreenOff && (ui_audio_level > 0.02f || ui_output_level > 0.02f)) {
+            updateMeters();
         }
         
         vTaskDelay(pdMS_TO_TICKS(16));
@@ -913,26 +936,27 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     currentWetBlend = 0.6f;
                 }
 
+                // FIX 1: Attenuate Mix Modes to prevent 32-bit digital hard-clipping
                 if (!isWhammyActive) {
-                    shiftedOutput = input + feedbackOut; 
+                    shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f); 
                 } else if (harm) {
-                    shiftedOutput = compensatedDry + ((w1 + w2) * 0.707f); 
+                    shiftedOutput = (compensatedDry * 0.6f) + ((w1 + w2) * 0.5f); 
                 } else if (chorus) {
-                    shiftedOutput = compensatedDry + ((w1 + w2) * 0.5f); 
+                    shiftedOutput = (compensatedDry * 0.6f) + ((w1 + w2) * 0.5f); 
                 } else if (feedback) {
-                    shiftedOutput = input + feedbackOut;
+                    shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f);
                 } else if (activeEffectMode == 1) {
-                    shiftedOutput = input + (w1 * currentWetBlend); 
+                    shiftedOutput = (input * 0.5f) + (w1 * currentWetBlend * 0.5f); 
                 } else if (pad) {
                     padFilter = padFilter * 0.95f + w1 * 0.05f;
                     float wetPad = padFilter * 3.0f * currentWetBlend; 
-                    shiftedOutput = input + wetPad; 
+                    shiftedOutput = (input * 0.5f) + (wetPad * 0.5f); 
                 } else {
                     shiftedOutput = (input * (1.0f - currentWetBlend)) + (w1 * currentWetBlend);
                 }
 
                 if (freezeRamp > 0.0f && (!freezeActive || activeEffectMode != 1)) {
-                    shiftedOutput += (freezeOut * 0.9f);
+                    shiftedOutput = (shiftedOutput * 0.6f) + (freezeOut * 0.7f);
                 }
 
                 float finalOutput = shiftedOutput * swellGain * volumePedalGain; 
@@ -1033,9 +1057,9 @@ void MidiTask(void * pvParameters) {
     static DebouncedButton btnCar(CAROUSEL_BUTTON_PIN);
     static DebouncedButton btnFreeze(FREEZE_BUTTON_PIN);
     static DebouncedButton btnFb(FEEDBACK_BUTTON_PIN);
-    static DebouncedButton btnInterval(INTERVAL_BUTTON_PIN);
-
-
+    
+    // FIX 1: Variables for Interval Edge Detection
+    static bool lastIntervalReading = HIGH;
 
     btnCar.state = digitalRead(CAROUSEL_BUTTON_PIN); 
     btnCar.lastReading = btnCar.state;
@@ -1046,9 +1070,6 @@ void MidiTask(void * pvParameters) {
     btnFb.state = digitalRead(FEEDBACK_BUTTON_PIN); 
     btnFb.lastReading = btnFb.state;
     
-    btnInterval.state = digitalRead(INTERVAL_BUTTON_PIN); 
-    btnInterval.lastReading = btnInterval.state;
-
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
     
     lastActivityTime = millis(); 
@@ -1146,36 +1167,36 @@ void MidiTask(void * pvParameters) {
             } 
         }
         
-        // New logic using the DebouncedButton class:
-        if (btnInterval.update(100)) {
-            if (btnInterval.state == LOW) {
-                if (activeEffectMode == 2) {
-                    feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
-                } else {
-                    currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
-                    
-                    int slot = activeEffectMode;
-                    if (slot == 5) slot = 6;
-                    else if (slot == 6) slot = 7;
-                    else if (slot == 7) slot = 8;
-                    
-                    if (slot == 4) {
-                        float currentCents = effectMemory[4] - (int)effectMemory[4];
-                        effectMemory[4] = intervalList[currentIntervalIdx] + currentCents;
-                    } 
-                    else if (activeEffectMode == 8) {
-                        // Do nothing
-                    } 
-                    else {
-                        effectMemory[slot] = intervalList[currentIntervalIdx]; 
-                    }
-                }
+        // FIX 1: Interval Edge Detection to prevent rapid-fire cycling
+        bool currentIntervalReading = digitalRead(4);
+        if (currentIntervalReading == LOW && lastIntervalReading == HIGH) {
+            if (activeEffectMode == 2) {
+                feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
+            } else {
+                currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
                 
-                updateLUT(); 
-                forceUIUpdate = true;
-                lastActivityTime = millis();
+                int slot = activeEffectMode;
+                if (slot == 5) slot = 6;
+                else if (slot == 6) slot = 7;
+                else if (slot == 7) slot = 8;
+                
+                if (slot == 4) {
+                    float currentCents = effectMemory[4] - (int)effectMemory[4];
+                    effectMemory[4] = intervalList[currentIntervalIdx] + currentCents;
+                } 
+                else if (activeEffectMode == 8) {
+                    // Do nothing
+                } 
+                else {
+                    effectMemory[slot] = intervalList[currentIntervalIdx]; 
+                }
             }
+            
+            updateLUT(); 
+            forceUIUpdate = true;
+            lastActivityTime = millis();
         }
+        lastIntervalReading = currentIntervalReading;
 
         filterPB.update(); 
         filterPB2.update(); 
@@ -1530,6 +1551,10 @@ void setup() {
     tft.init(); 
     tft.setRotation(1); 
     spr.createSprite(tft.width(), tft.height()); 
+    
+    // FIX 3: Isolated sprite allocated for fast 60fps meter rendering
+    meterSpr.createSprite(6, 98); 
+    
     tft.fillScreen(TFT_BLACK); 
     tft.setTextDatum(MC_DATUM); 
     tft.setTextSize(3); 

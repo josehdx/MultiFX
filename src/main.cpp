@@ -46,7 +46,7 @@ int fbDelayWriteIdx = 0;
 DRAM_ATTR float hannLUT[HANN_LUT_SIZE];
 DRAM_ATTR float lfoLUT[LFO_LUT_SIZE];
 DRAM_ATTR float synthLUT[WAVE_LUT_SIZE];
-float pitchShiftLUT[16384]; 
+volatile float pitchShiftLUT[16384]; 
 
 // Tap States 
 float tap1 = 0.0f;
@@ -56,7 +56,6 @@ float tap2_2 = 256.0f;
 float currentWindowSize = 1024.0f; 
 
 // --- FREEZE STATE & ALL-PASS FILTERS ---
-volatile int freezeReadIdx = 0;
 const int freezeLength = 48000; 
 bool wasFrozen = false;
 volatile float freezeRamp = 0.0f;
@@ -76,7 +75,7 @@ TaskHandle_t audioTaskHandle = NULL;
 // --- TFT DISPLAY ---
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite spr = TFT_eSprite(&tft); 
-TFT_eSprite meterSpr = TFT_eSprite(&tft); // FIX 3: Isolated sprite for ultra-fast meter redraws
+TFT_eSprite meterSpr = TFT_eSprite(&tft); 
 volatile bool forceUIUpdate = true; 
 
 // --- EFFECT STATE ---
@@ -94,7 +93,6 @@ volatile bool isCapoMode = false;
 volatile bool isChorusMode = false; 
 volatile bool isSwellMode = false; 
 
-// FIX 2: Global volatile variables for mode-change resets to prevent pops
 volatile float chorusLfoPhase = 0.0f;
 volatile float feedbackLfoPhase = 0.0f;
 volatile float swellGain = 0.0f; 
@@ -117,6 +115,10 @@ const unsigned long SCREEN_OFF_TIMEOUT = 1200000;
 bool isScreenOff = false;
 volatile bool wakeupPending = false; 
 volatile float core1_load = 0.0f; 
+
+// FIX: Safe RTOS Handshake variables for going to sleep without queue corruption
+volatile bool sleepRequested = false;
+volatile bool isSleeping = false;
 
 // --- PIN ASSIGNMENTS ---
 pin_t pinPB = 1;     
@@ -173,8 +175,10 @@ void turnScreenOn() {
 void goToLightSleep() {
     turnScreenOff();
     
-    if (audioTaskHandle != NULL) {
-        vTaskSuspend(audioTaskHandle); 
+    // FIX: Safe hand-shake to park the AudioDSPTask before killing its DMA Queues
+    sleepRequested = true;
+    while (!isSleeping) {
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     
     i2s_channel_disable(tx_chan);      
@@ -197,8 +201,9 @@ void goToLightSleep() {
     i2s_channel_enable(tx_chan);
     i2s_channel_enable(rx_chan);
     
-    if (audioTaskHandle != NULL) {
-        vTaskResume(audioTaskHandle); 
+    sleepRequested = false;
+    while (isSleeping) {
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     
     vTaskDelay(pdMS_TO_TICKS(200)); 
@@ -342,7 +347,6 @@ void updateLUT() {
         float heelBend = effectMemory[5];
         
         for (int i = 0; i < 16384; i++) {
-            // FIX 2: Precise asymmetric scaling bounds so extreme TOE hits exactly 1.0 multiplier
             float normalizedThrow;
             if (i >= 8192) {
                 normalizedThrow = (float)(i - 8192) / 8191.0f;
@@ -362,9 +366,13 @@ void updateLUT() {
             pitchShiftLUT[i] = powf(2.0f, totalShift / 12.0f);
         }
     }
+    
+    // UPDATE: Sync pitch to the current pedal position when changing modes/intervals
+    if (!isVolumeMode) {
+        pitchShiftFactor = pitchShiftLUT[constrain(currentPB1, 0, 16383)];
+    }
 }
 
-// FIX 3: Extracted lightweight volume meters for uncapped, flicker-free rendering
 void updateMeters() {
     int barHeight = 98;
     
@@ -618,7 +626,6 @@ void updateDisplay() {
     
     spr.pushSprite(0, 0);
     
-    // FIX 3: Render meters after static UI is drawn
     updateMeters();
 }
 
@@ -638,7 +645,6 @@ void DisplayTask(void * pvParameters) {
             forceUIUpdate = true;
         }
         
-        // FIX 3: Only redraw large static TFT on demand, but render light meters continuously
         if (forceUIUpdate) { 
             updateDisplay(); 
             forceUIUpdate = false; 
@@ -652,7 +658,6 @@ void DisplayTask(void * pvParameters) {
 
 // --- AUDIO DSP TASK ---
 void IRAM_ATTR AudioDSPTask(void * pvParameters) {
-    // FIX: Multiply by 2 so we perfectly hold 64 stereo frames
     static float dsp_out[HOP_SIZE * 2] __attribute__((aligned(16)));
     static int32_t i2s_in[HOP_SIZE * 2] __attribute__((aligned(16)));
     static int32_t i2s_out[HOP_SIZE * 2] __attribute__((aligned(16)));
@@ -662,18 +667,26 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float padFilter = 0.0f;
     static float padEnv = 0.0f;
     static float inputEnvelope = 0.0f;
-    // FIX 2: Removed local shadowed chorusLfoPhase to use global volatile for reset
     
-    // FIX 1: DC Blocker state variables to strip hardware rumble
     static float dc_state_in = 0.0f;
     static float dc_state_out = 0.0f;
     
-    // FIX: 32-bit standard I2S MSB scaling (2^31)
+    static int freezeWriteIdx = 0;
+    static int freezePlayCounter = 0;
+    static int freezeStartIdx = 0;
+    
     const float norm = 1.0f / 2147483648.0f; 
     i2s_chan_info_t rx_info; 
     i2s_chan_info_t tx_info;
     
     for(;;) {
+        if (sleepRequested) {
+            isSleeping = true;
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        isSleeping = false;
+
         i2s_channel_get_info(rx_chan, &rx_info); 
         i2s_channel_get_info(tx_chan, &tx_info);
         
@@ -700,11 +713,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             bool freezeActive = ((activeEffectMode == 1 && isWhammyActive) || isFrozen);
             
             if (freezeActive && !wasFrozen) {
-                freezeReadIdx = 0;
-                for (int i = 0; i < freezeLength; i++) {
-                    int readPos = (writeIndex - freezeLength + i + MAX_BUFFER_SIZE) & BUFFER_MASK;
-                    freezeBuffer[i] = delayBuffer[readPos] * (1.0f / 32768.0f);
-                }
+                freezePlayCounter = 0;
+                freezeStartIdx = freezeWriteIdx; 
             }
             wasFrozen = freezeActive;
             
@@ -718,10 +728,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float pIn = 0.0f;
             float pOut = 0.0f;
             
-            // FIX: Loop bounds updated to HOP_SIZE * 2
             for (int i = 0; i < HOP_SIZE * 2; i += 2) {
                 
-                // FIX 1: Hardware DC-Offset Blocker (High-Pass Filter)
                 float raw_input = (float)i2s_in[i] * norm;
                 float input = raw_input - dc_state_in + 0.995f * dc_state_out;
                 dc_state_in = raw_input;
@@ -741,6 +749,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
 
                 float writeVal = input;
                 
+                if (!freezeActive) {
+                    freezeBuffer[freezeWriteIdx] = writeVal;
+                    freezeWriteIdx++;
+                    if (freezeWriteIdx >= freezeLength) freezeWriteIdx = 0;
+                }
+                
                 if (synth) {
                     if (inputEnvelope > 0.005f) {
                         synthEnv = fminf(1.0f, synthEnv + 0.1f);
@@ -748,7 +762,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         synthEnv = fmaxf(0.0f, synthEnv - 0.005f);
                     }
                     
-                    // FIX: Robust symmetric LUT index calculation
                     int lutIdx = (int)( (writeVal + 1.0f) * 0.5f * (WAVE_LUT_SIZE - 1) );
                     if (lutIdx < 0) {
                         lutIdx = 0;
@@ -775,11 +788,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
 
                 float freezeOut = 0.0f;
                 if (freezeRamp > 0.0f) {
-                    float phase = (float)freezeReadIdx * invFreezeLength;
-                    int i2 = freezeReadIdx + freezeLength / 2;
-                    if (i2 >= freezeLength) {
-                        i2 -= freezeLength;
-                    }
+                    float phase = (float)freezePlayCounter * invFreezeLength;
+                    
+                    int i1 = (freezeStartIdx + freezePlayCounter);
+                    while (i1 >= freezeLength) i1 -= freezeLength; 
+                    
+                    int i2 = (freezeStartIdx + freezePlayCounter + freezeLength / 2);
+                    while (i2 >= freezeLength) i2 -= freezeLength; 
                     
                     float phase2 = phase + 0.5f;
                     if (phase2 >= 1.0f) {
@@ -788,7 +803,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     
                     int l1 = (int)(phase * 1023.0f);
                     int l2 = (int)(phase2 * 1023.0f);
-                    float rawFreeze = (freezeBuffer[freezeReadIdx] * hannLUT[l1]) + (freezeBuffer[i2] * hannLUT[l2]);
+                    float rawFreeze = (freezeBuffer[i1] * hannLUT[l1]) + (freezeBuffer[i2] * hannLUT[l2]);
                     
                     float d1 = apf1Buffer[apf1Idx]; 
                     float a1 = -0.6f * rawFreeze + d1; 
@@ -809,9 +824,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     }
                     
                     freezeOut = a2 * freezeRamp;
-                    freezeReadIdx++;
-                    if (freezeReadIdx >= freezeLength) {
-                        freezeReadIdx = 0;
+                    
+                    freezePlayCounter++;
+                    if (freezePlayCounter >= freezeLength) {
+                        freezePlayCounter = 0;
                     }
                 }
 
@@ -853,7 +869,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 int idx1 = (int)(tap1 * hannMultiplier);
                 int idx2 = (int)(tap2 * hannMultiplier);
                 
-                // FIX 2: Upgraded to Cubic Hermite Interpolation with +1.0f safety boundary
                 float w1 = (getHermiteSample(tap1 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx1]) + 
                            (getHermiteSample(tap2 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx2]);
                            
@@ -925,7 +940,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     feedbackOut = fbDelayBuffer[rIdx];
                 }
 
-                // FIX 2: Upgraded to Cubic Hermite Interpolation
                 float compensatedDry = getHermiteSample((currentWindowSize / 2.0f) + 1.0f, delayBuffer, writeIndex);
                 float shiftedOutput = w1;
                 float currentWetBlend = 1.0f;
@@ -936,7 +950,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     currentWetBlend = 0.6f;
                 }
 
-                // FIX 1: Attenuate Mix Modes to prevent 32-bit digital hard-clipping
                 if (!isWhammyActive) {
                     shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f); 
                 } else if (harm) {
@@ -982,27 +995,24 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             core1_load = core1_load * 0.95f + current_load * 0.05f;
 
-            // FIX: Restore to full 32-bit volume bounds
             float sc = 2147483647.0f; 
             dsps_mul_f32(dsp_out, &sc, dsp_out, HOP_SIZE * 2, 1, 0, 1);
             
             #pragma GCC ivdep
             for(int i = 0; i < HOP_SIZE * 2; i++) {
-                // FIX: Clip exactly at maximum 32-bit limits to prevent digital rollover screeches
                 i2s_out[i] = (int32_t)fmaxf(-2147483648.0f, fminf(dsp_out[i], 2147483647.0f));
             }
             
-            // FIX 3: Smooth visual decay for UI Meters
             if (pIn > ui_audio_level) {
                 ui_audio_level = pIn; 
             } else {
-                ui_audio_level = ui_audio_level * 0.995f; 
+                ui_audio_level = ui_audio_level * 0.998f; 
             }
             
             if (pOut > ui_output_level) {
                 ui_output_level = pOut; 
             } else {
-                ui_output_level = ui_output_level * 0.995f; 
+                ui_output_level = ui_output_level * 0.998f; 
             }
             
             size_t bw; 
@@ -1057,9 +1067,7 @@ void MidiTask(void * pvParameters) {
     static DebouncedButton btnCar(CAROUSEL_BUTTON_PIN);
     static DebouncedButton btnFreeze(FREEZE_BUTTON_PIN);
     static DebouncedButton btnFb(FEEDBACK_BUTTON_PIN);
-    
-    // FIX 1: Variables for Interval Edge Detection
-    static bool lastIntervalReading = HIGH;
+    static DebouncedButton btnInterval(INTERVAL_BUTTON_PIN);
 
     btnCar.state = digitalRead(CAROUSEL_BUTTON_PIN); 
     btnCar.lastReading = btnCar.state;
@@ -1070,6 +1078,9 @@ void MidiTask(void * pvParameters) {
     btnFb.state = digitalRead(FEEDBACK_BUTTON_PIN); 
     btnFb.lastReading = btnFb.state;
     
+    btnInterval.state = digitalRead(INTERVAL_BUTTON_PIN); 
+    btnInterval.lastReading = btnInterval.state;
+
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
     
     lastActivityTime = millis(); 
@@ -1114,7 +1125,6 @@ void MidiTask(void * pvParameters) {
                 if (dur < 400) { 
                     activeEffectMode = (activeEffectMode + 1) % 9; 
                     
-                    // FIX 2: Reset LFOs and Swell Gain on mode change to prevent pops and hot-starts
                     chorusLfoPhase = 0.0f;
                     feedbackLfoPhase = 0.0f;
                     swellGain = 0.0f;
@@ -1167,36 +1177,35 @@ void MidiTask(void * pvParameters) {
             } 
         }
         
-        // FIX 1: Interval Edge Detection to prevent rapid-fire cycling
-        bool currentIntervalReading = digitalRead(4);
-        if (currentIntervalReading == LOW && lastIntervalReading == HIGH) {
-            if (activeEffectMode == 2) {
-                feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
-            } else {
-                currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
-                
-                int slot = activeEffectMode;
-                if (slot == 5) slot = 6;
-                else if (slot == 6) slot = 7;
-                else if (slot == 7) slot = 8;
-                
-                if (slot == 4) {
-                    float currentCents = effectMemory[4] - (int)effectMemory[4];
-                    effectMemory[4] = intervalList[currentIntervalIdx] + currentCents;
-                } 
-                else if (activeEffectMode == 8) {
-                    // Do nothing
-                } 
-                else {
-                    effectMemory[slot] = intervalList[currentIntervalIdx]; 
+        if (btnInterval.update(100)) {
+            if (btnInterval.state == LOW) {
+                if (activeEffectMode == 2) {
+                    feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
+                } else {
+                    currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
+                    
+                    int slot = activeEffectMode;
+                    if (slot == 5) slot = 6;
+                    else if (slot == 6) slot = 7;
+                    else if (slot == 7) slot = 8;
+                    
+                    if (slot == 4) {
+                        float currentCents = effectMemory[4] - (int)effectMemory[4];
+                        effectMemory[4] = intervalList[currentIntervalIdx] + currentCents;
+                    } 
+                    else if (activeEffectMode == 8) {
+                        // Do nothing
+                    } 
+                    else {
+                        effectMemory[slot] = intervalList[currentIntervalIdx]; 
+                    }
                 }
+                
+                updateLUT(); 
+                forceUIUpdate = true;
+                lastActivityTime = millis();
             }
-            
-            updateLUT(); 
-            forceUIUpdate = true;
-            lastActivityTime = millis();
         }
-        lastIntervalReading = currentIntervalReading;
 
         filterPB.update(); 
         filterPB2.update(); 
@@ -1220,40 +1229,37 @@ void MidiTask(void * pvParameters) {
                 lastScreenActivityTime = millis();
             }
 
-            // MOCK: Disabled PBs to block floating pin noise
+            // UPDATE: Expression pedals re-enabled for testing!
             bool movedA = false; 
-            bool movedB = false; 
+            bool movedB = false;
             
             if (movedA || movedB) {
                 
                 if (movedA) {
                     currentPB1 = calibratedA; 
                     lastMidiA = calibratedA; 
-                    
-                    pitchShiftFactor = pitchShiftLUT[constrain(calibratedA, 0, 16383)];
-                    
-                    if (isVolumeMode) {
-                        uint8_t ccVal = map(calibratedA, 0, 16383, 0, 127);
-                        if (ccVal != lastVolumeCC) {
-                            Control_Surface.sendControlChange({19, Channel_1}, ccVal);
-                            lastVolumeCC = ccVal;
-                            forceUIUpdate = true;
-                        }
-                        volumePedalGain = (float)calibratedA / 16383.0f; 
-                    } else {
-                        Control_Surface.sendPitchBend(Channel_1, calibratedA);
-                        lastMidiSent = calibratedA; 
-                        forceUIUpdate = true;
-                    }
                 }
                 
                 if (movedB) {
                     currentPB2 = calibratedB; 
                     lastMidiB = calibratedB; 
-                    
-                    pitchShiftFactor = pitchShiftLUT[constrain(calibratedB, 0, 16383)];
-                    Control_Surface.sendPitchBend(Channel_1, calibratedB);
-                    lastMidiSent = calibratedB; 
+                }
+                
+                analog_t activeMidi = movedB ? calibratedB : calibratedA;
+                
+                // UPDATE: Dynamic bend is ignored if Volume Mode is active
+                if (isVolumeMode) {
+                    uint8_t ccVal = map(activeMidi, 0, 16383, 0, 127);
+                    if (ccVal != lastVolumeCC) {
+                        Control_Surface.sendControlChange({19, Channel_1}, ccVal);
+                        lastVolumeCC = ccVal;
+                        forceUIUpdate = true;
+                    }
+                    volumePedalGain = (float)activeMidi / 16383.0f; 
+                } else {
+                    pitchShiftFactor = pitchShiftLUT[constrain(activeMidi, 0, 16383)];
+                    Control_Surface.sendPitchBend(Channel_1, activeMidi);
+                    lastMidiSent = activeMidi; 
                     forceUIUpdate = true;
                 }
             }
@@ -1302,7 +1308,6 @@ bool channelMessageCallback(ChannelMessage cm) {
                 activeEffectMode = activeEffectMode - 1;
             }
             
-            // FIX 2: Reset LFOs and Swell Gain on mode change to prevent pops
             chorusLfoPhase = 0.0f;
             feedbackLfoPhase = 0.0f;
             swellGain = 0.0f;
@@ -1335,7 +1340,6 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 5 && cm.data2 >= 64) { 
             activeEffectMode = (activeEffectMode + 1) % 9; 
             
-            // FIX 2: Reset LFOs and Swell Gain on mode change to prevent pops
             chorusLfoPhase = 0.0f;
             feedbackLfoPhase = 0.0f;
             swellGain = 0.0f;
@@ -1531,6 +1535,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 11) { 
             uint16_t m = map(cm.data2, 0, 127, 0, 16383); 
             currentCC11 = m; 
+            currentPB1 = m; // KEEP SYNCED
             pitchShiftFactor = pitchShiftLUT[m]; 
             forceUIUpdate = true;
         }
@@ -1551,8 +1556,6 @@ void setup() {
     tft.init(); 
     tft.setRotation(1); 
     spr.createSprite(tft.width(), tft.height()); 
-    
-    // FIX 3: Isolated sprite allocated for fast 60fps meter rendering
     meterSpr.createSprite(6, 98); 
     
     tft.fillScreen(TFT_BLACK); 
@@ -1573,7 +1576,6 @@ void setup() {
     pinMode(pinPB, INPUT); 
     pinMode(pinPB2, INPUT);
     
-    // PSRAM Allocation to prevent memory fragmentation crashes
     delayBuffer = (int16_t*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     fbDelayBuffer = (float*)heap_caps_malloc(8192 * 4, MALLOC_CAP_SPIRAM);
     freezeBuffer = (float*)heap_caps_malloc(MAX_BUFFER_SIZE * 4, MALLOC_CAP_SPIRAM);
@@ -1616,7 +1618,6 @@ void setup() {
     Control_Surface.begin();
     
     i2s_chan_config_t c = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
-    // Boost DMA frames to absorb Bluetooth latency
     c.dma_desc_num = 6; 
     c.dma_frame_num = 256; 
     c.auto_clear = true; 

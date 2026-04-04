@@ -66,9 +66,10 @@ int apf1Idx = 0;
 float apf2Buffer[863] = { 0.0f };  
 int apf2Idx = 0;
 
-// --- INTERVAL CYCLER ---
+// --- INTERVAL CYCLERS ---
 const float intervalList[] = {-12.0f, -7.0f, -5.0f, -2.0f, 0.0f, 2.0f, 5.0f, 7.0f, 12.0f};
 int currentIntervalIdx = 8; 
+int feedbackIntervalIdx = 0; 
 
 TaskHandle_t audioTaskHandle = NULL; 
 
@@ -119,7 +120,7 @@ pin_t pinPB2 = 2;
 const int BOOT_SENSE_PIN = 0; 
 const int CAROUSEL_BUTTON_PIN = 14; 
 const int FREEZE_BUTTON_PIN = 18;    
-const int INTERVAL_BUTTON_PIN = 44; 
+const int INTERVAL_BUTTON_PIN = 4; 
 const int FEEDBACK_BUTTON_PIN = 13;  
 
 uint16_t lastMidiSent = 8192;
@@ -300,7 +301,7 @@ void updateLUT() {
     
     if (isStaticIntervalMode) {
         float intervals[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f };
-        float staticTotalShift = intervals[currentIntervalIdx % 5];
+        float staticTotalShift = intervals[feedbackIntervalIdx % 5];
         float staticRatio = powf(2.0f, staticTotalShift / 12.0f);
         
         for (int i = 0; i < 16384; i++) {
@@ -310,10 +311,12 @@ void updateLUT() {
         float basePitch = 0.0f;
         
         if (isCapoMode) {
-            basePitch += effectMemory[4]; // Contains both Intervals and Cents
+            basePitch += effectMemory[4]; 
         }
         
-        if (activeEffectMode == 5) {
+        if (activeEffectMode == 1 || activeEffectMode == 3) {
+            basePitch += effectMemory[activeEffectMode];
+        } else if (activeEffectMode == 5) {
             basePitch += effectMemory[6]; 
         } else if (activeEffectMode == 6) {
             basePitch += effectMemory[7]; 
@@ -432,35 +435,35 @@ void updateDisplay() {
             break;
         case 1: 
             spr.setTextColor(TFT_CYAN, TFT_BLACK); 
-            spr.drawString("FREEZE", spr.width() / 2, 40); 
+            spr.drawString("FREEZE", spr.width() / 2 + 30, 40); 
             break;
         case 2: 
             spr.setTextColor(TFT_RED, TFT_BLACK); 
-            spr.drawString("FEEDBACK", spr.width() / 2, 40); 
+            spr.drawString("FEEDBACK", spr.width() / 2 + 30, 40); 
             break;
         case 3: 
             spr.setTextColor(TFT_MAGENTA, TFT_BLACK); 
-            spr.drawString("HARMONY", spr.width() / 2, 40); 
+            spr.drawString("HARMONY", spr.width() / 2 + 30, 40); 
             break;
         case 4: 
             spr.setTextColor(TFT_GREEN, TFT_BLACK); 
-            spr.drawString("CAPO", spr.width() / 2, 40); 
+            spr.drawString("CAPO", spr.width() / 2 + 30, 40); 
             break;
         case 5: 
             spr.setTextColor(TFT_YELLOW, TFT_BLACK); 
-            spr.drawString("SYNTH", spr.width() / 2, 40); 
+            spr.drawString("SYNTH", spr.width() / 2 + 30, 40); 
             break;
         case 6: 
             spr.setTextColor(TFT_PINK, TFT_BLACK); 
-            spr.drawString("PAD", spr.width() / 2, 40); 
+            spr.drawString("PAD", spr.width() / 2 + 30, 40); 
             break;
         case 7: 
             spr.setTextColor(TFT_SKYBLUE, TFT_BLACK); 
-            spr.drawString("CHORUS", spr.width() / 2, 40); 
+            spr.drawString("CHORUS", spr.width() / 2 + 30, 40); 
             break;
         case 8: 
             spr.setTextColor(TFT_WHITE, TFT_BLACK); 
-            spr.drawString("SWELL", spr.width() / 2, 40); 
+            spr.drawString("SWELL", spr.width() / 2 + 30, 40); 
             break;
     }
 
@@ -468,7 +471,10 @@ void updateDisplay() {
     
     float displayVal = effectMemory[activeEffectMode];
     
-    if (activeEffectMode == 5) {
+    if (activeEffectMode == 2) {
+        float fbIntervals[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f };
+        displayVal = fbIntervals[feedbackIntervalIdx % 5];
+    } else if (activeEffectMode == 5) {
         displayVal = effectMemory[6];
     } else if (activeEffectMode == 6) {
         displayVal = effectMemory[7];
@@ -476,71 +482,72 @@ void updateDisplay() {
         displayVal = effectMemory[8];
     }
 
-    if (activeEffectMode == 0 || activeEffectMode == 4) { 
-        spr.setTextSize(1);
-        int lineTop = 30; 
-        int lineBot = 130; 
-        int x1 = 35; 
-        int x2 = 70; 
-        int x3 = 105;
-        
-        if (activeEffectMode == 0) {
-            spr.drawString("PB1", x1, lineBot + 15); 
-            spr.drawString("PB2", x2, lineBot + 15); 
-            spr.drawString("CC11", x3, lineBot + 15);
-            
-            for (int y = lineTop; y <= lineBot; y += 5) { 
-                spr.drawFastVLine(x1, y, 2, TFT_DARKGREY); 
-                spr.drawFastVLine(x2, y, 2, TFT_DARKGREY); 
-                spr.drawFastVLine(x3, y, 2, TFT_DARKGREY); 
-            }
-            
-            spr.fillCircle(x1, map(currentPB1, 0, 16383, lineBot, lineTop), 4, TFT_CYAN);
-            spr.fillCircle(x2, map(currentPB2, 0, 16383, lineBot, lineTop), 4, TFT_MAGENTA);
-            spr.fillCircle(x3, map(currentCC11, 0, 16383, lineBot, lineTop), 4, TFT_GREEN);
-        }
+    // --- DRAW PB1, PB2, AND CC11 BARS FOR ALL MODES ---
+    spr.setTextSize(1);
+    int lineTop = 30; 
+    int lineBot = 130; 
+    int x1 = 35; 
+    int x2 = 70; 
+    int x3 = 105;
+    
+    spr.drawString("PB1", x1, lineBot + 15); 
+    spr.drawString("PB2", x2, lineBot + 15); 
+    spr.drawString("CC11", x3, lineBot + 15);
+    
+    for (int y = lineTop; y <= lineBot; y += 5) { 
+        spr.drawFastVLine(x1, y, 2, TFT_DARKGREY); 
+        spr.drawFastVLine(x2, y, 2, TFT_DARKGREY); 
+        spr.drawFastVLine(x3, y, 2, TFT_DARKGREY); 
+    }
+    
+    spr.fillCircle(x1, map(currentPB1, 0, 16383, lineBot, lineTop), 4, TFT_CYAN);
+    spr.fillCircle(x2, map(currentPB2, 0, 16383, lineBot, lineTop), 4, TFT_MAGENTA);
+    spr.fillCircle(x3, map(currentCC11, 0, 16383, lineBot, lineTop), 4, TFT_GREEN);
 
+    // --- DRAW PARAMETER TEXT WITH A SHIFTED CENTER ---
+    int textX = spr.width() / 2 + 35; // Standardized X anchor so it never overlaps the bars
+
+    if (activeEffectMode == 0 || activeEffectMode == 8) { 
         char topStr[16]; 
         char botStr[16];
-        int textX = spr.width() / 2;
-        
-        if (activeEffectMode == 0) {
-            textX = spr.width() / 2 + 35;
-            spr.setTextSize(3); 
-            if (effectMemory[0] > 0) {
-                sprintf(topStr, "+%.1f", effectMemory[0]);
-            } else {
-                sprintf(topStr, "%.1f", effectMemory[0]);
-            }
-            
-            if (effectMemory[5] > 0) {
-                sprintf(botStr, "+%.1f", effectMemory[5]);
-            } else {
-                sprintf(botStr, "%.1f", effectMemory[5]);
-            }
+        spr.setTextSize(3); 
+        if (effectMemory[0] > 0) {
+            sprintf(topStr, "+%.1f", effectMemory[0]);
         } else {
-            spr.setTextSize(2); 
-            int totalCents = (int)round(effectMemory[4] * 100.0f);
-            int cInt = totalCents / 100; 
-            int cCents = totalCents % 100;
-            
-            if (cInt > 0) {
-                sprintf(topStr, "Int: +%d", cInt);
-            } else {
-                sprintf(topStr, "Int: %d", cInt);
-            }
-            
-            if (cCents > 0) {
-                sprintf(botStr, "Ct: +%d", cCents);
-            } else {
-                sprintf(botStr, "Ct: %d", cCents);
-            }
+            sprintf(topStr, "%.1f", effectMemory[0]);
         }
         
+        if (effectMemory[5] > 0) {
+            sprintf(botStr, "+%.1f", effectMemory[5]);
+        } else {
+            sprintf(botStr, "%.1f", effectMemory[5]);
+        }
         spr.drawString(topStr, textX, (spr.height() / 2) - 15);
         spr.drawString(botStr, textX, (spr.height() / 2) + 15);
+    } 
+    else if (activeEffectMode == 4) {
+        char topStr[16]; 
+        char botStr[16];
+        spr.setTextSize(2); 
+        int totalCents = (int)round(effectMemory[4] * 100.0f);
+        int cInt = totalCents / 100; 
+        int cCents = totalCents % 100;
         
-    } else if (activeEffectMode != 8) { 
+        if (cInt > 0) {
+            sprintf(topStr, "Int: +%d", cInt);
+        } else {
+            sprintf(topStr, "Int: %d", cInt);
+        }
+        
+        if (cCents > 0) {
+            sprintf(botStr, "Ct: +%d", cCents);
+        } else {
+            sprintf(botStr, "Ct: %d", cCents);
+        }
+        spr.drawString(topStr, textX, (spr.height() / 2) - 15);
+        spr.drawString(botStr, textX, (spr.height() / 2) + 15);
+    } 
+    else { 
         spr.setTextSize(4); 
         char intervalStr[16];
         
@@ -549,8 +556,7 @@ void updateDisplay() {
         } else {
             sprintf(intervalStr, "%.1f", displayVal);
         }
-        
-        spr.drawString(intervalStr, spr.width() / 2, spr.height() / 2 + 10);
+        spr.drawString(intervalStr, textX, spr.height() / 2 + 10);
     }
 
     spr.setTextSize(2); 
@@ -572,7 +578,6 @@ void updateDisplay() {
     if (isChorusMode && activeEffectMode != 7) drawBanner("CHORUS", TFT_SKYBLUE);
     if (isSwellMode && activeEffectMode != 8) drawBanner("SWELL", TFT_WHITE); 
     
-    // NEW: Volume Mode Banner
     if (isVolumeMode) drawBanner("VOLUME", TFT_DARKGREY);
 
     spr.setTextSize(1); 
@@ -672,7 +677,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float pIn = 0.0f;
             float pOut = 0.0f;
             
-            for (int i = 0; i < HOP_SIZE; i++) {
+            for (int i = 0; i < HOP_SIZE; i += 2) {
                 float input = (float)i2s_in[i] * norm; 
                 inputEnvelope = inputEnvelope * 0.99f + fabsf(input) * 0.01f;
                 
@@ -903,15 +908,17 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     shiftedOutput += (freezeOut * 0.9f);
                 }
 
-                // MULTIPLY THE FINAL OUTPUT BY THE SWELL AND VOLUME PEDAL GAIN
-                dsp_out[i] = shiftedOutput * swellGain * volumePedalGain; 
+                float finalOutput = shiftedOutput * swellGain * volumePedalGain; 
+                
+                dsp_out[i] = finalOutput; 
+                dsp_out[i+1] = finalOutput; 
                 
                 if (fabsf(input) > pIn) {
                     pIn = fabsf(input);
                 }
                 
-                if (fabsf(dsp_out[i]) > pOut) {
-                    pOut = fabsf(dsp_out[i]);
+                if (fabsf(finalOutput) > pOut) {
+                    pOut = fabsf(finalOutput);
                 }
             }
             
@@ -1071,9 +1078,9 @@ void MidiTask(void * pvParameters) {
                     } else if (activeEffectMode == 8) {
                         isWhammyActive = isSwellMode;
                     } else {
-                        // Switching TO Whammy Mode overrides and turns Volume OFF
                         isWhammyActive = true; 
                         isVolumeMode = false;
+                        volumePedalGain = 1.0f; 
                     }
                     
                     updateLUT(); 
@@ -1104,8 +1111,28 @@ void MidiTask(void * pvParameters) {
         
         if (btnInterval.update(100)) {
             if (btnInterval.state == LOW) {
-                currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
-                effectMemory[activeEffectMode] = intervalList[currentIntervalIdx]; 
+                if (activeEffectMode == 2) {
+                    feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
+                } else {
+                    currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
+                    
+                    int slot = activeEffectMode;
+                    if (slot == 5) slot = 6;
+                    else if (slot == 6) slot = 7;
+                    else if (slot == 7) slot = 8;
+                    
+                    if (slot == 4) {
+                        float currentCents = effectMemory[4] - (int)effectMemory[4];
+                        effectMemory[4] = intervalList[currentIntervalIdx] + currentCents;
+                    } 
+                    else if (activeEffectMode == 8) {
+                        // Do nothing
+                    } 
+                    else {
+                        effectMemory[slot] = intervalList[currentIntervalIdx]; 
+                    }
+                }
+                
                 updateLUT(); 
                 forceUIUpdate = true;
             }
@@ -1126,50 +1153,47 @@ void MidiTask(void * pvParameters) {
             int diffA = abs((int)calibratedA - (int)lastMidiA);
             int diffB = abs((int)calibratedB - (int)lastMidiB);
             
-            if (diffA > 256) {
-                if (isScreenOff) turnScreenOn();
+            if (diffA > 256 || diffB > 256) {
+                if (isScreenOff) {
+                    turnScreenOn();
+                }
                 lastScreenActivityTime = millis();
             }
 
-            // ACTIVE MODE
-            bool movedA = diffA > 8;
-            bool movedB = false; // PB2 is forced OFF and will be completely ignored
+            // MOCK: Disabled PBs to block floating pin noise
+            bool movedA = false; 
+            bool movedB = false; 
             
             if (movedA || movedB) {
-                if (movedA) { 
+                
+                if (movedA) {
                     currentPB1 = calibratedA; 
                     lastMidiA = calibratedA; 
                     
-                    // --- VOLUME MODE OVERRIDE ---
+                    pitchShiftFactor = pitchShiftLUT[constrain(calibratedA, 0, 16383)];
+                    
                     if (isVolumeMode) {
                         uint8_t ccVal = map(calibratedA, 0, 16383, 0, 127);
                         if (ccVal != lastVolumeCC) {
                             Control_Surface.sendControlChange({19, Channel_1}, ccVal);
                             lastVolumeCC = ccVal;
-                            volumePedalGain = (float)calibratedA / 16383.0f; 
                             forceUIUpdate = true;
                         }
+                        volumePedalGain = (float)calibratedA / 16383.0f; 
+                    } else {
+                        Control_Surface.sendPitchBend(Channel_1, calibratedA);
+                        lastMidiSent = calibratedA; 
+                        forceUIUpdate = true;
                     }
                 }
                 
-                if (movedB) { 
+                if (movedB) {
                     currentPB2 = calibratedB; 
                     lastMidiB = calibratedB; 
-                }
-                
-                // PITCH BEND LOGIC
-                // Only execute if Volume mode is OFF, OR if Pedal 2 (which is independent of Volume) was moved
-                if (!isVolumeMode || movedB) {
-                    analog_t activeMidi = calibratedA;
                     
-                    // If Volume Mode is ON, PB1 is occupied, so any PB messages MUST come from PB2
-                    if (isVolumeMode || movedB) {
-                        activeMidi = calibratedB;
-                    }
-                    
-                    pitchShiftFactor = pitchShiftLUT[constrain(activeMidi, 0, 16383)];
-                    Control_Surface.sendPitchBend(Channel_1, activeMidi);
-                    lastMidiSent = activeMidi; 
+                    pitchShiftFactor = pitchShiftLUT[constrain(calibratedB, 0, 16383)];
+                    Control_Surface.sendPitchBend(Channel_1, calibratedB);
+                    lastMidiSent = calibratedB; 
                     forceUIUpdate = true;
                 }
             }
@@ -1181,14 +1205,14 @@ void MidiTask(void * pvParameters) {
 bool channelMessageCallback(ChannelMessage cm) {
     if (cm.header == 0xB0) {
         
-        // NEW: CC 20 TOGGLES VOLUME MODE
         if (cm.data1 == 20) {
             isVolumeMode = (cm.data2 >= 64);
             
             if (isVolumeMode) {
-                isWhammyActive = false; // Mutually exclusive with Whammy
+                isWhammyActive = false; 
             } else {
-                // Return to normal effect status
+                volumePedalGain = 1.0f; 
+                
                 if (activeEffectMode == 0) {
                     isWhammyActive = true;
                 } else if (activeEffectMode == 1) {
@@ -1236,7 +1260,8 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isWhammyActive = isSwellMode;
             } else {
                 isWhammyActive = true; 
-                isVolumeMode = false; // Override volume if switching to Whammy
+                isVolumeMode = false; 
+                volumePedalGain = 1.0f; 
             }
             
             updateLUT(); 
@@ -1263,7 +1288,8 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isWhammyActive = isSwellMode;
             } else {
                 isWhammyActive = true; 
-                isVolumeMode = false; // Override volume if switching to Whammy
+                isVolumeMode = false; 
+                volumePedalGain = 1.0f; 
             }
             
             updateLUT(); 
@@ -1285,6 +1311,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isChorusMode = false;
                 isSwellMode = false;
                 isVolumeMode = false;
+                volumePedalGain = 1.0f; 
             } else {
                 activeEffectMode = 0;
                 isWhammyActive = true;
@@ -1297,6 +1324,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isChorusMode = false;
                 isSwellMode = false;
                 isVolumeMode = false;
+                volumePedalGain = 1.0f; 
             }
             updateLUT();
             forceUIUpdate = true;
@@ -1358,17 +1386,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             }
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 118) {
-            if (activeEffectMode == 4) {
-                if (cm.data2 < 64) {
-                    effectMemory[4] = constrain(effectMemory[4] + 1.0f, -24.0f, 24.0f);
-                } else {
-                    effectMemory[4] = constrain(effectMemory[4] - 1.0f, -24.0f, 24.0f);
-                }
-                updateLUT(); 
-                forceUIUpdate = true;
-            }
-        }
         else if (cm.data1 == 18) {
             if (activeEffectMode == 8) return false;
             
@@ -1379,18 +1396,27 @@ bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[0] = constrain(effectMemory[0] - 1.0f, -24.0f, 24.0f);
                 }
             } else if (activeEffectMode == 4) {
-                // Ignore, as 118 and 17 handle Capo now
-            } else {
                 if (cm.data2 < 64) {
-                    int slot = activeEffectMode; 
-                    if (activeEffectMode == 5) {
-                        slot = 6; 
-                    } else if (activeEffectMode == 6) {
-                        slot = 7; 
-                    } else if (activeEffectMode == 7) {
-                        slot = 8;
-                    }
+                    effectMemory[4] = constrain(effectMemory[4] + 1.0f, -24.0f, 24.0f);
+                } else {
+                    effectMemory[4] = constrain(effectMemory[4] - 1.0f, -24.0f, 24.0f);
+                }
+            } else if (activeEffectMode == 2) {
+                if (cm.data2 < 64) {
+                    feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
+                } else {
+                    feedbackIntervalIdx = (feedbackIntervalIdx - 1 + 5) % 5;
+                }
+            } else {
+                int slot = activeEffectMode; 
+                if (activeEffectMode == 5) slot = 6; 
+                else if (activeEffectMode == 6) slot = 7; 
+                else if (activeEffectMode == 7) slot = 8;
+
+                if (cm.data2 < 64) {
                     effectMemory[slot] = constrain(effectMemory[slot] + 1.0f, -24.0f, 24.0f);
+                } else {
+                    effectMemory[slot] = constrain(effectMemory[slot] - 1.0f, -24.0f, 24.0f);
                 }
             }
             updateLUT(); 
@@ -1411,16 +1437,21 @@ bool channelMessageCallback(ChannelMessage cm) {
                 } else {
                     effectMemory[4] = constrain(effectMemory[4] - 0.01f, -24.0f, 24.0f);
                 }
+            } else if (activeEffectMode == 2) {
+                if (cm.data2 < 64) {
+                    feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
+                } else {
+                    feedbackIntervalIdx = (feedbackIntervalIdx - 1 + 5) % 5;
+                }
             } else {
-                if (cm.data2 >= 64) {
-                    int slot = activeEffectMode; 
-                    if (activeEffectMode == 5) {
-                        slot = 6; 
-                    } else if (activeEffectMode == 6) {
-                        slot = 7; 
-                    } else if (activeEffectMode == 7) {
-                        slot = 8;
-                    }
+                int slot = activeEffectMode; 
+                if (activeEffectMode == 5) slot = 6; 
+                else if (activeEffectMode == 6) slot = 7; 
+                else if (activeEffectMode == 7) slot = 8;
+
+                if (cm.data2 < 64) {
+                    effectMemory[slot] = constrain(effectMemory[slot] + 1.0f, -24.0f, 24.0f);
+                } else {
                     effectMemory[slot] = constrain(effectMemory[slot] - 1.0f, -24.0f, 24.0f);
                 }
             }
@@ -1509,11 +1540,10 @@ void setup() {
     Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); 
     Control_Surface.begin();
     
-    // --- IMPROVED I2S CHANNEL CONFIGURATION ---
     i2s_chan_config_t c = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
-    c.dma_desc_num = 4; // Improved from 2 to 4 to absorb OS jitter
+    c.dma_desc_num = 4; 
     c.dma_frame_num = 64;
-    c.auto_clear = true; // Output silence instead of glitching if CPU maxes out
+    c.auto_clear = true; 
     i2s_new_channel(&c, &tx_chan, &rx_chan);
     
     i2s_std_config_t s = { 
@@ -1522,7 +1552,7 @@ void setup() {
         .gpio_cfg = { .bclk = GPIO_NUM_10, .ws = GPIO_NUM_11, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } 
     };
     
-    s.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH; // Force I2S hardware driver to use fast internal SRAM for DMA
+    s.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH; 
     
     i2s_channel_init_std_mode(tx_chan, &s); 
     i2s_channel_init_std_mode(rx_chan, &s);

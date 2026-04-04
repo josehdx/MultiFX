@@ -115,7 +115,7 @@ pin_t pinPB2 = 2;
 const int BOOT_SENSE_PIN = 0; 
 const int CAROUSEL_BUTTON_PIN = 14; 
 const int FREEZE_BUTTON_PIN = 18;    
-const int INTERVAL_BUTTON_PIN = 44; 
+const int INTERVAL_BUTTON_PIN = 4; 
 const int FEEDBACK_BUTTON_PIN = 13;  
 
 uint16_t lastMidiSent = 8192;

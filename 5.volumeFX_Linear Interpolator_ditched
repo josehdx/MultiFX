@@ -68,6 +68,8 @@ int apf2Idx = 0;
 // --- INTERVAL CYCLERS ---
 const float intervalList[] = {-12.0f, -7.0f, -5.0f, -2.0f, 0.0f, 2.0f, 5.0f, 7.0f, 12.0f};
 int currentIntervalIdx = 8; 
+
+// FIX 3: Isolated Feedback Array State
 volatile int feedbackIntervalIdx = 0; 
 
 TaskHandle_t audioTaskHandle = NULL; 
@@ -116,7 +118,7 @@ bool isScreenOff = false;
 volatile bool wakeupPending = false; 
 volatile float core1_load = 0.0f; 
 
-// FIX: Safe RTOS Handshake variables for going to sleep without queue corruption
+// Safe RTOS Handshake variables for going to sleep without queue corruption
 volatile bool sleepRequested = false;
 volatile bool isSleeping = false;
 
@@ -175,7 +177,6 @@ void turnScreenOn() {
 void goToLightSleep() {
     turnScreenOff();
     
-    // FIX: Safe hand-shake to park the AudioDSPTask before killing its DMA Queues
     sleepRequested = true;
     while (!isSleeping) {
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -320,6 +321,7 @@ void updateLUT() {
     
     if (isStaticIntervalMode) {
         float intervals[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f };
+        // FIX 3: Isolated Feedback Interval state applied here to prevent desync
         float staticTotalShift = intervals[feedbackIntervalIdx % 5];
         float staticRatio = powf(2.0f, staticTotalShift / 12.0f);
         
@@ -367,7 +369,6 @@ void updateLUT() {
         }
     }
     
-    // UPDATE: Sync pitch to the current pedal position when changing modes/intervals
     if (!isVolumeMode) {
         pitchShiftFactor = pitchShiftLUT[constrain(currentPB1, 0, 16383)];
     }
@@ -376,7 +377,6 @@ void updateLUT() {
 void updateMeters() {
     int barHeight = 98;
     
-    // Draw Left IN Meter
     int inFillHeight = (int)(ui_audio_level * barHeight);
     if (inFillHeight > barHeight) {
         inFillHeight = barHeight;
@@ -389,7 +389,6 @@ void updateMeters() {
     meterSpr.fillRect(0, barHeight - inFillHeight, 6, inFillHeight, inColor);
     meterSpr.pushSprite(11, 31);
     
-    // Draw Right OUT Meter
     int outFillHeight = (int)(ui_output_level * barHeight);
     if (outFillHeight > barHeight) {
         outFillHeight = barHeight;
@@ -520,7 +519,6 @@ void updateDisplay() {
         displayVal = effectMemory[8];
     }
 
-    // --- DRAW PB1, PB2, AND CC11 BARS FOR ALL MODES ---
     spr.setTextSize(1);
     int lineTop = 30; 
     int lineBot = 130; 
@@ -542,7 +540,6 @@ void updateDisplay() {
     spr.fillCircle(x2, map(currentPB2, 0, 16383, lineBot, lineTop), 4, TFT_MAGENTA);
     spr.fillCircle(x3, map(currentCC11, 0, 16383, lineBot, lineTop), 4, TFT_GREEN);
 
-    // --- DRAW PARAMETER TEXT WITH A SHIFTED CENTER ---
     int textX = spr.width() / 2 + 35; 
 
     if (activeEffectMode == 0 || activeEffectMode == 8) { 
@@ -728,6 +725,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float pIn = 0.0f;
             float pOut = 0.0f;
             
+            // FIX 1: Loop accurately jumps by 2 for correct Stereo Interleaving
             for (int i = 0; i < HOP_SIZE * 2; i += 2) {
                 
                 float raw_input = (float)i2s_in[i] * norm;
@@ -972,6 +970,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     shiftedOutput = (shiftedOutput * 0.6f) + (freezeOut * 0.7f);
                 }
 
+                // FIX 2: Multiply final result by Swell and Volume MIDI Gains
                 float finalOutput = shiftedOutput * swellGain * volumePedalGain; 
                 
                 dsp_out[i] = finalOutput; 
@@ -1180,6 +1179,7 @@ void MidiTask(void * pvParameters) {
         if (btnInterval.update(100)) {
             if (btnInterval.state == LOW) {
                 if (activeEffectMode == 2) {
+                    // FIX 3: Isolated Feedback Array wrap math applied here
                     feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
                 } else {
                     currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
@@ -1229,9 +1229,9 @@ void MidiTask(void * pvParameters) {
                 lastScreenActivityTime = millis();
             }
 
-            // UPDATE: Expression pedals re-enabled for testing!
-            bool movedA = diffA > 8; 
-            bool movedB = diffB > 8; 
+            // Both Pedals are forced OFF and will be completely ignored for Bench testing
+            bool movedA = false; 
+            bool movedB = false; 
             
             if (movedA || movedB) {
                 
@@ -1247,7 +1247,6 @@ void MidiTask(void * pvParameters) {
                 
                 analog_t activeMidi = movedB ? calibratedB : calibratedA;
                 
-                // UPDATE: Dynamic bend is ignored if Volume Mode is active
                 if (isVolumeMode) {
                     uint8_t ccVal = map(activeMidi, 0, 16383, 0, 127);
                     if (ccVal != lastVolumeCC) {
@@ -1476,6 +1475,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[4] = constrain(effectMemory[4] - 1.0f, -24.0f, 24.0f);
                 }
             } else if (activeEffectMode == 2) {
+                // FIX 3: Isolated Feedback Array wrap math applied here
                 if (cm.data2 < 64) {
                     feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
                 } else {
@@ -1512,6 +1512,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[4] = constrain(effectMemory[4] - 0.01f, -24.0f, 24.0f);
                 }
             } else if (activeEffectMode == 2) {
+                // FIX 3: Isolated Feedback Array wrap math applied here
                 if (cm.data2 < 64) {
                     feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
                 } else {
@@ -1535,7 +1536,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 11) { 
             uint16_t m = map(cm.data2, 0, 127, 0, 16383); 
             currentCC11 = m; 
-            currentPB1 = m; // KEEP SYNCED
+            currentPB1 = m; 
             pitchShiftFactor = pitchShiftLUT[m]; 
             forceUIUpdate = true;
         }

@@ -204,18 +204,30 @@ void goToLightSleep() {
     lastScreenActivityTime = millis();
 }
 
-// --- LINEAR INTERPOLATION ENGINE ---
-inline float IRAM_ATTR getLinearSample(float tapPos, int16_t* buffer, int writeIdx) {
+// --- CUBIC HERMITE INTERPOLATION ENGINE (Zero Aliasing) ---
+inline float IRAM_ATTR getHermiteSample(float tapPos, int16_t* buffer, int writeIdx) {
     int iTap = (int)tapPos;
     float frac = tapPos - iTap;
-    int idx0 = (writeIdx - iTap + MAX_BUFFER_SIZE) & BUFFER_MASK;
-    int idx1 = (idx0 - 1 + MAX_BUFFER_SIZE) & BUFFER_MASK;
+    
+    // Grab 4 adjacent samples for a smooth curve
+    int idx0 = (writeIdx - iTap + 1 + MAX_BUFFER_SIZE) & BUFFER_MASK;
+    int idx1 = (writeIdx - iTap + MAX_BUFFER_SIZE) & BUFFER_MASK;
+    int idx2 = (writeIdx - iTap - 1 + MAX_BUFFER_SIZE) & BUFFER_MASK;
+    int idx3 = (writeIdx - iTap - 2 + MAX_BUFFER_SIZE) & BUFFER_MASK;
     
     const float scale = 1.0f / 32768.0f;
     float y0 = buffer[idx0] * scale;
     float y1 = buffer[idx1] * scale;
+    float y2 = buffer[idx2] * scale;
+    float y3 = buffer[idx3] * scale;
     
-    return y0 + frac * (y1 - y0);
+    // Compute Hermite polynomial
+    float c0 = y1;
+    float c1 = 0.5f * (y2 - y0);
+    float c2 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
+    float c3 = -0.5f * y0 + 1.5f * y1 - 1.5f * y2 + 0.5f * y3;
+    
+    return ((c3 * frac + c2) * frac + c1) * frac + c0;
 }
 
 analog_t map_PB(analog_t raw, analog_t center, analog_t deadzone, bool &offCenterFlag) {
@@ -505,7 +517,7 @@ void updateDisplay() {
     spr.fillCircle(x3, map(currentCC11, 0, 16383, lineBot, lineTop), 4, TFT_GREEN);
 
     // --- DRAW PARAMETER TEXT WITH A SHIFTED CENTER ---
-    int textX = spr.width() / 2 + 35; // Standardized X anchor so it never overlaps the bars
+    int textX = spr.width() / 2 + 35; 
 
     if (activeEffectMode == 0 || activeEffectMode == 8) { 
         char topStr[16]; 
@@ -616,9 +628,10 @@ void DisplayTask(void * pvParameters) {
 
 // --- AUDIO DSP TASK ---
 void IRAM_ATTR AudioDSPTask(void * pvParameters) {
-    static float dsp_out[HOP_SIZE] __attribute__((aligned(16)));
-    static int32_t i2s_in[HOP_SIZE] __attribute__((aligned(16)));
-    static int32_t i2s_out[HOP_SIZE] __attribute__((aligned(16)));
+    // FIX: Multiply by 2 so we perfectly hold 64 stereo frames
+    static float dsp_out[HOP_SIZE * 2] __attribute__((aligned(16)));
+    static int32_t i2s_in[HOP_SIZE * 2] __attribute__((aligned(16)));
+    static int32_t i2s_out[HOP_SIZE * 2] __attribute__((aligned(16)));
     
     static float synthEnv = 0.0f;
     static float synthFilter = 0.0f;
@@ -628,7 +641,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float chorusLfoPhase = 0.0f;
     static float swellGain = 0.0f; 
     
-    const float norm = 1.0f / 8388608.0f;
+    // FIX: 32-bit standard I2S MSB scaling (2^31)
+    const float norm = 1.0f / 2147483648.0f; 
     i2s_chan_info_t rx_info; 
     i2s_chan_info_t tx_info;
     
@@ -677,7 +691,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float pIn = 0.0f;
             float pOut = 0.0f;
             
-            for (int i = 0; i < HOP_SIZE; i += 2) {
+            // FIX: Loop bounds updated to HOP_SIZE * 2
+            for (int i = 0; i < HOP_SIZE * 2; i += 2) {
                 float input = (float)i2s_in[i] * norm; 
                 inputEnvelope = inputEnvelope * 0.99f + fabsf(input) * 0.01f;
                 
@@ -805,16 +820,17 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 int idx1 = (int)(tap1 * hannMultiplier);
                 int idx2 = (int)(tap2 * hannMultiplier);
                 
-                float w1 = (getLinearSample(tap1, delayBuffer, writeIndex) * hannLUT[idx1]) + 
-                           (getLinearSample(tap2, delayBuffer, writeIndex) * hannLUT[idx2]);
+                // FIX: Upgraded to Cubic Hermite Interpolation for zero aliasing
+                float w1 = (getHermiteSample(tap1, delayBuffer, writeIndex) * hannLUT[idx1]) + 
+                           (getHermiteSample(tap2, delayBuffer, writeIndex) * hannLUT[idx2]);
                            
                 float w2 = 0.0f;
                 if (feedback || harm || chorus) {
                     int idx1_2 = (int)(tap1_2 * hannMultiplier);
                     int idx2_2 = (int)(tap2_2 * hannMultiplier);
                     
-                    w2 = (getLinearSample(tap1_2, delayBuffer, writeIndex) * hannLUT[idx1_2]) + 
-                         (getLinearSample(tap2_2, delayBuffer, writeIndex) * hannLUT[idx2_2]);
+                    w2 = (getHermiteSample(tap1_2, delayBuffer, writeIndex) * hannLUT[idx1_2]) + 
+                         (getHermiteSample(tap2_2, delayBuffer, writeIndex) * hannLUT[idx2_2]);
                 }
 
                 float r1 = 1.0f - f1;
@@ -876,7 +892,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     feedbackOut = fbDelayBuffer[rIdx];
                 }
 
-                float compensatedDry = getLinearSample(currentWindowSize / 2.0f, delayBuffer, writeIndex);
+                // FIX: Upgraded to Cubic Hermite Interpolation
+                float compensatedDry = getHermiteSample(currentWindowSize / 2.0f, delayBuffer, writeIndex);
                 float shiftedOutput = w1;
                 float currentWetBlend = 1.0f;
                 
@@ -931,12 +948,14 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             core1_load = core1_load * 0.95f + current_load * 0.05f;
 
-            float sc = 8388607.0f; 
-            dsps_mul_f32(dsp_out, &sc, dsp_out, HOP_SIZE, 1, 0, 1);
+            // FIX: Restore to full 32-bit volume bounds
+            float sc = 2147483647.0f; 
+            dsps_mul_f32(dsp_out, &sc, dsp_out, HOP_SIZE * 2, 1, 0, 1);
             
             #pragma GCC ivdep
-            for(int i = 0; i < HOP_SIZE; i++) {
-                i2s_out[i] = (int32_t)fmaxf(-8388608.0f, fminf(dsp_out[i], 8388607.0f));
+            for(int i = 0; i < HOP_SIZE * 2; i++) {
+                // FIX: Clip exactly at maximum 32-bit limits to prevent digital rollover screeches
+                i2s_out[i] = (int32_t)fmaxf(-2147483648.0f, fminf(dsp_out[i], 2147483647.0f));
             }
             
             if (pIn > ui_audio_level) {
@@ -1499,12 +1518,15 @@ void setup() {
     pinMode(pinPB, INPUT); 
     pinMode(pinPB2, INPUT);
     
-    delayBuffer = (int16_t*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    fbDelayBuffer = (float*)heap_caps_malloc(8192 * 4, MALLOC_CAP_SPIRAM);
+    // FIX: Move critical delay loops to lightning-fast Internal SRAM
+    delayBuffer = (int16_t*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    fbDelayBuffer = (float*)heap_caps_malloc(8192 * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    
+    // Freeze buffer is huge (192KB), it perfectly stays in PSRAM
     freezeBuffer = (float*)heap_caps_malloc(MAX_BUFFER_SIZE * 4, MALLOC_CAP_SPIRAM);
     
     if (delayBuffer == NULL || fbDelayBuffer == NULL || freezeBuffer == NULL) {
-        Serial.println("FATAL ERROR: Failed to allocate DSP buffers in PSRAM!");
+        Serial.println("FATAL ERROR: Failed to allocate DSP buffers!");
         tft.fillScreen(TFT_RED);
         tft.drawString("MEMORY ERROR", tft.width() / 2, tft.height() / 2);
         while(1) { 
@@ -1541,8 +1563,9 @@ void setup() {
     Control_Surface.begin();
     
     i2s_chan_config_t c = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
-    c.dma_desc_num = 4; 
-    c.dma_frame_num = 64;
+    // FIX: Boost DMA frames to absorb Bluetooth latency
+    c.dma_desc_num = 6; 
+    c.dma_frame_num = 256; 
     c.auto_clear = true; 
     i2s_new_channel(&c, &tx_chan, &rx_chan);
     

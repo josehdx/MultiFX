@@ -69,7 +69,7 @@ int apf2Idx = 0;
 // --- INTERVAL CYCLERS ---
 const float intervalList[] = {-12.0f, -7.0f, -5.0f, -2.0f, 0.0f, 2.0f, 5.0f, 7.0f, 12.0f};
 int currentIntervalIdx = 8; 
-int feedbackIntervalIdx = 0; // FIX: Dedicated index for Feedback Mode
+int feedbackIntervalIdx = 0; 
 
 TaskHandle_t audioTaskHandle = NULL; 
 
@@ -204,18 +204,30 @@ void goToLightSleep() {
     lastScreenActivityTime = millis();
 }
 
-// --- LINEAR INTERPOLATION ENGINE ---
-inline float IRAM_ATTR getLinearSample(float tapPos, int16_t* buffer, int writeIdx) {
+// --- CUBIC HERMITE INTERPOLATION ENGINE (Zero Aliasing) ---
+inline float IRAM_ATTR getHermiteSample(float tapPos, int16_t* buffer, int writeIdx) {
     int iTap = (int)tapPos;
     float frac = tapPos - iTap;
-    int idx0 = (writeIdx - iTap + MAX_BUFFER_SIZE) & BUFFER_MASK;
-    int idx1 = (idx0 - 1 + MAX_BUFFER_SIZE) & BUFFER_MASK;
+    
+    // Grab 4 adjacent samples for a smooth curve
+    int idx0 = (writeIdx - iTap + 1 + MAX_BUFFER_SIZE) & BUFFER_MASK;
+    int idx1 = (writeIdx - iTap + MAX_BUFFER_SIZE) & BUFFER_MASK;
+    int idx2 = (writeIdx - iTap - 1 + MAX_BUFFER_SIZE) & BUFFER_MASK;
+    int idx3 = (writeIdx - iTap - 2 + MAX_BUFFER_SIZE) & BUFFER_MASK;
     
     const float scale = 1.0f / 32768.0f;
     float y0 = buffer[idx0] * scale;
     float y1 = buffer[idx1] * scale;
+    float y2 = buffer[idx2] * scale;
+    float y3 = buffer[idx3] * scale;
     
-    return y0 + frac * (y1 - y0);
+    // Compute Hermite polynomial
+    float c0 = y1;
+    float c1 = 0.5f * (y2 - y0);
+    float c2 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
+    float c3 = -0.5f * y0 + 1.5f * y1 - 1.5f * y2 + 0.5f * y3;
+    
+    return ((c3 * frac + c2) * frac + c1) * frac + c0;
 }
 
 analog_t map_PB(analog_t raw, analog_t center, analog_t deadzone, bool &offCenterFlag) {
@@ -301,7 +313,6 @@ void updateLUT() {
     
     if (isStaticIntervalMode) {
         float intervals[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f };
-        // FIX: Feedback Mode now strictly uses its own modulo 5 index
         float staticTotalShift = intervals[feedbackIntervalIdx % 5];
         float staticRatio = powf(2.0f, staticTotalShift / 12.0f);
         
@@ -312,7 +323,7 @@ void updateLUT() {
         float basePitch = 0.0f;
         
         if (isCapoMode) {
-            basePitch += effectMemory[4]; // Contains both Intervals and Cents
+            basePitch += effectMemory[4]; 
         }
         
         if (activeEffectMode == 1 || activeEffectMode == 3) {
@@ -436,35 +447,35 @@ void updateDisplay() {
             break;
         case 1: 
             spr.setTextColor(TFT_CYAN, TFT_BLACK); 
-            spr.drawString("FREEZE", spr.width() / 2, 40); 
+            spr.drawString("FREEZE", spr.width() / 2 + 30, 40); 
             break;
         case 2: 
             spr.setTextColor(TFT_RED, TFT_BLACK); 
-            spr.drawString("FEEDBACK", spr.width() / 2, 40); 
+            spr.drawString("FEEDBACK", spr.width() / 2 + 30, 40); 
             break;
         case 3: 
             spr.setTextColor(TFT_MAGENTA, TFT_BLACK); 
-            spr.drawString("HARMONY", spr.width() / 2, 40); 
+            spr.drawString("HARMONY", spr.width() / 2 + 30, 40); 
             break;
         case 4: 
             spr.setTextColor(TFT_GREEN, TFT_BLACK); 
-            spr.drawString("CAPO", spr.width() / 2, 40); 
+            spr.drawString("CAPO", spr.width() / 2 + 30, 40); 
             break;
         case 5: 
             spr.setTextColor(TFT_YELLOW, TFT_BLACK); 
-            spr.drawString("SYNTH", spr.width() / 2, 40); 
+            spr.drawString("SYNTH", spr.width() / 2 + 30, 40); 
             break;
         case 6: 
             spr.setTextColor(TFT_PINK, TFT_BLACK); 
-            spr.drawString("PAD", spr.width() / 2, 40); 
+            spr.drawString("PAD", spr.width() / 2 + 30, 40); 
             break;
         case 7: 
             spr.setTextColor(TFT_SKYBLUE, TFT_BLACK); 
-            spr.drawString("CHORUS", spr.width() / 2, 40); 
+            spr.drawString("CHORUS", spr.width() / 2 + 30, 40); 
             break;
         case 8: 
             spr.setTextColor(TFT_WHITE, TFT_BLACK); 
-            spr.drawString("SWELL", spr.width() / 2, 40); 
+            spr.drawString("SWELL", spr.width() / 2 + 30, 40); 
             break;
     }
 
@@ -474,7 +485,6 @@ void updateDisplay() {
     
     if (activeEffectMode == 2) {
         float fbIntervals[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f };
-        // FIX: UI accurately reflects the Feedback's dedicated index
         displayVal = fbIntervals[feedbackIntervalIdx % 5];
     } else if (activeEffectMode == 5) {
         displayVal = effectMemory[6];
@@ -484,71 +494,72 @@ void updateDisplay() {
         displayVal = effectMemory[8];
     }
 
-    if (activeEffectMode == 0 || activeEffectMode == 4 || activeEffectMode == 8) { 
-        spr.setTextSize(1);
-        int lineTop = 30; 
-        int lineBot = 130; 
-        int x1 = 35; 
-        int x2 = 70; 
-        int x3 = 105;
-        
-        if (activeEffectMode == 0 || activeEffectMode == 8) { 
-            spr.drawString("PB1", x1, lineBot + 15); 
-            spr.drawString("PB2", x2, lineBot + 15); 
-            spr.drawString("CC11", x3, lineBot + 15);
-            
-            for (int y = lineTop; y <= lineBot; y += 5) { 
-                spr.drawFastVLine(x1, y, 2, TFT_DARKGREY); 
-                spr.drawFastVLine(x2, y, 2, TFT_DARKGREY); 
-                spr.drawFastVLine(x3, y, 2, TFT_DARKGREY); 
-            }
-            
-            spr.fillCircle(x1, map(currentPB1, 0, 16383, lineBot, lineTop), 4, TFT_CYAN);
-            spr.fillCircle(x2, map(currentPB2, 0, 16383, lineBot, lineTop), 4, TFT_MAGENTA);
-            spr.fillCircle(x3, map(currentCC11, 0, 16383, lineBot, lineTop), 4, TFT_GREEN);
-        }
+    // --- DRAW PB1, PB2, AND CC11 BARS FOR ALL MODES ---
+    spr.setTextSize(1);
+    int lineTop = 30; 
+    int lineBot = 130; 
+    int x1 = 35; 
+    int x2 = 70; 
+    int x3 = 105;
+    
+    spr.drawString("PB1", x1, lineBot + 15); 
+    spr.drawString("PB2", x2, lineBot + 15); 
+    spr.drawString("CC11", x3, lineBot + 15);
+    
+    for (int y = lineTop; y <= lineBot; y += 5) { 
+        spr.drawFastVLine(x1, y, 2, TFT_DARKGREY); 
+        spr.drawFastVLine(x2, y, 2, TFT_DARKGREY); 
+        spr.drawFastVLine(x3, y, 2, TFT_DARKGREY); 
+    }
+    
+    spr.fillCircle(x1, map(currentPB1, 0, 16383, lineBot, lineTop), 4, TFT_CYAN);
+    spr.fillCircle(x2, map(currentPB2, 0, 16383, lineBot, lineTop), 4, TFT_MAGENTA);
+    spr.fillCircle(x3, map(currentCC11, 0, 16383, lineBot, lineTop), 4, TFT_GREEN);
 
+    // --- DRAW PARAMETER TEXT WITH A SHIFTED CENTER ---
+    int textX = spr.width() / 2 + 35; 
+
+    if (activeEffectMode == 0 || activeEffectMode == 8) { 
         char topStr[16]; 
         char botStr[16];
-        int textX = spr.width() / 2;
-        
-        if (activeEffectMode == 0 || activeEffectMode == 8) {
-            textX = spr.width() / 2 + 35;
-            spr.setTextSize(3); 
-            if (effectMemory[0] > 0) {
-                sprintf(topStr, "+%.1f", effectMemory[0]);
-            } else {
-                sprintf(topStr, "%.1f", effectMemory[0]);
-            }
-            
-            if (effectMemory[5] > 0) {
-                sprintf(botStr, "+%.1f", effectMemory[5]);
-            } else {
-                sprintf(botStr, "%.1f", effectMemory[5]);
-            }
+        spr.setTextSize(3); 
+        if (effectMemory[0] > 0) {
+            sprintf(topStr, "+%.1f", effectMemory[0]);
         } else {
-            spr.setTextSize(2); 
-            int totalCents = (int)round(effectMemory[4] * 100.0f);
-            int cInt = totalCents / 100; 
-            int cCents = totalCents % 100;
-            
-            if (cInt > 0) {
-                sprintf(topStr, "Int: +%d", cInt);
-            } else {
-                sprintf(topStr, "Int: %d", cInt);
-            }
-            
-            if (cCents > 0) {
-                sprintf(botStr, "Ct: +%d", cCents);
-            } else {
-                sprintf(botStr, "Ct: %d", cCents);
-            }
+            sprintf(topStr, "%.1f", effectMemory[0]);
         }
         
+        if (effectMemory[5] > 0) {
+            sprintf(botStr, "+%.1f", effectMemory[5]);
+        } else {
+            sprintf(botStr, "%.1f", effectMemory[5]);
+        }
         spr.drawString(topStr, textX, (spr.height() / 2) - 15);
         spr.drawString(botStr, textX, (spr.height() / 2) + 15);
+    } 
+    else if (activeEffectMode == 4) {
+        char topStr[16]; 
+        char botStr[16];
+        spr.setTextSize(2); 
+        int totalCents = (int)round(effectMemory[4] * 100.0f);
+        int cInt = totalCents / 100; 
+        int cCents = totalCents % 100;
         
-    } else { 
+        if (cInt > 0) {
+            sprintf(topStr, "Int: +%d", cInt);
+        } else {
+            sprintf(topStr, "Int: %d", cInt);
+        }
+        
+        if (cCents > 0) {
+            sprintf(botStr, "Ct: +%d", cCents);
+        } else {
+            sprintf(botStr, "Ct: %d", cCents);
+        }
+        spr.drawString(topStr, textX, (spr.height() / 2) - 15);
+        spr.drawString(botStr, textX, (spr.height() / 2) + 15);
+    } 
+    else { 
         spr.setTextSize(4); 
         char intervalStr[16];
         
@@ -557,8 +568,7 @@ void updateDisplay() {
         } else {
             sprintf(intervalStr, "%.1f", displayVal);
         }
-        
-        spr.drawString(intervalStr, spr.width() / 2, spr.height() / 2 + 10);
+        spr.drawString(intervalStr, textX, spr.height() / 2 + 10);
     }
 
     spr.setTextSize(2); 
@@ -618,9 +628,10 @@ void DisplayTask(void * pvParameters) {
 
 // --- AUDIO DSP TASK ---
 void IRAM_ATTR AudioDSPTask(void * pvParameters) {
-    static float dsp_out[HOP_SIZE] __attribute__((aligned(16)));
-    static int32_t i2s_in[HOP_SIZE] __attribute__((aligned(16)));
-    static int32_t i2s_out[HOP_SIZE] __attribute__((aligned(16)));
+    // FIX: Multiply by 2 so we perfectly hold 64 stereo frames
+    static float dsp_out[HOP_SIZE * 2] __attribute__((aligned(16)));
+    static int32_t i2s_in[HOP_SIZE * 2] __attribute__((aligned(16)));
+    static int32_t i2s_out[HOP_SIZE * 2] __attribute__((aligned(16)));
     
     static float synthEnv = 0.0f;
     static float synthFilter = 0.0f;
@@ -630,7 +641,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float chorusLfoPhase = 0.0f;
     static float swellGain = 0.0f; 
     
-    const float norm = 1.0f / 8388608.0f;
+    // FIX: 32-bit standard I2S MSB scaling (2^31)
+    const float norm = 1.0f / 2147483648.0f; 
     i2s_chan_info_t rx_info; 
     i2s_chan_info_t tx_info;
     
@@ -679,7 +691,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float pIn = 0.0f;
             float pOut = 0.0f;
             
-            for (int i = 0; i < HOP_SIZE; i += 2) {
+            // FIX: Loop bounds updated to HOP_SIZE * 2
+            for (int i = 0; i < HOP_SIZE * 2; i += 2) {
                 float input = (float)i2s_in[i] * norm; 
                 inputEnvelope = inputEnvelope * 0.99f + fabsf(input) * 0.01f;
                 
@@ -807,16 +820,17 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 int idx1 = (int)(tap1 * hannMultiplier);
                 int idx2 = (int)(tap2 * hannMultiplier);
                 
-                float w1 = (getLinearSample(tap1, delayBuffer, writeIndex) * hannLUT[idx1]) + 
-                           (getLinearSample(tap2, delayBuffer, writeIndex) * hannLUT[idx2]);
+                // FIX: Upgraded to Cubic Hermite Interpolation for zero aliasing
+                float w1 = (getHermiteSample(tap1, delayBuffer, writeIndex) * hannLUT[idx1]) + 
+                           (getHermiteSample(tap2, delayBuffer, writeIndex) * hannLUT[idx2]);
                            
                 float w2 = 0.0f;
                 if (feedback || harm || chorus) {
                     int idx1_2 = (int)(tap1_2 * hannMultiplier);
                     int idx2_2 = (int)(tap2_2 * hannMultiplier);
                     
-                    w2 = (getLinearSample(tap1_2, delayBuffer, writeIndex) * hannLUT[idx1_2]) + 
-                         (getLinearSample(tap2_2, delayBuffer, writeIndex) * hannLUT[idx2_2]);
+                    w2 = (getHermiteSample(tap1_2, delayBuffer, writeIndex) * hannLUT[idx1_2]) + 
+                         (getHermiteSample(tap2_2, delayBuffer, writeIndex) * hannLUT[idx2_2]);
                 }
 
                 float r1 = 1.0f - f1;
@@ -878,7 +892,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     feedbackOut = fbDelayBuffer[rIdx];
                 }
 
-                float compensatedDry = getLinearSample(currentWindowSize / 2.0f, delayBuffer, writeIndex);
+                // FIX: Upgraded to Cubic Hermite Interpolation
+                float compensatedDry = getHermiteSample(currentWindowSize / 2.0f, delayBuffer, writeIndex);
                 float shiftedOutput = w1;
                 float currentWetBlend = 1.0f;
                 
@@ -933,12 +948,14 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             core1_load = core1_load * 0.95f + current_load * 0.05f;
 
-            float sc = 8388607.0f; 
-            dsps_mul_f32(dsp_out, &sc, dsp_out, HOP_SIZE, 1, 0, 1);
+            // FIX: Restore to full 32-bit volume bounds
+            float sc = 2147483647.0f; 
+            dsps_mul_f32(dsp_out, &sc, dsp_out, HOP_SIZE * 2, 1, 0, 1);
             
             #pragma GCC ivdep
-            for(int i = 0; i < HOP_SIZE; i++) {
-                i2s_out[i] = (int32_t)fmaxf(-8388608.0f, fminf(dsp_out[i], 8388607.0f));
+            for(int i = 0; i < HOP_SIZE * 2; i++) {
+                // FIX: Clip exactly at maximum 32-bit limits to prevent digital rollover screeches
+                i2s_out[i] = (int32_t)fmaxf(-2147483648.0f, fminf(dsp_out[i], 2147483647.0f));
             }
             
             if (pIn > ui_audio_level) {
@@ -1113,7 +1130,6 @@ void MidiTask(void * pvParameters) {
         
         if (btnInterval.update(100)) {
             if (btnInterval.state == LOW) {
-                // FIX: Feedback Mode gets its own separate Modulo 5 array index
                 if (activeEffectMode == 2) {
                     feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
                 } else {
@@ -1173,7 +1189,6 @@ void MidiTask(void * pvParameters) {
                     currentPB1 = calibratedA; 
                     lastMidiA = calibratedA; 
                     
-                    // FIX: Background Pitch Tracking so pitch doesn't snap when exiting Volume mode!
                     pitchShiftFactor = pitchShiftLUT[constrain(calibratedA, 0, 16383)];
                     
                     if (isVolumeMode) {
@@ -1406,7 +1421,6 @@ bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[4] = constrain(effectMemory[4] - 1.0f, -24.0f, 24.0f);
                 }
             } else if (activeEffectMode == 2) {
-                // FIX: Cycle the Dedicated Feedback Index Modulo 5
                 if (cm.data2 < 64) {
                     feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
                 } else {
@@ -1443,7 +1457,6 @@ bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[4] = constrain(effectMemory[4] - 0.01f, -24.0f, 24.0f);
                 }
             } else if (activeEffectMode == 2) {
-                // FIX: Cycle the Dedicated Feedback Index Modulo 5
                 if (cm.data2 < 64) {
                     feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
                 } else {
@@ -1505,12 +1518,15 @@ void setup() {
     pinMode(pinPB, INPUT); 
     pinMode(pinPB2, INPUT);
     
-    delayBuffer = (int16_t*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    fbDelayBuffer = (float*)heap_caps_malloc(8192 * 4, MALLOC_CAP_SPIRAM);
+    // FIX: Move critical delay loops to lightning-fast Internal SRAM
+    delayBuffer = (int16_t*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    fbDelayBuffer = (float*)heap_caps_malloc(8192 * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    
+    // Freeze buffer is huge (192KB), it perfectly stays in PSRAM
     freezeBuffer = (float*)heap_caps_malloc(MAX_BUFFER_SIZE * 4, MALLOC_CAP_SPIRAM);
     
     if (delayBuffer == NULL || fbDelayBuffer == NULL || freezeBuffer == NULL) {
-        Serial.println("FATAL ERROR: Failed to allocate DSP buffers in PSRAM!");
+        Serial.println("FATAL ERROR: Failed to allocate DSP buffers!");
         tft.fillScreen(TFT_RED);
         tft.drawString("MEMORY ERROR", tft.width() / 2, tft.height() / 2);
         while(1) { 
@@ -1547,8 +1563,9 @@ void setup() {
     Control_Surface.begin();
     
     i2s_chan_config_t c = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
-    c.dma_desc_num = 4; 
-    c.dma_frame_num = 64;
+    // FIX: Boost DMA frames to absorb Bluetooth latency
+    c.dma_desc_num = 6; 
+    c.dma_frame_num = 256; 
     c.auto_clear = true; 
     i2s_new_channel(&c, &tx_chan, &rx_chan);
     

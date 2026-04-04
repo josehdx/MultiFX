@@ -93,7 +93,9 @@ volatile bool isCapoMode = false;
 volatile bool isChorusMode = false; 
 volatile bool isSwellMode = false; 
 
-// FIX: Global volatile for Swell reset (Hot Start Fix)
+// FIX 2: Global volatile variables for mode-change resets to prevent pops
+volatile float chorusLfoPhase = 0.0f;
+volatile float feedbackLfoPhase = 0.0f;
 volatile float swellGain = 0.0f; 
 
 // NEW: VOLUME EFFECT VARIABLES
@@ -101,7 +103,6 @@ volatile bool isVolumeMode = false;
 volatile float volumePedalGain = 1.0f; 
 
 volatile float feedbackRamp = 0.0f;
-float feedbackLfoPhase = 0.0f;
 float fbHpfState = 0.0f;
 float feedbackFilter = 0.0f;
 volatile int latencyMode = 1; 
@@ -622,7 +623,7 @@ void DisplayTask(void * pvParameters) {
             forceUIUpdate = false; 
         }
         
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(16));
     }
 }
 
@@ -638,7 +639,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float padFilter = 0.0f;
     static float padEnv = 0.0f;
     static float inputEnvelope = 0.0f;
-    static float chorusLfoPhase = 0.0f;
+    // FIX 2: Removed local shadowed chorusLfoPhase to use global volatile for reset
     
     // FIX 1: DC Blocker state variables to strip hardware rumble
     static float dc_state_in = 0.0f;
@@ -1034,6 +1035,9 @@ void MidiTask(void * pvParameters) {
     static DebouncedButton btnFb(FEEDBACK_BUTTON_PIN);
     static DebouncedButton btnInterval(INTERVAL_BUTTON_PIN);
 
+    // FIX 1: Variable for Interval Edge Detection
+    static bool lastIntervalReading = HIGH;
+
     btnCar.state = digitalRead(CAROUSEL_BUTTON_PIN); 
     btnCar.lastReading = btnCar.state;
     
@@ -1090,6 +1094,11 @@ void MidiTask(void * pvParameters) {
                 if (dur < 400) { 
                     activeEffectMode = (activeEffectMode + 1) % 9; 
                     
+                    // FIX 2: Reset LFOs and Swell Gain on mode change to prevent pops and hot-starts
+                    chorusLfoPhase = 0.0f;
+                    feedbackLfoPhase = 0.0f;
+                    swellGain = 0.0f;
+                    
                     if (activeEffectMode == 1) {
                         isWhammyActive = isFrozen; 
                     } else if (activeEffectMode == 2) {
@@ -1106,7 +1115,6 @@ void MidiTask(void * pvParameters) {
                         isWhammyActive = isChorusMode;
                     } else if (activeEffectMode == 8) {
                         isWhammyActive = isSwellMode;
-                        swellGain = 0.0f; // FIX: Reset gain on transition
                     } else {
                         isWhammyActive = true; 
                         isVolumeMode = false;
@@ -1139,34 +1147,36 @@ void MidiTask(void * pvParameters) {
             } 
         }
         
-        if (btnInterval.update(100)) {
-            if (btnInterval.state == LOW) {
-                if (activeEffectMode == 2) {
-                    feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
-                } else {
-                    currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
-                    
-                    int slot = activeEffectMode;
-                    if (slot == 5) slot = 6;
-                    else if (slot == 6) slot = 7;
-                    else if (slot == 7) slot = 8;
-                    
-                    if (slot == 4) {
-                        float currentCents = effectMemory[4] - (int)effectMemory[4];
-                        effectMemory[4] = intervalList[currentIntervalIdx] + currentCents;
-                    } 
-                    else if (activeEffectMode == 8) {
-                        // Do nothing
-                    } 
-                    else {
-                        effectMemory[slot] = intervalList[currentIntervalIdx]; 
-                    }
-                }
+        // FIX 1: Interval Edge Detection to prevent rapid-fire cycling
+        bool currentIntervalReading = digitalRead(INTERVAL_BUTTON_PIN);
+        if (currentIntervalReading == LOW && lastIntervalReading == HIGH) {
+            if (activeEffectMode == 2) {
+                feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
+            } else {
+                currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
                 
-                updateLUT(); 
-                forceUIUpdate = true;
+                int slot = activeEffectMode;
+                if (slot == 5) slot = 6;
+                else if (slot == 6) slot = 7;
+                else if (slot == 7) slot = 8;
+                
+                if (slot == 4) {
+                    float currentCents = effectMemory[4] - (int)effectMemory[4];
+                    effectMemory[4] = intervalList[currentIntervalIdx] + currentCents;
+                } 
+                else if (activeEffectMode == 8) {
+                    // Do nothing
+                } 
+                else {
+                    effectMemory[slot] = intervalList[currentIntervalIdx]; 
+                }
             }
+            
+            updateLUT(); 
+            forceUIUpdate = true;
+            lastActivityTime = millis();
         }
+        lastIntervalReading = currentIntervalReading;
 
         filterPB.update(); 
         filterPB2.update(); 
@@ -1272,6 +1282,11 @@ bool channelMessageCallback(ChannelMessage cm) {
                 activeEffectMode = activeEffectMode - 1;
             }
             
+            // FIX 2: Reset LFOs and Swell Gain on mode change to prevent pops
+            chorusLfoPhase = 0.0f;
+            feedbackLfoPhase = 0.0f;
+            swellGain = 0.0f;
+            
             if (activeEffectMode == 1) {
                 isWhammyActive = isFrozen; 
             } else if (activeEffectMode == 2) {
@@ -1288,7 +1303,6 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isWhammyActive = isChorusMode;
             } else if (activeEffectMode == 8) {
                 isWhammyActive = isSwellMode;
-                swellGain = 0.0f; // FIX: Reset gain on transition
             } else {
                 isWhammyActive = true; 
                 isVolumeMode = false; 
@@ -1301,6 +1315,11 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 5 && cm.data2 >= 64) { 
             activeEffectMode = (activeEffectMode + 1) % 9; 
             
+            // FIX 2: Reset LFOs and Swell Gain on mode change to prevent pops
+            chorusLfoPhase = 0.0f;
+            feedbackLfoPhase = 0.0f;
+            swellGain = 0.0f;
+            
             if (activeEffectMode == 1) {
                 isWhammyActive = isFrozen; 
             } else if (activeEffectMode == 2) {
@@ -1317,7 +1336,6 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isWhammyActive = isChorusMode;
             } else if (activeEffectMode == 8) {
                 isWhammyActive = isSwellMode;
-                swellGain = 0.0f; // FIX: Reset gain on transition
             } else {
                 isWhammyActive = true; 
                 isVolumeMode = false; 
@@ -1415,7 +1433,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             isSwellMode = (cm.data2 >= 64); 
             if (activeEffectMode == 8) {
                 isWhammyActive = isSwellMode; 
-                swellGain = 0.0f; // FIX: Reset gain on transition
             }
             forceUIUpdate = true; 
         }
@@ -1581,10 +1598,16 @@ void setup() {
     c.auto_clear = true; 
     i2s_new_channel(&c, &tx_chan, &rx_chan);
     
-    i2s_std_config_t s = { 
+        i2s_std_config_t s = { 
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLING_FREQUENCY), 
         .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
-        .gpio_cfg = { .bclk = GPIO_NUM_10, .ws = GPIO_NUM_11, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } 
+        .gpio_cfg = { 
+            .mclk = GPIO_NUM_3,
+            .bclk = GPIO_NUM_10, 
+            .ws = GPIO_NUM_11, 
+            .dout = GPIO_NUM_16, 
+            .din = GPIO_NUM_17 
+        } 
     };
     
     s.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH; 

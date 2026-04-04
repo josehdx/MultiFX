@@ -623,7 +623,7 @@ void DisplayTask(void * pvParameters) {
             forceUIUpdate = false; 
         }
         
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(16));
     }
 }
 
@@ -1035,8 +1035,7 @@ void MidiTask(void * pvParameters) {
     static DebouncedButton btnFb(FEEDBACK_BUTTON_PIN);
     static DebouncedButton btnInterval(INTERVAL_BUTTON_PIN);
 
-    // FIX 1: Variable for Interval Edge Detection
-    static bool lastIntervalReading = HIGH;
+
 
     btnCar.state = digitalRead(CAROUSEL_BUTTON_PIN); 
     btnCar.lastReading = btnCar.state;
@@ -1147,36 +1146,36 @@ void MidiTask(void * pvParameters) {
             } 
         }
         
-        // FIX 1: Interval Edge Detection to prevent rapid-fire cycling
-        bool currentIntervalReading = digitalRead(INTERVAL_BUTTON_PIN);
-        if (currentIntervalReading == LOW && lastIntervalReading == HIGH) {
-            if (activeEffectMode == 2) {
-                feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
-            } else {
-                currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
-                
-                int slot = activeEffectMode;
-                if (slot == 5) slot = 6;
-                else if (slot == 6) slot = 7;
-                else if (slot == 7) slot = 8;
-                
-                if (slot == 4) {
-                    float currentCents = effectMemory[4] - (int)effectMemory[4];
-                    effectMemory[4] = intervalList[currentIntervalIdx] + currentCents;
-                } 
-                else if (activeEffectMode == 8) {
-                    // Do nothing
-                } 
-                else {
-                    effectMemory[slot] = intervalList[currentIntervalIdx]; 
+        // New logic using the DebouncedButton class:
+        if (btnInterval.update(100)) {
+            if (btnInterval.state == LOW) {
+                if (activeEffectMode == 2) {
+                    feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
+                } else {
+                    currentIntervalIdx = (currentIntervalIdx + 1) % 9; 
+                    
+                    int slot = activeEffectMode;
+                    if (slot == 5) slot = 6;
+                    else if (slot == 6) slot = 7;
+                    else if (slot == 7) slot = 8;
+                    
+                    if (slot == 4) {
+                        float currentCents = effectMemory[4] - (int)effectMemory[4];
+                        effectMemory[4] = intervalList[currentIntervalIdx] + currentCents;
+                    } 
+                    else if (activeEffectMode == 8) {
+                        // Do nothing
+                    } 
+                    else {
+                        effectMemory[slot] = intervalList[currentIntervalIdx]; 
+                    }
                 }
+                
+                updateLUT(); 
+                forceUIUpdate = true;
+                lastActivityTime = millis();
             }
-            
-            updateLUT(); 
-            forceUIUpdate = true;
-            lastActivityTime = millis();
         }
-        lastIntervalReading = currentIntervalReading;
 
         filterPB.update(); 
         filterPB2.update(); 
@@ -1598,10 +1597,16 @@ void setup() {
     c.auto_clear = true; 
     i2s_new_channel(&c, &tx_chan, &rx_chan);
     
-    i2s_std_config_t s = { 
+        i2s_std_config_t s = { 
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLING_FREQUENCY), 
         .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
-        .gpio_cfg = { .bclk = GPIO_NUM_10, .ws = GPIO_NUM_11, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } 
+        .gpio_cfg = { 
+            .mclk = GPIO_NUM_3,
+            .bclk = GPIO_NUM_10, 
+            .ws = GPIO_NUM_11, 
+            .dout = GPIO_NUM_16, 
+            .din = GPIO_NUM_17 
+        } 
     };
     
     s.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH; 

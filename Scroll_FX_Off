@@ -440,18 +440,27 @@ void updateDisplay() {
     spr.drawRect(outX, barY, barWidth, barHeight, TFT_DARKGREY);
     spr.drawString("OUT", outX + (barWidth / 2), barY + barHeight + 10);
 
-    // PERFECT SYNC LED LOGIC
-    bool isCurrentEffectActive = false; 
-    if (activeEffectMode == 0) isCurrentEffectActive = isWhammyActive;
-    else if (activeEffectMode == 1) isCurrentEffectActive = (isWhammyActive || isFrozen);
-    else if (activeEffectMode == 2) isCurrentEffectActive = (isWhammyActive || isFeedbackActive);
-    else if (activeEffectMode == 3) isCurrentEffectActive = (isWhammyActive || isHarmonizerMode);
-    else if (activeEffectMode == 4) isCurrentEffectActive = (isWhammyActive || isCapoMode);
-    else if (activeEffectMode == 5) isCurrentEffectActive = (isWhammyActive || isSynthMode);
-    else if (activeEffectMode == 6) isCurrentEffectActive = (isWhammyActive || isPadMode);
-    else if (activeEffectMode == 7) isCurrentEffectActive = (isWhammyActive || isChorusMode);
-    else if (activeEffectMode == 8) isCurrentEffectActive = (isWhammyActive || isSwellMode); 
-    else if (activeEffectMode == 9) isCurrentEffectActive = (isWhammyActive || isVibratoMode);
+    bool isCurrentEffectActive = isWhammyActive; 
+    
+    if (activeEffectMode == 1) {
+        isCurrentEffectActive = isFrozen;
+    } else if (activeEffectMode == 2) {
+        isCurrentEffectActive = isFeedbackActive;
+    } else if (activeEffectMode == 3) {
+        isCurrentEffectActive = isHarmonizerMode;
+    } else if (activeEffectMode == 4) {
+        isCurrentEffectActive = isCapoMode;
+    } else if (activeEffectMode == 5) {
+        isCurrentEffectActive = isSynthMode;
+    } else if (activeEffectMode == 6) {
+        isCurrentEffectActive = isPadMode;
+    } else if (activeEffectMode == 7) {
+        isCurrentEffectActive = isChorusMode;
+    } else if (activeEffectMode == 8) {
+        isCurrentEffectActive = isSwellMode; 
+    } else if (activeEffectMode == 9) {
+        isCurrentEffectActive = isVibratoMode;
+    }
 
     uint32_t ledColor = TFT_RED;
     if (isCurrentEffectActive) {
@@ -959,7 +968,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float bloom = fmaxf(0.0f, fminf((feedbackRamp - 0.1f) * 2.0f, 1.0f));
                     float bloomed;
                     
-                    // If Freeze is running, feed the pure unbent drone directly into the Scream matrix
+                    // FIX: If Freeze is running, feed the pure unbent drone directly into the Scream matrix
                     if (freezeActive && freezeRamp > 0.0f) {
                         bloomed = freezeOut; 
                     } else {
@@ -1005,7 +1014,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 if (!isAnyEffectActive) {
                     shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f); 
                 } else if (feedback) {
-                    // If Freeze and Feedback are on simultaneously, blend Input, Drone, and Feedback scream together
+                    // FIX: If Freeze and Feedback are on simultaneously, blend Input, Drone, and Feedback scream together
                     if (freezeActive) {
                         shiftedOutput = (input * 0.5f) + (freezeOut * 0.4f) + (feedbackOut * 0.6f);
                     } else {
@@ -1191,8 +1200,14 @@ void MidiTask(void * pvParameters) {
                     vibratoLfoPhase = 0.0f;
                     swellGain = 0.0f;
                     
-                    // Auto-Engage newly selected effect
-                    isWhammyActive = true; 
+                    if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+                    else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive;
+                    else if (activeEffectMode == 3) isWhammyActive = isHarmonizerMode;
+                    else if (activeEffectMode == 4) isWhammyActive = isCapoMode;
+                    else if (activeEffectMode == 5) isWhammyActive = isSynthMode;
+                    else if (activeEffectMode == 6) isWhammyActive = isPadMode;
+                    else if (activeEffectMode == 7) isWhammyActive = isChorusMode;
+                    else isWhammyActive = true; 
                     
                     updateLUT(); 
                 }
@@ -1203,6 +1218,7 @@ void MidiTask(void * pvParameters) {
         if (btnFreeze.update(100)) { 
             if (btnFreeze.state == LOW) { 
                 isFrozen = !isFrozen; 
+                // Removed the Feedback Kill Switch so both can run together
                 if (activeEffectMode == 1) {
                     isWhammyActive = isFrozen; 
                 }
@@ -1344,8 +1360,14 @@ bool channelMessageCallback(ChannelMessage cm) {
             vibratoLfoPhase = 0.0f;
             swellGain = 0.0f;
             
-            // Auto-Engage newly selected effect
-            isWhammyActive = true; 
+            if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+            else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive; 
+            else if (activeEffectMode == 3) isWhammyActive = isHarmonizerMode;
+            else if (activeEffectMode == 4) isWhammyActive = isCapoMode;
+            else if (activeEffectMode == 5) isWhammyActive = isSynthMode;
+            else if (activeEffectMode == 6) isWhammyActive = isPadMode;
+            else if (activeEffectMode == 7) isWhammyActive = isChorusMode;
+            else isWhammyActive = true; 
             
             updateLUT(); 
             forceUIUpdate = true;
@@ -1360,8 +1382,14 @@ bool channelMessageCallback(ChannelMessage cm) {
             vibratoLfoPhase = 0.0f;
             swellGain = 0.0f;
             
-            // Auto-Engage newly selected effect
-            isWhammyActive = true; 
+            if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+            else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive; 
+            else if (activeEffectMode == 3) isWhammyActive = isHarmonizerMode;
+            else if (activeEffectMode == 4) isWhammyActive = isCapoMode;
+            else if (activeEffectMode == 5) isWhammyActive = isSynthMode;
+            else if (activeEffectMode == 6) isWhammyActive = isPadMode;
+            else if (activeEffectMode == 7) isWhammyActive = isChorusMode;
+            else isWhammyActive = true; 
             
             updateLUT(); 
             forceUIUpdate = true;
@@ -1370,7 +1398,7 @@ bool channelMessageCallback(ChannelMessage cm) {
             latencyMode = (latencyMode + 1) % 4; 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 7) {
+else if (cm.data1 == 7) {
             if (cm.data2 >= 64) {
                 isWhammyActive = false;
                 isFrozen = false;
@@ -1383,7 +1411,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isSwellMode = false;
                 isVibratoMode = false;
                 
-                // Release Volume Mode and return PB to pitch control
+                // FIX: Release Volume Mode and return PB to pitch control
                 isVolumeMode = false; 
                 volumePedalGain = 1.0f; 
             } else {
@@ -1399,7 +1427,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isSwellMode = false;
                 isVibratoMode = false;
                 
-                // Release Volume Mode and return PB to pitch control
+                // FIX: Release Volume Mode and return PB to pitch control
                 isVolumeMode = false; 
                 volumePedalGain = 1.0f; 
             }
@@ -1408,6 +1436,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         }
         else if (cm.data1 == 8) { 
             isFrozen = (cm.data2 >= 64); 
+            // Removed the Feedback Kill Switch so both can run together
             if (activeEffectMode == 1) isWhammyActive = isFrozen; 
             forceUIUpdate = true; 
         }

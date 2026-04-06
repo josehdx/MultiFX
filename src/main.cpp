@@ -467,12 +467,11 @@ void updateDisplay() {
     spr.setTextSize(3);
     
     switch(activeEffectMode) {
-     case 0: 
+        case 0: 
             spr.setTextColor(TFT_ORANGE, TFT_BLACK); 
             spr.drawString("WHAMMY", spr.width() / 2 + 30, 40); 
             
-            // FIX: Only Feedback completely mutes the primary Whammy (w1) signal.
-            // Harmony and Chorus still use w1 in their audio mix, so they shouldn't cross it out.
+            // If Whammy is the primary mode but Feedback is active, it completely overrides Whammy.
             if (isFeedbackActive) {
                 int textW = spr.textWidth("WHAMMY");
                 int startX = (spr.width() / 2 + 30) - (textW / 2);
@@ -633,16 +632,19 @@ void updateDisplay() {
     
     // Determine which higher-priority DSP blocks are currently monopolizing the engine
     bool dspSynthActive = isSynthMode || (activeEffectMode == 5 && isWhammyActive);
+    bool dspFeedbackActive = isFeedbackActive || (activeEffectMode == 2 && isWhammyActive);
     bool dspHarmActive = isHarmonizerMode || (activeEffectMode == 3 && isWhammyActive);
-    bool dspChorusActive = isChorusMode || (activeEffectMode == 7 && isWhammyActive);
 
     if (isFrozen && activeEffectMode != 1) drawBanner("FROZEN", TFT_CYAN);
-    if (isFeedbackActive && activeEffectMode != 2) drawBanner("SCREAM", TFT_RED, (dspHarmActive || dspChorusActive));
-    if (isHarmonizerMode && activeEffectMode != 3) drawBanner("HARM", TFT_MAGENTA);
+    // Feedback is the absolute priority now, never cross-lined
+    if (isFeedbackActive && activeEffectMode != 2) drawBanner("SCREAM", TFT_RED);
+    // Harm is cross-lined if Feedback takes over
+    if (isHarmonizerMode && activeEffectMode != 3) drawBanner("HARM", TFT_MAGENTA, dspFeedbackActive);
     if (isCapoMode && activeEffectMode != 4) drawBanner("CAPO", TFT_GREEN);
     if (isSynthMode && activeEffectMode != 5) drawBanner("SYNTH", TFT_YELLOW);
     if (isPadMode && activeEffectMode != 6) drawBanner("PAD", TFT_PINK, dspSynthActive);
-    if (isChorusMode && activeEffectMode != 7) drawBanner("CHORUS", TFT_SKYBLUE, dspHarmActive);
+    // Chorus is cross-lined if Feedback or Harm take over
+    if (isChorusMode && activeEffectMode != 7) drawBanner("CHORUS", TFT_SKYBLUE, (dspFeedbackActive || dspHarmActive));
     if (isSwellMode && activeEffectMode != 8) drawBanner("SWELL", TFT_WHITE); 
     if (isVibratoMode && activeEffectMode != 9) drawBanner("VIB", TFT_PURPLE); 
     
@@ -876,7 +878,18 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float f1 = pitchShiftFactor;
                 float f2 = pitchShiftFactor;
                 
-                if (harm) {
+                // Feedback is the highest priority for the secondary f2 block
+                if (feedback) { 
+                    feedbackLfoPhase += feedbackPhaseInc;
+                    if (feedbackLfoPhase >= LFO_LUT_SIZE) {
+                        feedbackLfoPhase -= LFO_LUT_SIZE;
+                    }
+                    
+                    float drift = lfoLUT[(int)feedbackLfoPhase];
+                    f1 = 1.0f * drift; 
+                    f2 = pitchShiftFactor * drift; 
+                }
+                else if (harm) {
                     f2 = pitchShiftFactor * powf(2.0f, effectMemory[3] / 12.0f);
                 }
                 else if (chorus) { 
@@ -890,16 +903,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float chorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
                     f2 = pitchShiftFactor * chorusRatio * lfoLUT[p1]; 
                 } 
-                else if (feedback) { 
-                    feedbackLfoPhase += feedbackPhaseInc;
-                    if (feedbackLfoPhase >= LFO_LUT_SIZE) {
-                        feedbackLfoPhase -= LFO_LUT_SIZE;
-                    }
-                    
-                    float drift = lfoLUT[(int)feedbackLfoPhase];
-                    f1 = 1.0f * drift; 
-                    f2 = pitchShiftFactor * drift; 
-                }
                 else if (vibrato) {
                     vibratoLfoPhase += vibratoPhaseInc;
                     if (vibratoLfoPhase >= LFO_LUT_SIZE) {
@@ -957,7 +960,15 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     }
                     
                     float bloom = fmaxf(0.0f, fminf((feedbackRamp - 0.1f) * 2.0f, 1.0f));
-                    float bloomed = (w1 * (1.0f - bloom)) + (w2 * bloom);
+                    float bloomed;
+                    
+                    // FIX: If Freeze is running, feed the pure unbent drone directly into the Scream matrix
+                    if (freezeActive && freezeRamp > 0.0f) {
+                        bloomed = freezeOut; 
+                    } else {
+                        bloomed = (w1 * (1.0f - bloom)) + (w2 * bloom);
+                    }
+                    
                     fbHpfState += 0.05f * (bloomed - fbHpfState);
                     
                     float driven = (bloomed - fbHpfState) * 30.0f;
@@ -993,14 +1004,20 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 bool isAnyEffectActive = isWhammyActive || harm || chorus || feedback || synth || pad || freezeActive || vibrato || capo;
 
+                // Output mixer updated so Feedback is the absolute highest priority
                 if (!isAnyEffectActive) {
                     shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f); 
+                } else if (feedback) {
+                    // FIX: If Freeze and Feedback are on simultaneously, blend Input, Drone, and Feedback scream together
+                    if (freezeActive) {
+                        shiftedOutput = (input * 0.5f) + (freezeOut * 0.4f) + (feedbackOut * 0.6f);
+                    } else {
+                        shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f);
+                    }
                 } else if (harm) {
                     shiftedOutput = (w1 * 0.6f) + (w2 * 0.5f); 
                 } else if (chorus) {
                     shiftedOutput = (w1 * 0.6f) + (w2 * 0.5f); 
-                } else if (feedback) {
-                    shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f);
                 } else if (freezeActive) {
                     shiftedOutput = (input * 0.5f) + (w1 * currentWetBlend * 0.5f); 
                 } else if (pad) {
@@ -1011,7 +1028,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     shiftedOutput = (input * (1.0f - currentWetBlend)) + (w1 * currentWetBlend);
                 }
 
-                if (freezeRamp > 0.0f && !freezeActive) {
+                if (freezeRamp > 0.0f && !freezeActive && !feedback) {
                     shiftedOutput = (shiftedOutput * 0.6f) + (freezeOut * 0.7f);
                 }
 
@@ -1050,14 +1067,14 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 ui_audio_level = pIn; 
             } else {
                 ui_audio_level = ui_audio_level * 0.998f; 
-                if (ui_audio_level < 0.025f) ui_audio_level = 0.0f; // FIX: Force UI clear
+                if (ui_audio_level < 0.025f) ui_audio_level = 0.0f; 
             }
             
             if (pOut > ui_output_level) {
                 ui_output_level = pOut; 
             } else {
                 ui_output_level = ui_output_level * 0.998f; 
-                if (ui_output_level < 0.025f) ui_output_level = 0.0f; // FIX: Force UI clear
+                if (ui_output_level < 0.025f) ui_output_level = 0.0f; 
             }
             
             size_t bw; 
@@ -1168,6 +1185,8 @@ void MidiTask(void * pvParameters) {
                 unsigned long dur = millis() - btnCar.pressedTime;
                 
                 if (dur < 400) { 
+                    isFeedbackActive = false; 
+                    
                     activeEffectMode = (activeEffectMode + 1) % 10; 
                     
                     chorusLfoPhase = 0.0f;
@@ -1175,20 +1194,14 @@ void MidiTask(void * pvParameters) {
                     vibratoLfoPhase = 0.0f;
                     swellGain = 0.0f;
                     
-                    // FIX: Ensure UI choice overrides all background MIDI toggles
-                    isFrozen = false;
-                    isFeedbackActive = false;
-                    isHarmonizerMode = false;
-                    isCapoMode = false;
-                    isSynthMode = false;
-                    isPadMode = false;
-                    isChorusMode = false;
-                    isSwellMode = false;
-                    isVibratoMode = false;
-                    isVolumeMode = false;
-                    volumePedalGain = 1.0f; 
-                    
-                    isWhammyActive = true; 
+                    if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+                    else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive;
+                    else if (activeEffectMode == 3) isWhammyActive = isHarmonizerMode;
+                    else if (activeEffectMode == 4) isWhammyActive = isCapoMode;
+                    else if (activeEffectMode == 5) isWhammyActive = isSynthMode;
+                    else if (activeEffectMode == 6) isWhammyActive = isPadMode;
+                    else if (activeEffectMode == 7) isWhammyActive = isChorusMode;
+                    else isWhammyActive = true; 
                     
                     updateLUT(); 
                 }
@@ -1199,6 +1212,7 @@ void MidiTask(void * pvParameters) {
         if (btnFreeze.update(100)) { 
             if (btnFreeze.state == LOW) { 
                 isFrozen = !isFrozen; 
+                // Removed the Feedback Kill Switch so both can run together
                 if (activeEffectMode == 1) {
                     isWhammyActive = isFrozen; 
                 }
@@ -1230,7 +1244,7 @@ void MidiTask(void * pvParameters) {
                     if (slot == 5) slot = 6;
                     else if (slot == 6) slot = 7;
                     else if (slot == 7) slot = 8;
-                    else if (slot == 9) slot = 9; // Support physical button for vibrato speeds
+                    else if (slot == 9) slot = 9; 
                     
                     if (slot == 4) {
                         float currentCents = effectMemory[4] - (int)effectMemory[4];
@@ -1317,35 +1331,18 @@ bool channelMessageCallback(ChannelMessage cm) {
             isVolumeMode = (cm.data2 >= 64);
             
             if (isVolumeMode) {
-                isWhammyActive = false; 
+                isFeedbackActive = false; // Mute scream immediately if volume takes over
+                if (activeEffectMode == 2) {
+                    isWhammyActive = false; // Mute UI scream
+                }
             } else {
                 volumePedalGain = 1.0f; 
-                
-                if (activeEffectMode == 0) {
-                    isWhammyActive = true;
-                } else if (activeEffectMode == 1) {
-                    isWhammyActive = isFrozen;
-                } else if (activeEffectMode == 2) {
-                    isWhammyActive = isFeedbackActive;
-                } else if (activeEffectMode == 3) {
-                    isWhammyActive = isHarmonizerMode;
-                } else if (activeEffectMode == 4) {
-                    isWhammyActive = isCapoMode;
-                } else if (activeEffectMode == 5) {
-                    isWhammyActive = isSynthMode;
-                } else if (activeEffectMode == 6) {
-                    isWhammyActive = isPadMode;
-                } else if (activeEffectMode == 7) {
-                    isWhammyActive = isChorusMode;
-                } else if (activeEffectMode == 8) {
-                    isWhammyActive = isSwellMode;
-                } else if (activeEffectMode == 9) {
-                    isWhammyActive = isVibratoMode;
-                }
             }
             forceUIUpdate = true;
         }
         else if (cm.data1 == 4 && cm.data2 >= 64) { 
+            isFeedbackActive = false; 
+            
             if (activeEffectMode == 0) {
                 activeEffectMode = 9;
             } else {
@@ -1357,25 +1354,21 @@ bool channelMessageCallback(ChannelMessage cm) {
             vibratoLfoPhase = 0.0f;
             swellGain = 0.0f;
             
-            // FIX: Ensure MIDI Carousel overriding wipes background toggles
-            isFrozen = false;
-            isFeedbackActive = false;
-            isHarmonizerMode = false;
-            isCapoMode = false;
-            isSynthMode = false;
-            isPadMode = false;
-            isChorusMode = false;
-            isSwellMode = false;
-            isVibratoMode = false;
-            isVolumeMode = false;
-            volumePedalGain = 1.0f; 
-            
-            isWhammyActive = true;
+            if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+            else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive; 
+            else if (activeEffectMode == 3) isWhammyActive = isHarmonizerMode;
+            else if (activeEffectMode == 4) isWhammyActive = isCapoMode;
+            else if (activeEffectMode == 5) isWhammyActive = isSynthMode;
+            else if (activeEffectMode == 6) isWhammyActive = isPadMode;
+            else if (activeEffectMode == 7) isWhammyActive = isChorusMode;
+            else isWhammyActive = true; 
             
             updateLUT(); 
             forceUIUpdate = true;
         }
         else if (cm.data1 == 5 && cm.data2 >= 64) { 
+            isFeedbackActive = false; 
+            
             activeEffectMode = (activeEffectMode + 1) % 10; 
             
             chorusLfoPhase = 0.0f;
@@ -1383,20 +1376,14 @@ bool channelMessageCallback(ChannelMessage cm) {
             vibratoLfoPhase = 0.0f;
             swellGain = 0.0f;
             
-            // FIX: Ensure MIDI Carousel overriding wipes background toggles
-            isFrozen = false;
-            isFeedbackActive = false;
-            isHarmonizerMode = false;
-            isCapoMode = false;
-            isSynthMode = false;
-            isPadMode = false;
-            isChorusMode = false;
-            isSwellMode = false;
-            isVibratoMode = false;
-            isVolumeMode = false;
-            volumePedalGain = 1.0f; 
-            
-            isWhammyActive = true; 
+            if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+            else if (activeEffectMode == 2) isWhammyActive = isFeedbackActive; 
+            else if (activeEffectMode == 3) isWhammyActive = isHarmonizerMode;
+            else if (activeEffectMode == 4) isWhammyActive = isCapoMode;
+            else if (activeEffectMode == 5) isWhammyActive = isSynthMode;
+            else if (activeEffectMode == 6) isWhammyActive = isPadMode;
+            else if (activeEffectMode == 7) isWhammyActive = isChorusMode;
+            else isWhammyActive = true; 
             
             updateLUT(); 
             forceUIUpdate = true;
@@ -1405,11 +1392,11 @@ bool channelMessageCallback(ChannelMessage cm) {
             latencyMode = (latencyMode + 1) % 4; 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 7) {
+else if (cm.data1 == 7) {
             if (cm.data2 >= 64) {
                 isWhammyActive = false;
                 isFrozen = false;
-                isFeedbackActive = false;
+                isFeedbackActive = false; 
                 isHarmonizerMode = false;
                 isCapoMode = false;
                 isSynthMode = false;
@@ -1417,13 +1404,15 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isChorusMode = false;
                 isSwellMode = false;
                 isVibratoMode = false;
-                isVolumeMode = false;
+                
+                // FIX: Release Volume Mode and return PB to pitch control
+                isVolumeMode = false; 
                 volumePedalGain = 1.0f; 
             } else {
                 activeEffectMode = 0;
                 isWhammyActive = true;
                 isFrozen = false;
-                isFeedbackActive = false;
+                isFeedbackActive = false; 
                 isHarmonizerMode = false;
                 isCapoMode = false;
                 isSynthMode = false;
@@ -1431,7 +1420,9 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isChorusMode = false;
                 isSwellMode = false;
                 isVibratoMode = false;
-                isVolumeMode = false;
+                
+                // FIX: Release Volume Mode and return PB to pitch control
+                isVolumeMode = false; 
                 volumePedalGain = 1.0f; 
             }
             updateLUT();
@@ -1439,9 +1430,8 @@ bool channelMessageCallback(ChannelMessage cm) {
         }
         else if (cm.data1 == 8) { 
             isFrozen = (cm.data2 >= 64); 
-            if (activeEffectMode == 1) {
-                isWhammyActive = isFrozen; 
-            }
+            // Removed the Feedback Kill Switch so both can run together
+            if (activeEffectMode == 1) isWhammyActive = isFrozen; 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 9) { 
@@ -1453,52 +1443,66 @@ bool channelMessageCallback(ChannelMessage cm) {
         }
         else if (cm.data1 == 10) { 
             isHarmonizerMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 3) {
-                isWhammyActive = isHarmonizerMode; 
+            if (isHarmonizerMode) { 
+                isFeedbackActive = false; 
+                if (activeEffectMode == 2) isWhammyActive = false; 
             }
+            if (activeEffectMode == 3) isWhammyActive = isHarmonizerMode; 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 12) { 
             isCapoMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 4) {
-                isWhammyActive = isCapoMode; 
+            if (isCapoMode) { 
+                isFeedbackActive = false; 
+                if (activeEffectMode == 2) isWhammyActive = false; 
             }
+            if (activeEffectMode == 4) isWhammyActive = isCapoMode; 
             updateLUT(); 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 13) { 
             isSynthMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 5) {
-                isWhammyActive = isSynthMode; 
+            if (isSynthMode) { 
+                isFeedbackActive = false; 
+                if (activeEffectMode == 2) isWhammyActive = false; 
             }
+            if (activeEffectMode == 5) isWhammyActive = isSynthMode; 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 14) { 
             isPadMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 6) {
-                isWhammyActive = isPadMode; 
+            if (isPadMode) { 
+                isFeedbackActive = false; 
+                if (activeEffectMode == 2) isWhammyActive = false; 
             }
+            if (activeEffectMode == 6) isWhammyActive = isPadMode; 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 15) { 
             isChorusMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 7) {
-                isWhammyActive = isChorusMode; 
+            if (isChorusMode) { 
+                isFeedbackActive = false; 
+                if (activeEffectMode == 2) isWhammyActive = false; 
             }
+            if (activeEffectMode == 7) isWhammyActive = isChorusMode; 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 16) { 
             isSwellMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 8) {
-                isWhammyActive = isSwellMode; 
+            if (isSwellMode) { 
+                isFeedbackActive = false; 
+                if (activeEffectMode == 2) isWhammyActive = false; 
             }
+            if (activeEffectMode == 8) isWhammyActive = isSwellMode; 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 21) { 
             isVibratoMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 9) {
-                isWhammyActive = isVibratoMode; 
+            if (isVibratoMode) { 
+                isFeedbackActive = false; 
+                if (activeEffectMode == 2) isWhammyActive = false; 
             }
+            if (activeEffectMode == 9) isWhammyActive = isVibratoMode; 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 18) {

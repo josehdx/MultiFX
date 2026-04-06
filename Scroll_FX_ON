@@ -467,14 +467,6 @@ void updateDisplay() {
         case 0: 
             spr.setTextColor(TFT_ORANGE, TFT_BLACK); 
             spr.drawString("WHAMMY", spr.width() / 2 + 30, 40); 
-            
-            // If Whammy is the primary mode but Feedback is active, it completely overrides Whammy.
-            if (isFeedbackActive) {
-                int textW = spr.textWidth("WHAMMY");
-                int startX = (spr.width() / 2 + 30) - (textW / 2);
-                spr.drawFastHLine(startX, 40, textW, TFT_ORANGE);
-                spr.drawFastHLine(startX, 41, textW, TFT_ORANGE);
-            }
             break;
         case 1: 
             spr.setTextColor(TFT_CYAN, TFT_BLACK); 
@@ -627,24 +619,15 @@ void updateDisplay() {
         bannerCount++;
     };
     
-    // Determine which higher-priority DSP blocks are currently monopolizing the engine
-    bool dspSynthActive = isSynthMode || (activeEffectMode == 5 && isWhammyActive);
-    bool dspFeedbackActive = isFeedbackActive || (activeEffectMode == 2 && isWhammyActive);
-    bool dspHarmActive = isHarmonizerMode || (activeEffectMode == 3 && isWhammyActive);
-
     if (isFrozen && activeEffectMode != 1) drawBanner("FROZEN", TFT_CYAN);
-    // Feedback is the absolute priority now, never cross-lined
     if (isFeedbackActive && activeEffectMode != 2) drawBanner("SCREAM", TFT_RED);
-    // Harm is cross-lined if Feedback takes over
-    if (isHarmonizerMode && activeEffectMode != 3) drawBanner("HARM", TFT_MAGENTA, dspFeedbackActive);
+    if (isHarmonizerMode && activeEffectMode != 3) drawBanner("HARM", TFT_MAGENTA);
     if (isCapoMode && activeEffectMode != 4) drawBanner("CAPO", TFT_GREEN);
     if (isSynthMode && activeEffectMode != 5) drawBanner("SYNTH", TFT_YELLOW);
-    if (isPadMode && activeEffectMode != 6) drawBanner("PAD", TFT_PINK, dspSynthActive);
-    // Chorus is cross-lined if Feedback or Harm take over
-    if (isChorusMode && activeEffectMode != 7) drawBanner("CHORUS", TFT_SKYBLUE, (dspFeedbackActive || dspHarmActive));
+    if (isPadMode && activeEffectMode != 6) drawBanner("PAD", TFT_PINK);
+    if (isChorusMode && activeEffectMode != 7) drawBanner("CHORUS", TFT_SKYBLUE);
     if (isSwellMode && activeEffectMode != 8) drawBanner("SWELL", TFT_WHITE); 
     if (isVibratoMode && activeEffectMode != 9) drawBanner("VIB", TFT_PURPLE); 
-    
     if (isVolumeMode) drawBanner("VOLUME", TFT_DARKGREY);
 
     spr.setTextSize(1); 
@@ -875,7 +858,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float f1 = pitchShiftFactor;
                 float f2 = pitchShiftFactor;
                 
-                // Feedback is the highest priority for the secondary f2 block
                 if (feedback) { 
                     feedbackLfoPhase += feedbackPhaseInc;
                     if (feedbackLfoPhase >= LFO_LUT_SIZE) {
@@ -990,43 +972,58 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     feedbackOut = fbDelayBuffer[rIdx];
                 }
 
-                float shiftedOutput = w1;
-                float currentWetBlend = 1.0f;
-                
-                if (freezeActive) {
-                    currentWetBlend = 0.9f; 
-                } else if (pad) {
-                    currentWetBlend = 0.6f;
-                }
-                
-                bool isAnyEffectActive = isWhammyActive || harm || chorus || feedback || synth || pad || freezeActive || vibrato || capo;
-
-                // Output mixer updated so Feedback is the absolute highest priority
-                if (!isAnyEffectActive) {
-                    shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f); 
-                } else if (feedback) {
-                    // If Freeze and Feedback are on simultaneously, blend Input, Drone, and Feedback scream together
-                    if (freezeActive) {
-                        shiftedOutput = (input * 0.5f) + (freezeOut * 0.4f) + (feedbackOut * 0.6f);
-                    } else {
-                        shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f);
-                    }
-                } else if (harm) {
-                    shiftedOutput = (w1 * 0.6f) + (w2 * 0.5f); 
-                } else if (chorus) {
-                    shiftedOutput = (w1 * 0.6f) + (w2 * 0.5f); 
-                } else if (freezeActive) {
-                    shiftedOutput = (input * 0.5f) + (w1 * currentWetBlend * 0.5f); 
-                } else if (pad) {
+                // --- PARALLEL SUMMING MIXER ---
+                if (pad) {
                     padFilter = padFilter * 0.95f + w1 * 0.05f;
-                    float wetPad = padFilter * 3.0f * currentWetBlend; 
-                    shiftedOutput = (input * 0.5f) + (wetPad * 0.5f); 
                 } else {
-                    shiftedOutput = (input * (1.0f - currentWetBlend)) + (w1 * currentWetBlend);
+                    padFilter = padFilter * 0.95f; 
                 }
 
-                if (freezeRamp > 0.0f && !freezeActive && !feedback) {
-                    shiftedOutput = (shiftedOutput * 0.6f) + (freezeOut * 0.7f);
+                bool isAnyEffectActive = isWhammyActive || harm || chorus || feedback || synth || pad || freezeActive || vibrato || capo;
+                bool isBlendedEffect = harm || chorus || pad || freezeActive || feedback || (freezeRamp > 0.0f) || (feedbackRamp > 0.0f);
+
+                float shiftedOutput = 0.0f;
+
+                if (!isAnyEffectActive && freezeRamp <= 0.0f && feedbackRamp <= 0.0f && padFilter < 0.001f) {
+                    // True Bypass (Nothing running)
+                    shiftedOutput = input; 
+                } else {
+                    float mixedSignal = 0.0f;
+
+                    // 1. Base Core (Dry + w1)
+                    if (isBlendedEffect) {
+                        mixedSignal += (input * 0.4f);
+                        mixedSignal += (w1 * 0.4f);
+                    } else {
+                        // 100% Wet for pure pitch replacement (Whammy, Capo, Synth, Vibrato)
+                        mixedSignal += w1; 
+                    }
+
+                    // 2. Harmony / Chorus (w2)
+                    if (harm || chorus) {
+                        mixedSignal += (w2 * 0.4f);
+                    }
+
+                    // 3. Pad
+                    if (pad || padFilter > 0.001f) {
+                        mixedSignal += (padFilter * 1.5f);
+                    }
+
+                    // 4. Freeze Drone
+                    if (freezeActive || freezeRamp > 0.0f) {
+                        mixedSignal += (freezeOut * 0.5f);
+                    }
+
+                    // 5. Feedback Scream
+                    if (feedback || feedbackRamp > 0.0f) {
+                        mixedSignal += (feedbackOut * 0.6f);
+                    }
+
+                    // 6. Soft Clipping / Saturation (Prevents harsh digital clipping when all effects stack)
+                    if (mixedSignal > 1.25f) mixedSignal = 1.25f;
+                    else if (mixedSignal < -1.25f) mixedSignal = -1.25f;
+                    
+                    shiftedOutput = mixedSignal * (1.0f - (0.1f * mixedSignal * mixedSignal));
                 }
 
                 float finalOutput = shiftedOutput * swellGain * volumePedalGain; 
@@ -1182,8 +1179,6 @@ void MidiTask(void * pvParameters) {
                 unsigned long dur = millis() - btnCar.pressedTime;
                 
                 if (dur < 400) { 
-                    isFeedbackActive = false; 
-                    
                     activeEffectMode = (activeEffectMode + 1) % 10; 
                     
                     chorusLfoPhase = 0.0f;
@@ -1244,6 +1239,7 @@ void MidiTask(void * pvParameters) {
                         // Do nothing
                     } 
                     else {
+ 
                         effectMemory[slot] = intervalList[currentIntervalIdx]; 
                     }
                 }
@@ -1320,19 +1316,12 @@ bool channelMessageCallback(ChannelMessage cm) {
         if (cm.data1 == 20) {
             isVolumeMode = (cm.data2 >= 64);
             
-            if (isVolumeMode) {
-                isFeedbackActive = false; // Mute scream immediately if volume takes over
-                if (activeEffectMode == 2) {
-                    isWhammyActive = false; // Mute UI scream
-                }
-            } else {
+            if (!isVolumeMode) {
                 volumePedalGain = 1.0f; 
             }
             forceUIUpdate = true;
         }
         else if (cm.data1 == 4 && cm.data2 >= 64) { 
-            isFeedbackActive = false; 
-            
             if (activeEffectMode == 0) {
                 activeEffectMode = 9;
             } else {
@@ -1351,8 +1340,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             forceUIUpdate = true;
         }
         else if (cm.data1 == 5 && cm.data2 >= 64) { 
-            isFeedbackActive = false; 
-            
             activeEffectMode = (activeEffectMode + 1) % 10; 
             
             chorusLfoPhase = 0.0f;
@@ -1420,65 +1407,37 @@ bool channelMessageCallback(ChannelMessage cm) {
         }
         else if (cm.data1 == 10) { 
             isHarmonizerMode = (cm.data2 >= 64); 
-            if (isHarmonizerMode) { 
-                isFeedbackActive = false; 
-                if (activeEffectMode == 2) isWhammyActive = false; 
-            }
             if (activeEffectMode == 3) isWhammyActive = isHarmonizerMode; 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 12) { 
             isCapoMode = (cm.data2 >= 64); 
-            if (isCapoMode) { 
-                isFeedbackActive = false; 
-                if (activeEffectMode == 2) isWhammyActive = false; 
-            }
             if (activeEffectMode == 4) isWhammyActive = isCapoMode; 
             updateLUT(); 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 13) { 
             isSynthMode = (cm.data2 >= 64); 
-            if (isSynthMode) { 
-                isFeedbackActive = false; 
-                if (activeEffectMode == 2) isWhammyActive = false; 
-            }
             if (activeEffectMode == 5) isWhammyActive = isSynthMode; 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 14) { 
             isPadMode = (cm.data2 >= 64); 
-            if (isPadMode) { 
-                isFeedbackActive = false; 
-                if (activeEffectMode == 2) isWhammyActive = false; 
-            }
             if (activeEffectMode == 6) isWhammyActive = isPadMode; 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 15) { 
             isChorusMode = (cm.data2 >= 64); 
-            if (isChorusMode) { 
-                isFeedbackActive = false; 
-                if (activeEffectMode == 2) isWhammyActive = false; 
-            }
             if (activeEffectMode == 7) isWhammyActive = isChorusMode; 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 16) { 
             isSwellMode = (cm.data2 >= 64); 
-            if (isSwellMode) { 
-                isFeedbackActive = false; 
-                if (activeEffectMode == 2) isWhammyActive = false; 
-            }
             if (activeEffectMode == 8) isWhammyActive = isSwellMode; 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 21) { 
             isVibratoMode = (cm.data2 >= 64); 
-            if (isVibratoMode) { 
-                isFeedbackActive = false; 
-                if (activeEffectMode == 2) isWhammyActive = false; 
-            }
             if (activeEffectMode == 9) isWhammyActive = isVibratoMode; 
             forceUIUpdate = true; 
         }

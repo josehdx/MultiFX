@@ -32,7 +32,7 @@ i2s_chan_handle_t rx_chan;
 #define MAX_BUFFER_SIZE 65536
 #define BUFFER_MASK 0xFFFF 
 
-int16_t* delayBuffer = nullptr;
+float* delayBuffer = nullptr;
 float* freezeBuffer = nullptr;
 float* fbDelayBuffer = nullptr; 
 int writeIndex = 0;
@@ -69,7 +69,6 @@ int apf2Idx = 0;
 const float intervalList[] = {-12.0f, -7.0f, -5.0f, -2.0f, 0.0f, 2.0f, 5.0f, 7.0f, 12.0f};
 int currentIntervalIdx = 8; 
 
-// FIX 3: Isolated Feedback Array State
 volatile int feedbackIntervalIdx = 0; 
 
 TaskHandle_t audioTaskHandle = NULL; 
@@ -94,12 +93,14 @@ volatile bool isPadMode = false;
 volatile bool isCapoMode = false; 
 volatile bool isChorusMode = false; 
 volatile bool isSwellMode = false; 
+volatile bool isVibratoMode = false; 
 
 volatile float chorusLfoPhase = 0.0f;
 volatile float feedbackLfoPhase = 0.0f;
+volatile float vibratoLfoPhase = 0.0f;
 volatile float swellGain = 0.0f; 
 
-// NEW: VOLUME EFFECT VARIABLES
+// VOLUME EFFECT VARIABLES
 volatile bool isVolumeMode = false; 
 volatile float volumePedalGain = 1.0f; 
 
@@ -215,7 +216,7 @@ void goToLightSleep() {
 }
 
 // --- CUBIC HERMITE INTERPOLATION ENGINE (Zero Aliasing) ---
-inline float IRAM_ATTR getHermiteSample(float tapPos, int16_t* buffer, int writeIdx) {
+inline float IRAM_ATTR getHermiteSample(float tapPos, float* buffer, int writeIdx) {
     int iTap = (int)tapPos;
     float frac = tapPos - iTap;
     
@@ -224,11 +225,10 @@ inline float IRAM_ATTR getHermiteSample(float tapPos, int16_t* buffer, int write
     int idx2 = (writeIdx - iTap - 1 + MAX_BUFFER_SIZE) & BUFFER_MASK;
     int idx3 = (writeIdx - iTap - 2 + MAX_BUFFER_SIZE) & BUFFER_MASK;
     
-    const float scale = 1.0f / 32768.0f;
-    float y0 = buffer[idx0] * scale;
-    float y1 = buffer[idx1] * scale;
-    float y2 = buffer[idx2] * scale;
-    float y3 = buffer[idx3] * scale;
+    float y0 = buffer[idx0];
+    float y1 = buffer[idx1];
+    float y2 = buffer[idx2];
+    float y3 = buffer[idx3];
     
     float c0 = y1;
     float c1 = 0.5f * (y2 - y0);
@@ -330,8 +330,6 @@ void updateLUT() {
     } else {
         float basePitch = 0.0f;
         
-        // MODIFIED: Freeze (1), Harmony (3), and Chorus (7) are removed from Base Pitch
-        // so that pitchShiftLUT contains ONLY the pure physical bend applied to w1 (Dry).
         if (isCapoMode) {
             basePitch += effectMemory[4]; 
         } else if (activeEffectMode == 5) {
@@ -448,6 +446,8 @@ void updateDisplay() {
         isCurrentEffectActive = isChorusMode;
     } else if (activeEffectMode == 8) {
         isCurrentEffectActive = isSwellMode; 
+    } else if (activeEffectMode == 9) {
+        isCurrentEffectActive = isVibratoMode;
     }
 
     uint32_t ledColor = TFT_RED;
@@ -497,6 +497,10 @@ void updateDisplay() {
             spr.setTextColor(TFT_WHITE, TFT_BLACK); 
             spr.drawString("SWELL", spr.width() / 2 + 30, 40); 
             break;
+        case 9: 
+            spr.setTextColor(TFT_PURPLE, TFT_BLACK); 
+            spr.drawString("VIBRATO", spr.width() / 2 + 30, 40); 
+            break;
     }
 
     spr.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -512,6 +516,8 @@ void updateDisplay() {
         displayVal = effectMemory[7];
     } else if (activeEffectMode == 7) {
         displayVal = effectMemory[8];
+    } else if (activeEffectMode == 9) {
+        displayVal = effectMemory[9];
     }
 
     spr.setTextSize(1);
@@ -607,6 +613,7 @@ void updateDisplay() {
     if (isPadMode && activeEffectMode != 6) drawBanner("PAD", TFT_PINK);
     if (isChorusMode && activeEffectMode != 7) drawBanner("CHORUS", TFT_SKYBLUE);
     if (isSwellMode && activeEffectMode != 8) drawBanner("SWELL", TFT_WHITE); 
+    if (isVibratoMode && activeEffectMode != 9) drawBanner("VIB", TFT_PURPLE); 
     
     if (isVolumeMode) drawBanner("VOLUME", TFT_DARKGREY);
 
@@ -701,6 +708,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float invFreezeLength = 1.0f / 48000.0f;
             float chorusPhaseInc = 1536.0f / 96000.0f; 
             float feedbackPhaseInc = 5120.0f / 96000.0f; 
+            
+            float vibHz = (effectMemory[9] == 0.0f) ? 2.0f : fabsf(effectMemory[9]);
+            float vibratoPhaseInc = (vibHz * LFO_LUT_SIZE) / SAMPLING_FREQUENCY;
 
             bool freezeActive = ((activeEffectMode == 1 && isWhammyActive) || isFrozen);
             
@@ -716,6 +726,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             bool swell = isSwellMode; 
             bool chorus = ((activeEffectMode == 7 && isWhammyActive) || isChorusMode);
             bool feedback = ((activeEffectMode == 2 && isWhammyActive) || isFeedbackActive);
+            bool vibrato = ((activeEffectMode == 9 && isWhammyActive) || isVibratoMode);
             
             float pIn = 0.0f;
             float pOut = 0.0f;
@@ -828,14 +839,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     finalWriteVal = freezeOut;
                 }
                 
-                delayBuffer[writeIndex] = (int16_t)fmaxf(-32768.0f, fminf(finalWriteVal * 32767.0f, 32767.0f));
+                delayBuffer[writeIndex] = fmaxf(-1.0f, fminf(finalWriteVal, 1.0f));
 
-                // MODIFIED: f1 strictly holds the physical pedal bend (Bent Dry signal)
                 float f1 = pitchShiftFactor;
                 float f2 = pitchShiftFactor;
                 
                 if (harm) {
-                    // MODIFIED: f2 multiplies the bent dry by the harmony interval
                     f2 = pitchShiftFactor * powf(2.0f, effectMemory[3] / 12.0f);
                 }
                 else if (chorus) { 
@@ -846,7 +855,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     
                     int p1 = (int)chorusLfoPhase;
                     
-                    // MODIFIED: f2 creates a bent chorus voice that tracks alongside the bent dry
                     float chorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
                     f2 = pitchShiftFactor * chorusRatio * lfoLUT[p1]; 
                 } 
@@ -859,6 +867,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float drift = lfoLUT[(int)feedbackLfoPhase];
                     f1 = 1.0f * drift; 
                     f2 = pitchShiftFactor * drift; 
+                }
+                else if (vibrato) {
+                    vibratoLfoPhase += vibratoPhaseInc;
+                    if (vibratoLfoPhase >= LFO_LUT_SIZE) {
+                        vibratoLfoPhase -= LFO_LUT_SIZE;
+                    }
+                    f1 = pitchShiftFactor * lfoLUT[(int)vibratoLfoPhase];
                 }
                 
                 int idx1 = (int)(tap1 * hannMultiplier);
@@ -947,10 +962,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 if (!isWhammyActive) {
                     shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f); 
                 } else if (harm) {
-                    // MODIFIED: Mixes Bent Dry (w1) with Bent Harmony (w2)
                     shiftedOutput = (w1 * 0.6f) + (w2 * 0.5f); 
                 } else if (chorus) {
-                    // MODIFIED: Mixes Bent Dry (w1) with Bent Chorus Voice (w2)
                     shiftedOutput = (w1 * 0.6f) + (w2 * 0.5f); 
                 } else if (feedback) {
                     shiftedOutput = (input * 0.8f) + (feedbackOut * 0.8f);
@@ -1003,12 +1016,14 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 ui_audio_level = pIn; 
             } else {
                 ui_audio_level = ui_audio_level * 0.998f; 
+                if (ui_audio_level < 0.025f) ui_audio_level = 0.0f; // FIX: Force UI clear
             }
             
             if (pOut > ui_output_level) {
                 ui_output_level = pOut; 
             } else {
                 ui_output_level = ui_output_level * 0.998f; 
+                if (ui_output_level < 0.025f) ui_output_level = 0.0f; // FIX: Force UI clear
             }
             
             size_t bw; 
@@ -1119,10 +1134,11 @@ void MidiTask(void * pvParameters) {
                 unsigned long dur = millis() - btnCar.pressedTime;
                 
                 if (dur < 400) { 
-                    activeEffectMode = (activeEffectMode + 1) % 9; 
+                    activeEffectMode = (activeEffectMode + 1) % 10; 
                     
                     chorusLfoPhase = 0.0f;
                     feedbackLfoPhase = 0.0f;
+                    vibratoLfoPhase = 0.0f;
                     swellGain = 0.0f;
                     
                     if (activeEffectMode == 1) {
@@ -1141,6 +1157,8 @@ void MidiTask(void * pvParameters) {
                         isWhammyActive = isChorusMode;
                     } else if (activeEffectMode == 8) {
                         isWhammyActive = isSwellMode;
+                    } else if (activeEffectMode == 9) {
+                        isWhammyActive = isVibratoMode;
                     } else {
                         isWhammyActive = true; 
                         isVolumeMode = false;
@@ -1182,12 +1200,12 @@ void MidiTask(void * pvParameters) {
                     
                     int slot = activeEffectMode;
                     
-                    // MODIFIED: Freeze Mode maps interval button to Toe Bend
                     if (slot == 1) slot = 0; 
                     
                     if (slot == 5) slot = 6;
                     else if (slot == 6) slot = 7;
                     else if (slot == 7) slot = 8;
+                    else if (slot == 9) slot = 9; // Support physical button for vibrato speeds
                     
                     if (slot == 4) {
                         float currentCents = effectMemory[4] - (int)effectMemory[4];
@@ -1296,13 +1314,15 @@ bool channelMessageCallback(ChannelMessage cm) {
                     isWhammyActive = isChorusMode;
                 } else if (activeEffectMode == 8) {
                     isWhammyActive = isSwellMode;
+                } else if (activeEffectMode == 9) {
+                    isWhammyActive = isVibratoMode;
                 }
             }
             forceUIUpdate = true;
         }
         else if (cm.data1 == 4 && cm.data2 >= 64) { 
             if (activeEffectMode == 0) {
-                activeEffectMode = 8;
+                activeEffectMode = 9;
             } else {
                 activeEffectMode = activeEffectMode - 1;
             }
@@ -1337,7 +1357,7 @@ bool channelMessageCallback(ChannelMessage cm) {
             forceUIUpdate = true;
         }
         else if (cm.data1 == 5 && cm.data2 >= 64) { 
-            activeEffectMode = (activeEffectMode + 1) % 9; 
+            activeEffectMode = (activeEffectMode + 1) % 10; 
             
             chorusLfoPhase = 0.0f;
             feedbackLfoPhase = 0.0f;
@@ -1383,6 +1403,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isPadMode = false;
                 isChorusMode = false;
                 isSwellMode = false;
+                isVibratoMode = false;
                 isVolumeMode = false;
                 volumePedalGain = 1.0f; 
             } else {
@@ -1396,6 +1417,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isPadMode = false;
                 isChorusMode = false;
                 isSwellMode = false;
+                isVibratoMode = false;
                 isVolumeMode = false;
                 volumePedalGain = 1.0f; 
             }
@@ -1459,10 +1481,16 @@ bool channelMessageCallback(ChannelMessage cm) {
             }
             forceUIUpdate = true; 
         }
+        else if (cm.data1 == 21) { 
+            isVibratoMode = (cm.data2 >= 64); 
+            if (activeEffectMode == 9) {
+                isWhammyActive = isVibratoMode; 
+            }
+            forceUIUpdate = true; 
+        }
         else if (cm.data1 == 18) {
             if (activeEffectMode == 8) return false;
             
-            // MODIFIED: Freeze Mode maps CC18 to Toe Bend
             if (activeEffectMode == 0 || activeEffectMode == 1) {
                 if (cm.data2 < 64) {
                     effectMemory[0] = constrain(effectMemory[0] + 1.0f, -24.0f, 24.0f);
@@ -1470,11 +1498,8 @@ bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[0] = constrain(effectMemory[0] - 1.0f, -24.0f, 24.0f);
                 }
             } else if (activeEffectMode == 4) {
-                if (cm.data2 < 64) {
-                    effectMemory[4] = constrain(effectMemory[4] + 1.0f, -24.0f, 24.0f);
-                } else {
-                    effectMemory[4] = constrain(effectMemory[4] - 1.0f, -24.0f, 24.0f);
-                }
+                float newVal = effectMemory[4] + (cm.data2 < 64 ? 1.0f : -1.0f);
+                effectMemory[4] = constrain(roundf(newVal * 100.0f) / 100.0f, -24.0f, 24.0f);
             } else if (activeEffectMode == 2) {
                 if (cm.data2 < 64) {
                     feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
@@ -1486,6 +1511,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 if (activeEffectMode == 5) slot = 6; 
                 else if (activeEffectMode == 6) slot = 7; 
                 else if (activeEffectMode == 7) slot = 8;
+                else if (activeEffectMode == 9) slot = 9;
 
                 if (cm.data2 < 64) {
                     effectMemory[slot] = constrain(effectMemory[slot] + 1.0f, -24.0f, 24.0f);
@@ -1499,7 +1525,6 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 17) {
             if (activeEffectMode == 8) return false;
             
-            // MODIFIED: Freeze Mode maps CC17 to Heel Bend
             if (activeEffectMode == 0 || activeEffectMode == 1) {
                 if (cm.data2 < 64) {
                     effectMemory[5] = constrain(effectMemory[5] + 1.0f, -24.0f, 24.0f);
@@ -1507,11 +1532,8 @@ bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[5] = constrain(effectMemory[5] - 1.0f, -24.0f, 24.0f);
                 }
             } else if (activeEffectMode == 4) {
-                if (cm.data2 < 64) {
-                    effectMemory[4] = constrain(effectMemory[4] + 0.01f, -24.0f, 24.0f);
-                } else {
-                    effectMemory[4] = constrain(effectMemory[4] - 0.01f, -24.0f, 24.0f);
-                }
+                float newVal = effectMemory[4] + (cm.data2 < 64 ? 0.01f : -0.01f);
+                effectMemory[4] = constrain(roundf(newVal * 100.0f) / 100.0f, -24.0f, 24.0f);
             } else if (activeEffectMode == 2) {
                 if (cm.data2 < 64) {
                     feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5;
@@ -1523,6 +1545,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 if (activeEffectMode == 5) slot = 6; 
                 else if (activeEffectMode == 6) slot = 7; 
                 else if (activeEffectMode == 7) slot = 8;
+                else if (activeEffectMode == 9) slot = 9;
 
                 if (cm.data2 < 64) {
                     effectMemory[slot] = constrain(effectMemory[slot] + 1.0f, -24.0f, 24.0f);
@@ -1577,9 +1600,9 @@ void setup() {
     pinMode(pinPB, INPUT); 
     pinMode(pinPB2, INPUT);
     
-    delayBuffer = (int16_t*)heap_caps_malloc(MAX_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    fbDelayBuffer = (float*)heap_caps_malloc(8192 * 4, MALLOC_CAP_SPIRAM);
-    freezeBuffer = (float*)heap_caps_malloc(MAX_BUFFER_SIZE * 4, MALLOC_CAP_SPIRAM);
+    delayBuffer = (float*)heap_caps_aligned_alloc(16, MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
+    fbDelayBuffer = (float*)heap_caps_aligned_alloc(16, 8192 * sizeof(float), MALLOC_CAP_SPIRAM);
+    freezeBuffer = (float*)heap_caps_aligned_alloc(16, MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     
     if (delayBuffer == NULL || fbDelayBuffer == NULL || freezeBuffer == NULL) {
         Serial.println("FATAL ERROR: Failed to allocate DSP buffers in PSRAM!");
@@ -1590,8 +1613,9 @@ void setup() {
         } 
     }
     
-    memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
-    memset(fbDelayBuffer, 0, 8192 * 4);
+    memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float)); 
+    memset(fbDelayBuffer, 0, 8192 * sizeof(float));
+    memset(freezeBuffer, 0, MAX_BUFFER_SIZE * sizeof(float)); // FIX: Flushes garbage memory
     
     for (int i = 0; i < HANN_LUT_SIZE; i++) {
         hannLUT[i] = sinf(PI * ((float)i / (float)(HANN_LUT_SIZE - 1)));

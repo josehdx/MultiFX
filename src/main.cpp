@@ -997,8 +997,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         mixedSignal += (padFilter * 1.5f);
                     }
 
-                    // 4. Freeze Drone
-                    if (freezeActive || freezeRamp > 0.0f) {
+                    // 4. Freeze Drone Tail
+                    // When Freeze is active, the drone is inside 'w1' being dynamically bent!
+                    // We ONLY mix the raw drone here when Freeze is turned OFF to create the fade-out tail.
+                    if (!freezeActive && freezeRamp > 0.0f) {
                         mixedSignal += (freezeOut * 0.5f);
                     }
 

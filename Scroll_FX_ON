@@ -323,55 +323,43 @@ void calibrateCenterAndDeadzone() {
 }
 
 void updateLUT() {
-    bool isStaticIntervalMode = ((activeEffectMode == 2 && isWhammyActive) || isFeedbackActive);
+    float basePitch = 0.0f;
     
-    if (isStaticIntervalMode) {
-        float intervals[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f };
-        float staticTotalShift = intervals[feedbackIntervalIdx % 5];
-        float staticRatio = powf(2.0f, staticTotalShift / 12.0f);
-        
-        for (int i = 0; i < 16384; i++) {
-            pitchShiftLUT[i] = staticRatio;
+    if (isCapoMode || (activeEffectMode == 4 && isWhammyActive)) {
+        basePitch += effectMemory[4]; 
+    } 
+    
+    if (isSynthMode || (activeEffectMode == 5 && isWhammyActive)) {
+        basePitch += effectMemory[6]; 
+    } else if (isPadMode || (activeEffectMode == 6 && isWhammyActive)) {
+        basePitch += effectMemory[7]; 
+    } else if (isChorusMode || (activeEffectMode == 7 && isWhammyActive)) {
+        basePitch += effectMemory[8]; 
+    } else if (isVibratoMode || (activeEffectMode == 9 && isWhammyActive)) {
+        basePitch += effectMemory[9];
+    }
+    
+    float toeBend = effectMemory[0];
+    float heelBend = effectMemory[5];
+    
+    for (int i = 0; i < 16384; i++) {
+        float normalizedThrow;
+        if (i >= 8192) {
+            normalizedThrow = (float)(i - 8192) / 8191.0f;
+        } else {
+            normalizedThrow = (float)(i - 8192) / 8192.0f;
         }
-    } else {
-        float basePitch = 0.0f;
         
-        if (isCapoMode || (activeEffectMode == 4 && isWhammyActive)) {
-            basePitch += effectMemory[4]; 
-        } 
+        float dynamicBend = 0.0f;
         
-        if (isSynthMode || (activeEffectMode == 5 && isWhammyActive)) {
-            basePitch += effectMemory[6]; 
-        } else if (isPadMode || (activeEffectMode == 6 && isWhammyActive)) {
-            basePitch += effectMemory[7]; 
-        } else if (isChorusMode || (activeEffectMode == 7 && isWhammyActive)) {
-            basePitch += effectMemory[8]; 
-        } else if (isVibratoMode || (activeEffectMode == 9 && isWhammyActive)) {
-            basePitch += effectMemory[9];
+        if (normalizedThrow >= 0.0f) {
+            dynamicBend = toeBend * normalizedThrow;
+        } else {
+            dynamicBend = heelBend * std::abs(normalizedThrow);
         }
         
-        float toeBend = effectMemory[0];
-        float heelBend = effectMemory[5];
-        
-        for (int i = 0; i < 16384; i++) {
-            float normalizedThrow;
-            if (i >= 8192) {
-                normalizedThrow = (float)(i - 8192) / 8191.0f;
-            } else {
-                normalizedThrow = (float)(i - 8192) / 8192.0f;
-            }
-            
-            float dynamicBend = 0.0f;
-            
-            if (normalizedThrow >= 0.0f) {
-                dynamicBend = toeBend * normalizedThrow;
-            } else {
-                dynamicBend = heelBend * std::abs(normalizedThrow);
-            }
-            
-            float totalShift = basePitch + dynamicBend;
-            pitchShiftLUT[i] = powf(2.0f, totalShift / 12.0f);
-        }
+        float totalShift = basePitch + dynamicBend;
+        pitchShiftLUT[i] = powf(2.0f, totalShift / 12.0f);
     }
     
     if (!isVolumeMode) {
@@ -1009,8 +997,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         mixedSignal += (padFilter * 1.5f);
                     }
 
-                    // 4. Freeze Drone
-                    if (freezeActive || freezeRamp > 0.0f) {
+                    // 4. Freeze Drone Tail
+                    // When Freeze is active, the drone is inside 'w1' being dynamically bent!
+                    // We ONLY mix the raw drone here when Freeze is turned OFF to create the fade-out tail.
+                    if (!freezeActive && freezeRamp > 0.0f) {
                         mixedSignal += (freezeOut * 0.5f);
                     }
 

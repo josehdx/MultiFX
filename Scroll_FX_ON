@@ -48,11 +48,12 @@ DRAM_ATTR float lfoLUT[LFO_LUT_SIZE];
 DRAM_ATTR float synthLUT[WAVE_LUT_SIZE];
 volatile float pitchShiftLUT[16384]; 
 
-// Tap States 
-float tap1 = 0.0f;
-float tap2 = 256.0f; 
-float tap1_2 = 0.0f;
-float tap2_2 = 256.0f;
+// --- DEDICATED INDEPENDENT TAP STATES ---
+float tap_w1_1 = 0.0f, tap_w1_2 = 256.0f; // Whammy Core
+float tap_w2_1 = 0.0f, tap_w2_2 = 256.0f; // Harmonizer
+float tap_w3_1 = 0.0f, tap_w3_2 = 256.0f; // Chorus
+float tap_w4_1 = 0.0f, tap_w4_2 = 256.0f; // Feedback Unison
+float tap_w5_1 = 0.0f, tap_w5_2 = 256.0f; // Feedback Shifted
 float currentWindowSize = 1024.0f; 
 
 // --- FREEZE STATE & ALL-PASS FILTERS ---
@@ -699,10 +700,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float targetWin = LATENCY_WINDOWS[latencyMode];
             if (currentWindowSize != targetWin) { 
                 currentWindowSize = targetWin; 
-                tap1 = 0.0f; 
-                tap2 = targetWin / 2.0f; 
-                tap1_2 = 0.0f; 
-                tap2_2 = targetWin / 2.0f; 
+                tap_w1_1 = 0.0f; tap_w1_2 = targetWin / 2.0f; 
+                tap_w2_1 = 0.0f; tap_w2_2 = targetWin / 2.0f; 
+                tap_w3_1 = 0.0f; tap_w3_2 = targetWin / 2.0f; 
+                tap_w4_1 = 0.0f; tap_w4_2 = targetWin / 2.0f; 
+                tap_w5_1 = 0.0f; tap_w5_2 = targetWin / 2.0f; 
             }
             
             float hannMultiplier = 1023.0f / currentWindowSize; 
@@ -843,74 +845,91 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 delayBuffer[writeIndex] = fmaxf(-1.0f, fminf(finalWriteVal, 1.0f));
 
-                float f1 = pitchShiftFactor;
-                float f2 = pitchShiftFactor;
-                
-                if (feedback) { 
-                    feedbackLfoPhase += feedbackPhaseInc;
-                    if (feedbackLfoPhase >= LFO_LUT_SIZE) {
-                        feedbackLfoPhase -= LFO_LUT_SIZE;
-                    }
-                    
-                    float drift = lfoLUT[(int)feedbackLfoPhase];
-                    f1 = 1.0f * drift; 
-                    f2 = pitchShiftFactor * drift; 
-                }
-                else if (harm) {
-                    f2 = pitchShiftFactor * powf(2.0f, effectMemory[3] / 12.0f);
-                }
-                else if (chorus) { 
-                    chorusLfoPhase += chorusPhaseInc;
-                    if (chorusLfoPhase >= LFO_LUT_SIZE) {
-                        chorusLfoPhase -= LFO_LUT_SIZE;
-                    }
-                    
-                    int p1 = (int)chorusLfoPhase;
-                    
-                    float chorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
-                    f2 = pitchShiftFactor * chorusRatio * lfoLUT[p1]; 
-                } 
-                else if (vibrato) {
+                // --- MULTI-TAP FACTOR CALCULATIONS ---
+                float f_w1 = pitchShiftFactor;
+                if (vibrato) {
                     vibratoLfoPhase += vibratoPhaseInc;
-                    if (vibratoLfoPhase >= LFO_LUT_SIZE) {
-                        vibratoLfoPhase -= LFO_LUT_SIZE;
-                    }
-                    f1 = pitchShiftFactor * lfoLUT[(int)vibratoLfoPhase];
-                }
-                
-                int idx1 = (int)(tap1 * hannMultiplier);
-                int idx2 = (int)(tap2 * hannMultiplier);
-                
-                float w1 = (getHermiteSample(tap1 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx1]) + 
-                           (getHermiteSample(tap2 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx2]);
-                           
-                float w2 = 0.0f;
-                if (feedback || harm || chorus) {
-                    int idx1_2 = (int)(tap1_2 * hannMultiplier);
-                    int idx2_2 = (int)(tap2_2 * hannMultiplier);
-                    
-                    w2 = (getHermiteSample(tap1_2 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx1_2]) + 
-                         (getHermiteSample(tap2_2 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx2_2]);
+                    if (vibratoLfoPhase >= LFO_LUT_SIZE) vibratoLfoPhase -= LFO_LUT_SIZE;
+                    f_w1 = pitchShiftFactor * lfoLUT[(int)vibratoLfoPhase];
                 }
 
-                float r1 = 1.0f - f1;
-                float r2 = 1.0f - f2;
+                float f_w2 = 1.0f;
+                if (harm) {
+                    f_w2 = pitchShiftFactor * powf(2.0f, effectMemory[3] / 12.0f);
+                }
+
+                float f_w3 = 1.0f;
+                if (chorus) {
+                    chorusLfoPhase += chorusPhaseInc;
+                    if (chorusLfoPhase >= LFO_LUT_SIZE) chorusLfoPhase -= LFO_LUT_SIZE;
+                    f_w3 = pitchShiftFactor * powf(2.0f, effectMemory[8] / 12.0f) * lfoLUT[(int)chorusLfoPhase];
+                }
+
+                float f_w4 = 1.0f;
+                float f_w5 = 1.0f;
+                float drift = 1.0f;
+                if (feedback || feedbackRamp > 0.0f) {
+                    feedbackLfoPhase += feedbackPhaseInc;
+                    if (feedbackLfoPhase >= LFO_LUT_SIZE) feedbackLfoPhase -= LFO_LUT_SIZE;
+                    drift = lfoLUT[(int)feedbackLfoPhase];
+                    f_w4 = 1.0f * drift;
+                    f_w5 = pitchShiftFactor * drift;
+                }
                 
-                tap1 += r1; 
-                while (tap1 >= currentWindowSize) tap1 -= currentWindowSize; 
-                while (tap1 < 0.0f) tap1 += currentWindowSize;
+                // --- CONDITIONAL HERMITE INTERPOLATION (Saves CPU) ---
+                float w1 = 0.0f, w2 = 0.0f, w3 = 0.0f, w4 = 0.0f, w5 = 0.0f;
+
+                int idx1_1 = (int)(tap_w1_1 * hannMultiplier);
+                int idx1_2 = (int)(tap_w1_2 * hannMultiplier);
+                w1 = (getHermiteSample(tap_w1_1 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx1_1]) + 
+                     (getHermiteSample(tap_w1_2 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx1_2]);
+                           
+                if (harm) {
+                    int idx2_1 = (int)(tap_w2_1 * hannMultiplier);
+                    int idx2_2 = (int)(tap_w2_2 * hannMultiplier);
+                    w2 = (getHermiteSample(tap_w2_1 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx2_1]) + 
+                         (getHermiteSample(tap_w2_2 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx2_2]);
+                }
+
+                if (chorus) {
+                    int idx3_1 = (int)(tap_w3_1 * hannMultiplier);
+                    int idx3_2 = (int)(tap_w3_2 * hannMultiplier);
+                    w3 = (getHermiteSample(tap_w3_1 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx3_1]) + 
+                         (getHermiteSample(tap_w3_2 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx3_2]);
+                }
+
+                if (feedback || feedbackRamp > 0.0f) {
+                    int idx4_1 = (int)(tap_w4_1 * hannMultiplier);
+                    int idx4_2 = (int)(tap_w4_2 * hannMultiplier);
+                    w4 = (getHermiteSample(tap_w4_1 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx4_1]) + 
+                         (getHermiteSample(tap_w4_2 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx4_2]);
+
+                    int idx5_1 = (int)(tap_w5_1 * hannMultiplier);
+                    int idx5_2 = (int)(tap_w5_2 * hannMultiplier);
+                    w5 = (getHermiteSample(tap_w5_1 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx5_1]) + 
+                         (getHermiteSample(tap_w5_2 + 1.0f, delayBuffer, writeIndex) * hannLUT[idx5_2]);
+                }
+
+                // --- TAP ADVANCEMENT ---
+                float r1 = 1.0f - f_w1;
+                tap_w1_1 += r1; while (tap_w1_1 >= currentWindowSize) tap_w1_1 -= currentWindowSize; while (tap_w1_1 < 0.0f) tap_w1_1 += currentWindowSize;
+                tap_w1_2 += r1; while (tap_w1_2 >= currentWindowSize) tap_w1_2 -= currentWindowSize; while (tap_w1_2 < 0.0f) tap_w1_2 += currentWindowSize;
+
+                float r2 = 1.0f - f_w2;
+                tap_w2_1 += r2; while (tap_w2_1 >= currentWindowSize) tap_w2_1 -= currentWindowSize; while (tap_w2_1 < 0.0f) tap_w2_1 += currentWindowSize;
+                tap_w2_2 += r2; while (tap_w2_2 >= currentWindowSize) tap_w2_2 -= currentWindowSize; while (tap_w2_2 < 0.0f) tap_w2_2 += currentWindowSize;
                 
-                tap2 += r1; 
-                while (tap2 >= currentWindowSize) tap2 -= currentWindowSize; 
-                while (tap2 < 0.0f) tap2 += currentWindowSize;
+                float r3 = 1.0f - f_w3;
+                tap_w3_1 += r3; while (tap_w3_1 >= currentWindowSize) tap_w3_1 -= currentWindowSize; while (tap_w3_1 < 0.0f) tap_w3_1 += currentWindowSize;
+                tap_w3_2 += r3; while (tap_w3_2 >= currentWindowSize) tap_w3_2 -= currentWindowSize; while (tap_w3_2 < 0.0f) tap_w3_2 += currentWindowSize;
                 
-                tap1_2 += r2; 
-                while (tap1_2 >= currentWindowSize) tap1_2 -= currentWindowSize; 
-                while (tap1_2 < 0.0f) tap1_2 += currentWindowSize;
-                
-                tap2_2 += r2; 
-                while (tap2_2 >= currentWindowSize) tap2_2 -= currentWindowSize; 
-                while (tap2_2 < 0.0f) tap2_2 += currentWindowSize;
+                float r4 = 1.0f - f_w4;
+                tap_w4_1 += r4; while (tap_w4_1 >= currentWindowSize) tap_w4_1 -= currentWindowSize; while (tap_w4_1 < 0.0f) tap_w4_1 += currentWindowSize;
+                tap_w4_2 += r4; while (tap_w4_2 >= currentWindowSize) tap_w4_2 -= currentWindowSize; while (tap_w4_2 < 0.0f) tap_w4_2 += currentWindowSize;
+
+                float r5 = 1.0f - f_w5;
+                tap_w5_1 += r5; while (tap_w5_1 >= currentWindowSize) tap_w5_1 -= currentWindowSize; while (tap_w5_1 < 0.0f) tap_w5_1 += currentWindowSize;
+                tap_w5_2 += r5; while (tap_w5_2 >= currentWindowSize) tap_w5_2 -= currentWindowSize; while (tap_w5_2 < 0.0f) tap_w5_2 += currentWindowSize;
                 
                 writeIndex = (writeIndex + 1) & BUFFER_MASK;
 
@@ -933,7 +952,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     if (freezeActive && freezeRamp > 0.0f) {
                         bloomed = freezeOut; 
                     } else {
-                        bloomed = (w1 * (1.0f - bloom)) + (w2 * bloom);
+                        // Feedback now safely uses w4 and w5!
+                        bloomed = (w4 * (1.0f - bloom)) + (w5 * bloom);
                     }
                     
                     fbHpfState += 0.05f * (bloomed - fbHpfState);
@@ -968,7 +988,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 }
 
                 bool isAnyEffectActive = isWhammyActive || harm || chorus || feedback || synth || pad || freezeActive || vibrato || capo;
-                bool isBlendedEffect = harm || chorus || pad || freezeActive || feedback || (freezeRamp > 0.0f) || (feedbackRamp > 0.0f);
+                bool isDryBlendedEffect = chorus || pad || freezeActive || feedback || (freezeRamp > 0.0f) || (feedbackRamp > 0.0f);
 
                 float shiftedOutput = 0.0f;
 
@@ -979,17 +999,22 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float mixedSignal = 0.0f;
 
                     // 1. Base Core (Dry + w1)
-                    if (isBlendedEffect) {
-                        mixedSignal += (input * 0.4f);
+                    if (isDryBlendedEffect) {
+                        mixedSignal += (input * 0.4f); // Dry anchor for ambient effects
                         mixedSignal += (w1 * 0.4f);
+                    } else if (harm) {
+                        mixedSignal += (w1 * 0.5f);    // NO DRY SIGNAL. Just Primary Bend at 50%
                     } else {
                         // 100% Wet for pure pitch replacement (Whammy, Capo, Synth, Vibrato)
                         mixedSignal += w1; 
                     }
 
-                    // 2. Harmony / Chorus (w2)
-                    if (harm || chorus) {
-                        mixedSignal += (w2 * 0.4f);
+                    // 2. Harmony / Chorus (w2 & w3)
+                    if (harm) {
+                        mixedSignal += (w2 * 0.5f); // Harmony note balanced at 50%
+                    } 
+                    if (chorus) {
+                        mixedSignal += (w3 * 0.4f); // Chorus safely uses w3!
                     }
 
                     // 3. Pad
@@ -998,8 +1023,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     }
 
                     // 4. Freeze Drone Tail
-                    // When Freeze is active, the drone is inside 'w1' being dynamically bent!
-                    // We ONLY mix the raw drone here when Freeze is turned OFF to create the fade-out tail.
                     if (!freezeActive && freezeRamp > 0.0f) {
                         mixedSignal += (freezeOut * 0.5f);
                     }

@@ -50,6 +50,12 @@ DRAM_ATTR float lfoLUT[LFO_LUT_SIZE];
 DRAM_ATTR float synthLUT[WAVE_LUT_SIZE];
 volatile float pitchShiftLUT[16384]; 
 
+// --- DSP PRE-CALCULATED RATIOS (Optimization #1) ---
+volatile float globalHarmRatio = 1.0f;
+volatile float globalChorusRatio = 1.0f;
+volatile float globalFbRatio = 1.0f;
+volatile float globalVibratoPhaseInc = 0.0f;
+
 // --- DEDICATED INDEPENDENT TAP STATES ---
 float tap_w1_1 = 0.0f;
 float tap_w1_2 = 256.0f; 
@@ -328,7 +334,7 @@ void goToLightSleep() {
     lastScreenActivityTime = millis();
 }
 
-// --- OPTIMIZATION B: HORNER'S METHOD HERMITE INTERPOLATION ---
+// --- HORNER'S METHOD HERMITE INTERPOLATION ---
 inline float IRAM_ATTR getHermiteSample(float tapPos, float* buffer, int writeIdx) {
     int iTap = (int)tapPos; 
     float frac = tapPos - iTap;
@@ -385,6 +391,19 @@ void updateLUT() {
     if (!isVolumeMode) {
         pitchShiftFactor = pitchShiftLUT[constrain(currentPB1, 0, 16383)];
     }
+
+    // --- PRE-CALCULATE HEAVY MATH (Optimization #1) ---
+    globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f);
+    globalChorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
+    
+    float fbI[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f }; 
+    globalFbRatio = powf(2.0f, fbI[feedbackIntervalIdx % 5] / 12.0f);
+    
+    float vibHz = 2.0f;
+    if (effectMemory[9] != 0.0f) {
+        vibHz = fabsf(effectMemory[9]);
+    }
+    globalVibratoPhaseInc = (vibHz * LFO_LUT_SIZE) / SAMPLING_FREQUENCY;
 }
 
 void updateMeters() {
@@ -449,7 +468,7 @@ void updateDisplay() {
     spr.drawRect(outX, barY, barWidth, barHeight, TFT_DARKGREY); 
     spr.drawString("OUT", outX + (barWidth / 2), barY + barHeight + 10);
 
-    // LED 
+    // LED
     bool isEffectOn = false; 
     
     if (activeEffectMode == 0) {
@@ -747,18 +766,15 @@ void DisplayTask(void * pvParameters) {
 
 // --- OPTIMIZATION A & D: BLOCK PROCESSING AUDIO DSP TASK ---
 void IRAM_ATTR AudioDSPTask(void * pvParameters) {
-    // I/O Buffers
     static float dsp_out[HOP_SIZE * 2] __attribute__((aligned(16)));
     static int32_t i2s_in[HOP_SIZE * 2] __attribute__((aligned(16)));
     static int32_t i2s_out[HOP_SIZE * 2] __attribute__((aligned(16)));
     
-    // Intermediate Vector Arrays for Block Processing
     static float in_block[HOP_SIZE] __attribute__((aligned(16)));
     static float dc_block[HOP_SIZE] __attribute__((aligned(16)));
     static float w1_block[HOP_SIZE] __attribute__((aligned(16)));
     static float mix_block[HOP_SIZE] __attribute__((aligned(16)));
     
-    // Hardware Biquad DC Blocker (Optimization D)
     static float dc_coeffs[5] = {1.0f, -1.0f, 0.0f, -0.995f, 0.0f}; 
     static float dc_state[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     
@@ -813,13 +829,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float chorusPhaseInc = 1536.0f / 96000.0f;
             float feedbackPhaseInc = 5120.0f / 96000.0f; 
             
-            float vibHz = 2.0f;
-            if (effectMemory[9] != 0.0f) {
-                vibHz = fabsf(effectMemory[9]);
-            }
-            
-            float vibratoPhaseInc = (vibHz * LFO_LUT_SIZE) / SAMPLING_FREQUENCY;
-            
             bool frz = ((activeEffectMode == 1 && isWhammyActive) || isFrozen);
             if (frz && !wasFrozen) { 
                 freezePlayCounter = 0; 
@@ -836,12 +845,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             bool vibrato = ((activeEffectMode == 9 && isWhammyActive) || isVibratoMode);
             bool capo = ((activeEffectMode == 4 && isWhammyActive) || isCapoMode);
             
-            float harmRatio = powf(2.0f, effectMemory[3] / 12.0f);
-            float chorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
-            
-            float fbI[5] = { 0.0f, 12.0f, 19.0f, 24.0f, 28.0f }; 
-            float feedbackHarmonicRatio = powf(2.0f, fbI[feedbackIntervalIdx % 5] / 12.0f);
-            
             float pIn = 0.0f;
             float pOut = 0.0f;
 
@@ -851,7 +854,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 in_block[i] = (float)i2s_in[i * 2] * norm;
             }
             
-            // High-Speed Hardware Biquad DC Blocker
             dsps_biquad_f32(in_block, dc_block, HOP_SIZE, dc_coeffs, dc_state);
 
             // --- STAGE 2: COMPLEX SCALAR OPERATIONS ---
@@ -878,7 +880,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         synthEnv = fmaxf(0.0f, synthEnv - 0.005f); 
                     }
                     
-                    int lutIdx = (int)((writeVal + 1.0f) * 0.5f * (WAVE_LUT_SIZE - 1)); 
+                    // Pre-calculated Synth LUT math (Optimization #3)
+                    int lutIdx = (int)((writeVal + 1.0f) * 1023.5f); 
                     if (lutIdx < 0) {
                         lutIdx = 0; 
                     } else if (lutIdx >= WAVE_LUT_SIZE) {
@@ -920,12 +923,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float ph = (float)freezePlayCounter * invFreezeLength; 
                     
                     int i1 = freezeStartIdx + freezePlayCounter;
-                    while (i1 >= freezeLength) {
+                    if (i1 >= freezeLength) {
                         i1 -= freezeLength;
                     }
                     
                     int i2 = freezeStartIdx + freezePlayCounter + (freezeLength / 2);
-                    while (i2 >= freezeLength) {
+                    if (i2 >= freezeLength) {
                         i2 -= freezeLength;
                     }
                     
@@ -972,18 +975,19 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 float f_w1 = pitchShiftFactor; 
                 if (vibrato) { 
-                    vibratoLfoPhase += vibratoPhaseInc;
-                    while (vibratoLfoPhase >= LFO_LUT_SIZE) {
+                    vibratoLfoPhase += globalVibratoPhaseInc;
+                    if (vibratoLfoPhase >= LFO_LUT_SIZE) {
                         vibratoLfoPhase -= LFO_LUT_SIZE;
                     }
                     f_w1 = pitchShiftFactor * lfoLUT[(int)vibratoLfoPhase]; 
                 }
                 
-                float f_w2 = pitchShiftFactor * harmRatio;
-                float f_w3 = pitchShiftFactor * chorusRatio; 
+                // Using global pre-calculated ratios! (Optimization #1)
+                float f_w2 = pitchShiftFactor * globalHarmRatio;
+                float f_w3 = pitchShiftFactor * globalChorusRatio; 
                 if (chorus) { 
                     chorusLfoPhase += chorusPhaseInc;
-                    while (chorusLfoPhase >= LFO_LUT_SIZE) {
+                    if (chorusLfoPhase >= LFO_LUT_SIZE) {
                         chorusLfoPhase -= LFO_LUT_SIZE;
                     }
                     f_w3 *= lfoLUT[(int)chorusLfoPhase]; 
@@ -993,12 +997,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float f_w5 = 1.0f; 
                 if (feedback || feedbackRamp > 0.0f) { 
                     feedbackLfoPhase += feedbackPhaseInc;
-                    while (feedbackLfoPhase >= LFO_LUT_SIZE) {
+                    if (feedbackLfoPhase >= LFO_LUT_SIZE) {
                         feedbackLfoPhase -= LFO_LUT_SIZE;
                     }
                     float d = lfoLUT[(int)feedbackLfoPhase]; 
                     f_w4 = d; 
-                    f_w5 = pitchShiftFactor * feedbackHarmonicRatio * d; 
+                    f_w5 = pitchShiftFactor * globalFbRatio * d; 
                 }
                 
                 float w1 = (getHermiteSample(tap_w1_1 + 2.0f, delayBuffer, writeIndex) * hannLUT[(int)(tap_w1_1 * hannMultiplier)]) + 
@@ -1028,51 +1032,51 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                          (getHermiteSample(tap_w5_2 + 2.0f, delayBuffer, writeIndex) * hannLUT[(int)(tap_w5_2 * hannMultiplier)]); 
                 }
                 
-                // Fast Phase Wraps replacing fmodf()
+                // Fast Phase Wraps with "if" instead of "while" (Optimization #2)
                 float r1 = 1.0f - f_w1; 
                 tap_w1_1 += r1; 
-                while (tap_w1_1 >= currentWindowSize) tap_w1_1 -= currentWindowSize; 
-                while (tap_w1_1 < 0.0f) tap_w1_1 += currentWindowSize;
+                if (tap_w1_1 >= currentWindowSize) tap_w1_1 -= currentWindowSize; 
+                else if (tap_w1_1 < 0.0f) tap_w1_1 += currentWindowSize;
                 
                 tap_w1_2 += r1; 
-                while (tap_w1_2 >= currentWindowSize) tap_w1_2 -= currentWindowSize; 
-                while (tap_w1_2 < 0.0f) tap_w1_2 += currentWindowSize;
+                if (tap_w1_2 >= currentWindowSize) tap_w1_2 -= currentWindowSize; 
+                else if (tap_w1_2 < 0.0f) tap_w1_2 += currentWindowSize;
                 
                 float r2 = 1.0f - f_w2; 
                 tap_w2_1 += r2; 
-                while (tap_w2_1 >= currentWindowSize) tap_w2_1 -= currentWindowSize; 
-                while (tap_w2_1 < 0.0f) tap_w2_1 += currentWindowSize;
+                if (tap_w2_1 >= currentWindowSize) tap_w2_1 -= currentWindowSize; 
+                else if (tap_w2_1 < 0.0f) tap_w2_1 += currentWindowSize;
                 
                 tap_w2_2 += r2; 
-                while (tap_w2_2 >= currentWindowSize) tap_w2_2 -= currentWindowSize; 
-                while (tap_w2_2 < 0.0f) tap_w2_2 += currentWindowSize;
+                if (tap_w2_2 >= currentWindowSize) tap_w2_2 -= currentWindowSize; 
+                else if (tap_w2_2 < 0.0f) tap_w2_2 += currentWindowSize;
                 
                 float r3 = 1.0f - f_w3; 
                 tap_w3_1 += r3; 
-                while (tap_w3_1 >= currentWindowSize) tap_w3_1 -= currentWindowSize; 
-                while (tap_w3_1 < 0.0f) tap_w3_1 += currentWindowSize;
+                if (tap_w3_1 >= currentWindowSize) tap_w3_1 -= currentWindowSize; 
+                else if (tap_w3_1 < 0.0f) tap_w3_1 += currentWindowSize;
                 
                 tap_w3_2 += r3; 
-                while (tap_w3_2 >= currentWindowSize) tap_w3_2 -= currentWindowSize; 
-                while (tap_w3_2 < 0.0f) tap_w3_2 += currentWindowSize;
+                if (tap_w3_2 >= currentWindowSize) tap_w3_2 -= currentWindowSize; 
+                else if (tap_w3_2 < 0.0f) tap_w3_2 += currentWindowSize;
                 
                 float r4 = 1.0f - f_w4; 
                 tap_w4_1 += r4; 
-                while (tap_w4_1 >= currentWindowSize) tap_w4_1 -= currentWindowSize; 
-                while (tap_w4_1 < 0.0f) tap_w4_1 += currentWindowSize;
+                if (tap_w4_1 >= currentWindowSize) tap_w4_1 -= currentWindowSize; 
+                else if (tap_w4_1 < 0.0f) tap_w4_1 += currentWindowSize;
                 
                 tap_w4_2 += r4; 
-                while (tap_w4_2 >= currentWindowSize) tap_w4_2 -= currentWindowSize; 
-                while (tap_w4_2 < 0.0f) tap_w4_2 += currentWindowSize;
+                if (tap_w4_2 >= currentWindowSize) tap_w4_2 -= currentWindowSize; 
+                else if (tap_w4_2 < 0.0f) tap_w4_2 += currentWindowSize;
                 
                 float r5 = 1.0f - f_w5; 
                 tap_w5_1 += r5; 
-                while (tap_w5_1 >= currentWindowSize) tap_w5_1 -= currentWindowSize; 
-                while (tap_w5_1 < 0.0f) tap_w5_1 += currentWindowSize;
+                if (tap_w5_1 >= currentWindowSize) tap_w5_1 -= currentWindowSize; 
+                else if (tap_w5_1 < 0.0f) tap_w5_1 += currentWindowSize;
                 
                 tap_w5_2 += r5; 
-                while (tap_w5_2 >= currentWindowSize) tap_w5_2 -= currentWindowSize; 
-                while (tap_w5_2 < 0.0f) tap_w5_2 += currentWindowSize;
+                if (tap_w5_2 >= currentWindowSize) tap_w5_2 -= currentWindowSize; 
+                else if (tap_w5_2 < 0.0f) tap_w5_2 += currentWindowSize;
                 
                 writeIndex = (writeIndex + 1) & BUFFER_MASK;
                 
@@ -1337,6 +1341,7 @@ void MidiTask(void * pvParameters) {
                         Control_Surface.sendPitchBend(Channel_1, calA); 
                     }
                     lastMidiA = calA; 
+                    currentPB1 = calA; // ONLY update UI if it broke the hysteresis threshold!
                 }
                 
                 if (movedB) { 
@@ -1344,6 +1349,7 @@ void MidiTask(void * pvParameters) {
                         Control_Surface.sendPitchBend(Channel_2, calB); 
                     }
                     lastMidiB = calB; 
+                    currentPB2 = calB; // ONLY update UI if it broke the hysteresis threshold!
                 }
                 
                 if (movedC) { 
@@ -1351,6 +1357,7 @@ void MidiTask(void * pvParameters) {
                         Control_Surface.sendPitchBend(Channel_3, calC); 
                     }
                     lastMidiC = calC; 
+                    currentPB3 = calC; // ONLY update UI if it broke the hysteresis threshold!
                 }
                 
                 analog_t act;
@@ -1376,9 +1383,8 @@ void MidiTask(void * pvParameters) {
                 forceUIUpdate = true;
             }
             
-            currentPB1 = calA;
-            currentPB2 = calB;
-            currentPB3 = calC;
+            
+
         }
         vTaskDelay(pdMS_TO_TICKS(5));
     }

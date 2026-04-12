@@ -30,7 +30,7 @@
 //#define TFT_BACKLIGHT_ON 1
 
 #undef TFT_BL
-#define TFT_BL 21
+#define TFT_BL 38
 
 #define LOAD_GLCD
 #define LOAD_FONT2

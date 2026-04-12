@@ -1,35 +1,23 @@
-     int diffA = abs((int)calibratedA - (int)lastMidiA);
-            int diffB = abs((int)calibratedB - (int)lastMidiB);
-            
-            if (diffA > 256 || diffB > 256) {
-                if (isScreenOff) turnScreenOn();
-                lastScreenActivityTime = millis();
-            }
-
-            // ACTIVE MODE
-            bool movedA = diffA > 8;
-            bool movedB = diffB > 8;
+            bool movedA = (abs((int)calA - (int)lastMidiA) > 12);
+            bool movedB = (abs((int)calB - (int)lastMidiB) > 12);
+            bool movedC = (abs((int)calC - (int)lastMidiC) > 12);
 
 
+            // --- DISABLED FOR BENCH TESTING ---
+            //bool movedA = false; 
+            //bool movedB = false; 
+            //bool movedC = false;
 
-to this
-
-            int diffA = abs((int)calibratedA - (int)lastMidiA);
-            int diffB = abs((int)calibratedB - (int)lastMidiB);
-            
-            if (diffA > 256) {
-                if (isScreenOff) turnScreenOn();
-                lastScreenActivityTime = millis();
-            }
-
-            // ACTIVE MODE
-            bool movedA = diffA > 8;
-            bool movedB = false; // PB2 is forced OFF and will be completely ignored
+====================================
 
 
+            //bool movedA = (abs((int)calA - (int)lastMidiA) > 12);
+            //bool movedB = (abs((int)calB - (int)lastMidiB) > 12);
+            //bool movedC = (abs((int)calC - (int)lastMidiC) > 12);
 
-            or this
 
-
-            bool movedA = false; // PB1 is forced OFF and will be completely ignored
-            bool movedB = false;
+            // --- DISABLED FOR BENCH TESTING ---
+            bool movedA = false; 
+            bool movedB = false; 
+            bool movedC = false;
+====================================

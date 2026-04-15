@@ -1,6 +1,6 @@
-            bool movedA = (abs((int)calA - (int)lastMidiA) > 12);
-            bool movedB = (abs((int)calB - (int)lastMidiB) > 12);
-            bool movedC = (abs((int)calC - (int)lastMidiC) > 12);
+            bool moveA = (abs((int)calA - (int)lastMidiA) > 12);
+            bool moveB = (abs((int)calB - (int)lastMidiB) > 12);
+            bool moveC = (abs((int)calC - (int)lastMidiC) > 64);
 
 
             // --- DISABLED FOR BENCH TESTING ---

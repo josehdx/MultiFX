@@ -175,9 +175,9 @@ analog_t PBcenter2 = 8192;
 analog_t PBdeadzone2 = 950;
 bool PBwasOffCenter2 = false;
 
-FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB = pinPB;
-FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
-FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB3 = pinPB3;
+FilteredAnalog<12, 1, uint32_t, uint32_t> filterPB = pinPB;
+FilteredAnalog<12, 1, uint32_t, uint32_t> filterPB2 = pinPB2;
+FilteredAnalog<12, 1, uint32_t, uint32_t> filterPB3 = pinPB3;
 BluetoothMIDI_Interface btmidi;
 USBMIDI_Interface usbmidi;
 MIDI_PipeFactory<4> pipes;
@@ -186,11 +186,11 @@ MIDI_PipeFactory<4> pipes;
 analog_t map_PB_deadzone(analog_t raw, analog_t center, analog_t deadzone, bool &offCenterFlag) {
     raw = constrain(raw, PBminimumValue, PBmaximumValue);
     
-    if (raw <= PBminimumValue + 150) { 
+    if (raw <= PBminimumValue + 600) { 
         offCenterFlag = true; 
         return 0; 
     }
-    if (raw >= PBmaximumValue - 150) { 
+    if (raw >= PBmaximumValue - 600) { 
         offCenterFlag = true; 
         return 16383; 
     }
@@ -1448,9 +1448,9 @@ void setup() {
     digitalWrite(38, HIGH); 
     btmidi.setName("Whammy_S3"); 
     
-    pinMode(pinPB, INPUT_PULLDOWN); 
-    pinMode(pinPB2, INPUT_PULLDOWN); 
-    pinMode(pinPB3, INPUT_PULLDOWN);
+    pinMode(pinPB, INPUT); 
+    pinMode(pinPB2, INPUT); 
+    pinMode(pinPB3, INPUT);
     
     delayBuffer = (float*)heap_caps_aligned_alloc(16, MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     fbDelayBuffer = (float*)heap_caps_aligned_alloc(16, FB_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);

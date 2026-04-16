@@ -1196,7 +1196,7 @@ void MidiTask(void * pvParameters) {
             analog_t calA = map_PB_deadzone(map((int)smoothRawA, 0, 4095, 0, 16383), PBcenter1, PBdeadzone1, PBwasOffCenter1);
             analog_t calB = map_PB_deadzone(map((int)smoothRawB, 0, 4095, 0, 16383), PBcenter2, PBdeadzone2, PBwasOffCenter2);
             int conC = constrain((int)smoothRawC, 40, 4055); 
-            analog_t calC = map(conC, 40, 4055, 0, 16383); 
+            analog_t calC = map(conC, 40, 4055, 16383, 0); 
             
             if (calC < 150) {
                 calC = 0; 

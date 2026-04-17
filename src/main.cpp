@@ -171,7 +171,7 @@ uint16_t PB2_raw_center = 2048;
 uint16_t PB3_raw_min = 1000;
 uint16_t PB3_raw_max = 3000;
 
-int deadzone_size = 100; // Physical deadzone buffer for self-centering pedals
+int deadzone_size = 250; // Physical deadzone buffer for self-centering pedals
 
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB = pinPB;
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
@@ -1657,9 +1657,9 @@ void setup() {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLING_FREQUENCY), 
         .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
         .gpio_cfg = { 
-            .mclk = GPIO_NUM_13, 
-            .bclk = GPIO_NUM_12, 
-            .ws = GPIO_NUM_11, 
+            .mclk = GPIO_NUM_43, 
+            .bclk = GPIO_NUM_44, 
+            .ws = GPIO_NUM_18, 
             .dout = GPIO_NUM_16, 
             .din = GPIO_NUM_17 
         } 

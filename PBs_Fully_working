@@ -171,7 +171,7 @@ uint16_t PB2_raw_center = 2048;
 uint16_t PB3_raw_min = 1000;
 uint16_t PB3_raw_max = 3000;
 
-int deadzone_size = 250; // Physical deadzone buffer for self-centering pedals
+int deadzone_size = 400; // Increased to hide mechanical spring sag
 
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB = pinPB;
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
@@ -181,30 +181,34 @@ USBMIDI_Interface usbmidi;
 MIDI_PipeFactory<4> pipes;
 
 // --- DYNAMIC RAW DEADZONE MAPPING WITH DRIFT ANCHORS ---
-// Operates exclusively on constrained integers to prevent Underflow Jump bug
+// Safely handles inverted bounds and sloppy pedal springs
 analog_t map_raw_deadzone(float smoothRaw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
-    int raw = constrain((int)smoothRaw, rMin, rMax);
+    int raw = (int)smoothRaw;
     
-    // Massive 120-point lock zone to prevent floating/drifting at the edges
-    int lockZone = 120;
+    // Massive 200-point lock zone to absorb "rubber bumper squish" at max/min throw
+    int lockZone = 200; 
     
-    // Bottom Anchor Lock
-    if (raw <= (rMin + lockZone)) {
-        return 0;
-    }
+    int lowerLimit = rMin + lockZone;
+    int upperLimit = rMax - lockZone;
+    int deadLower = center - dZone;
+    int deadUpper = center + dZone;
+
+    // FAILSAFE: Prevent math inversions if the auto-tracker bounds are too tight at boot
+    if (lowerLimit >= deadLower) lowerLimit = deadLower - 1;
+    if (upperLimit <= deadUpper) upperLimit = deadUpper + 1;
+
+    // Bottom and Top Anchor Locks
+    if (raw <= lowerLimit) return 0;
+    if (raw >= upperLimit) return 16383; // Locks to +8191 in your DAW perfectly!
     
-    // Top Anchor Lock
-    if (raw >= (rMax - lockZone)) {
-        return 16383;
-    }
-    
-    // Smooth transition from the edge of the Anchor Lock to the Deadzone
-    if (raw < (center - dZone)) {
-        return map(raw, (rMin + lockZone), (center - dZone), 0, 8191);
-    } else if (raw > (center + dZone)) {
-        return map(raw, (center + dZone), (rMax - lockZone), 8191, 16383);
+    // Dead Center Lock
+    if (raw > deadLower && raw < deadUpper) return 8192;
+
+    // Smooth Monotonic Mapping
+    if (raw <= deadLower) {
+        return map(raw, lowerLimit, deadLower, 0, 8191);
     } else {
-        return 8192;
+        return map(raw, deadUpper, upperLimit, 8193, 16383);
     }
 }
 
@@ -257,12 +261,12 @@ void calibratePBs() {
         PB2_raw_center = 2048;
     }
     
-    // Set initial tight bounds around the center (will auto-expand when used)
-    PB1_raw_min = PB1_raw_center - 200; 
-    PB1_raw_max = PB1_raw_center + 200;
+    // Set initial tracking bounds tight enough that ANY pedal can push past them and auto-calibrate
+    PB1_raw_min = PB1_raw_center - 900; 
+    PB1_raw_max = PB1_raw_center + 900;
     
-    PB2_raw_min = PB2_raw_center - 200; 
-    PB2_raw_max = PB2_raw_center + 200;
+    PB2_raw_min = PB2_raw_center - 900; 
+    PB2_raw_max = PB2_raw_center + 900;
     
     if ((max3 - min3) < 100) {
         PB3_raw_min = 1000; 

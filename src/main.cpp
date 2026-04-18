@@ -195,13 +195,25 @@ analog_t map_raw_deadzone(float smoothRaw, uint16_t center, uint16_t rMin, uint1
     int deadLower = center - dZone;
     int deadUpper = center + dZone;
 
-    if (lowerLimit >= deadLower) lowerLimit = deadLower - 1;
-    if (upperLimit <= deadUpper) upperLimit = deadUpper + 1;
-
-    if (raw <= lowerLimit) return 0;
-    if (raw >= upperLimit) return 16383; 
+    if (lowerLimit >= deadLower) {
+        lowerLimit = deadLower - 1;
+    }
     
-    if (raw > deadLower && raw < deadUpper) return 8192;
+    if (upperLimit <= deadUpper) {
+        upperLimit = deadUpper + 1;
+    }
+
+    if (raw <= lowerLimit) {
+        return 0;
+    }
+    
+    if (raw >= upperLimit) {
+        return 16383; 
+    }
+    
+    if (raw > deadLower && raw < deadUpper) {
+        return 8192;
+    }
 
     if (raw <= deadLower) {
         return map(raw, lowerLimit, deadLower, 0, 8191);
@@ -216,21 +228,43 @@ analog_t map_raw_expression(int raw, uint16_t rMin, uint16_t rMax, bool invert) 
     int heelLockZone = 350; 
     int toeLockZone = 150;   
     
-    int lowerLimit, upperLimit;
+    int lowerLimit;
+    int upperLimit;
 
     if (!invert) {
         lowerLimit = rMin + heelLockZone;
         upperLimit = rMax - toeLockZone;
-        if (lowerLimit >= upperLimit) { lowerLimit = rMin; upperLimit = rMax; }
-        if (raw <= lowerLimit) return 0; 
-        if (raw >= upperLimit) return 16383; 
+        
+        if (lowerLimit >= upperLimit) { 
+            lowerLimit = rMin; 
+            upperLimit = rMax; 
+        }
+        
+        if (raw <= lowerLimit) {
+            return 0; 
+        }
+        if (raw >= upperLimit) {
+            return 16383; 
+        }
+        
         return map(raw, lowerLimit, upperLimit, 0, 16383);
+        
     } else {
         lowerLimit = rMin + toeLockZone;
         upperLimit = rMax - heelLockZone;
-        if (lowerLimit >= upperLimit) { lowerLimit = rMin; upperLimit = rMax; }
-        if (raw <= lowerLimit) return 16383; 
-        if (raw >= upperLimit) return 0; 
+        
+        if (lowerLimit >= upperLimit) { 
+            lowerLimit = rMin; 
+            upperLimit = rMax; 
+        }
+        
+        if (raw <= lowerLimit) {
+            return 16383; 
+        }
+        if (raw >= upperLimit) {
+            return 0; 
+        }
+        
         return map(raw, lowerLimit, upperLimit, 16383, 0);
     }
 }
@@ -360,6 +394,7 @@ inline float IRAM_ATTR processTap(uint32_t tapPhase, const float* buffer, int lo
 
 void updateLUT() {
     float basePitch = 0.0f; 
+    
     if (isCapoMode || (activeEffectMode == 4 && isWhammyActive)) { 
         basePitch += effectMemory[4]; 
     }
@@ -615,6 +650,7 @@ struct DebouncedButton {
                 changed = true; 
             } 
         }
+        
         lastReading = current; 
         return changed;
     }
@@ -781,6 +817,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             if (freezeRamp > 0.0f || frzActive) {
                 int start1 = (freezeStartIdxVar + freezePlayCounterVar) % freezeLength;
+                
                 if (start1 + HOP_SIZE > freezeLength) {
                     int p1 = freezeLength - start1;
                     memcpy(&freezeReadCache1[0], &freezeBuffer[start1], p1 * sizeof(float));
@@ -790,6 +827,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 }
                 
                 int start2 = (freezeStartIdxVar + freezePlayCounterVar + (freezeLength / 2)) % freezeLength;
+                
                 if (start2 + HOP_SIZE > freezeLength) {
                     int p1 = freezeLength - start2;
                     memcpy(&freezeReadCache2[0], &freezeBuffer[start2], p1 * sizeof(float));
@@ -801,6 +839,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             if (feedbackActive || feedbackRamp > 0.0f) {
                 int fbReadStart = (fbDelayWriteIdx - (int)(SAMPLING_FREQUENCY * 0.02f) + FB_BUFFER_SIZE) & FB_BUFFER_MASK;
+                
                 if (fbReadStart + HOP_SIZE > FB_BUFFER_SIZE) {
                     int p1 = FB_BUFFER_SIZE - fbReadStart;
                     memcpy(&fbReadCache[0], &fbDelayBuffer[fbReadStart], p1 * sizeof(float));
@@ -921,9 +960,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 if (vibratoActive) {
                     vibratoLfoPhase += globalVibratoPhaseInc; 
+                    
                     if (vibratoLfoPhase >= LFO_LUT_SIZE) { 
                         vibratoLfoPhase -= LFO_LUT_SIZE; 
                     }
+                    
                     spd1 *= lfoLUT[(int)vibratoLfoPhase];
                 }
                 
@@ -932,9 +973,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 if (chorusActive) { 
                     chorusLfoPhase += chorusPhaseIncr; 
+                    
                     if (chorusLfoPhase >= LFO_LUT_SIZE) { 
                         chorusLfoPhase -= LFO_LUT_SIZE; 
                     }
+                    
                     spd3 *= lfoLUT[(int)chorusLfoPhase]; 
                 }
                 
@@ -943,9 +986,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 if (feedbackActive || feedbackRamp > 0.0f) { 
                     feedbackLfoPhase += feedbackPhaseIncr; 
+                    
                     if (feedbackLfoPhase >= LFO_LUT_SIZE) { 
                         feedbackLfoPhase -= LFO_LUT_SIZE; 
                     }
+                    
                     float lfoVal = lfoLUT[(int)feedbackLfoPhase]; 
                     spd4 = lfoVal; 
                     spd5 = pitchShiftFactor * globalFbRatio * lfoVal; 
@@ -1180,13 +1225,13 @@ void MidiTask(void * pvParameters) {
     static bool lastBtState = false; 
     static uint8_t lastVolumeCC = 127;
     
-    static float smoothRawA = -1.0f;
-    static float smoothRawB = -1.0f;
-    
+    static int stableRawA = -1;
+    static int stableRawB = -1;
     static int stableRawC = -1;
     
     static bool unpluggedA = false;
     static bool unpluggedB = false;
+    static bool unpluggedC = false;
     
     static DebouncedButton carouselBtn(CAROUSEL_BUTTON_PIN); 
     carouselBtn.state = digitalRead(CAROUSEL_BUTTON_PIN); 
@@ -1262,49 +1307,64 @@ void MidiTask(void * pvParameters) {
                 unpluggedB = false;
             }
             
-            if (smoothRawA < 0) {
-                smoothRawA = rawA;
+            // PB3 Hardware Unplug Detection (Restored to INPUT_PULLUP logic)
+            // 4095 is absolute max. Physical pedals usually max around 3000-3800.
+            if (rawC >= 4094) {
+                unpluggedC = true;
+            } else if (rawC < 4050) {
+                unpluggedC = false;
             }
-            smoothRawA = smoothRawA * 0.5f + (float)rawA * 0.5f; 
             
-            if (smoothRawB < 0) {
-                smoothRawB = rawB;
+            if (stableRawA < 0) {
+                stableRawA = rawA;
             }
-            smoothRawB = smoothRawB * 0.5f + (float)rawB * 0.5f; 
+            if (abs((int)rawA - stableRawA) > 6) {
+                stableRawA = rawA;
+            }
             
-            // --- STRICT INTEGER GATING TO KILL PB3 CREEP ---
-            if (stableRawC < 0) stableRawC = rawC;
-            if (abs((int)rawC - stableRawC) > 16) stableRawC = rawC; 
+            if (stableRawB < 0) {
+                stableRawB = rawB;
+            }
+            if (abs((int)rawB - stableRawB) > 6) {
+                stableRawB = rawB;
+            }
+            
+            if (stableRawC < 0) {
+                stableRawC = rawC;
+            }
+            if (abs((int)rawC - stableRawC) > 16) {
+                stableRawC = rawC;
+            }
             
             if (!unpluggedA) {
-                if (smoothRawA < PB1_raw_min && smoothRawA > 100) {
-                    PB1_raw_min = smoothRawA;
+                if (stableRawA < PB1_raw_min && stableRawA > 100) {
+                    PB1_raw_min = stableRawA;
                 }
-                if (smoothRawA > PB1_raw_max && smoothRawA < 4050) {
-                    PB1_raw_max = smoothRawA;
+                if (stableRawA > PB1_raw_max && stableRawA < 4050) {
+                    PB1_raw_max = stableRawA;
                 }
             }
             
             if (!unpluggedB) {
-                if (smoothRawB < PB2_raw_min && smoothRawB > 100) {
-                    PB2_raw_min = smoothRawB;
+                if (stableRawB < PB2_raw_min && stableRawB > 100) {
+                    PB2_raw_min = stableRawB;
                 }
-                if (smoothRawB > PB2_raw_max && smoothRawB < 4050) {
-                    PB2_raw_max = smoothRawB;
+                if (stableRawB > PB2_raw_max && stableRawB < 4050) {
+                    PB2_raw_max = stableRawB;
                 }
             }
             
-            // PB3 stretches infinitely to match your specific hardware limits
-            if (stableRawC < PB3_raw_min && stableRawC >= 0) {
-                PB3_raw_min = stableRawC;
-            }
-            if (stableRawC > PB3_raw_max && stableRawC <= 4095) {
-                PB3_raw_max = stableRawC;
+            if (!unpluggedC) {
+                if (stableRawC < PB3_raw_min && stableRawC >= 0) {
+                    PB3_raw_min = stableRawC;
+                }
+                if (stableRawC > PB3_raw_max && stableRawC <= 4095) {
+                    PB3_raw_max = stableRawC;
+                }
             }
             
-            // Map the pedals cleanly using the stable bounds and correct inversion math
-            analog_t calA = map_raw_deadzone(smoothRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
-            analog_t calB = map_raw_deadzone(smoothRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
+            analog_t calA = map_raw_deadzone(stableRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
+            analog_t calB = map_raw_deadzone(stableRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
             analog_t calC = map_raw_expression(stableRawC, PB3_raw_min, PB3_raw_max, INVERT_PB3);
             
             if (unpluggedA) {
@@ -1313,12 +1373,14 @@ void MidiTask(void * pvParameters) {
             if (unpluggedB) {
                 calB = 8192;
             }
+            if (unpluggedC) {
+                // Centers to exactly middle pitch bend (0 in DAW)
+                calC = 8192; 
+            }
             
             bool moveA = (abs((int)calA - (int)lastMidiA) > 12) || ((calA == 8192 || calA == 0 || calA == 16383) && calA != lastMidiA);
             bool moveB = (abs((int)calB - (int)lastMidiB) > 12) || ((calB == 8192 || calB == 0 || calB == 16383) && calB != lastMidiB);
-            
-            // --- MIDI HYSTERESIS WALL ---
-            bool moveC = (abs((int)calC - (int)lastMidiC) >= 128) || ((calC == 0 || calC == 16383) && calC != lastMidiC);
+            bool moveC = (abs((int)calC - (int)lastMidiC) >= 128) || ((calC == 0 || calC == 16383) && calC != lastMidiC) || (calC == 8192 && calC != lastMidiC);
             
             if (moveA || moveB || moveC) {
                 if (isScreenOff) { 
@@ -1586,7 +1648,9 @@ void setup() {
     
     pinMode(pinPB, INPUT_PULLUP); 
     pinMode(pinPB2, INPUT_PULLUP); 
-    pinMode(pinPB3, INPUT_PULLUP);
+    
+    // --- PB3 Reverted back to PULLUP ---
+    pinMode(pinPB3, INPUT_PULLUP); 
     
     delayBuffer = (float*)heap_caps_aligned_alloc(16, MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     fbDelayBuffer = (float*)heap_caps_aligned_alloc(16, FB_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);

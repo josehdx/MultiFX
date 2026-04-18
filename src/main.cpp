@@ -185,9 +185,7 @@ USBMIDI_Interface usbmidi;
 MIDI_PipeFactory<4> pipes;
 
 // --- DYNAMIC RAW DEADZONE MAPPING (PB1 & PB2) ---
-analog_t map_raw_deadzone(float smoothRaw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
-    int raw = (int)smoothRaw;
-    
+analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
     int lockZone = 200; 
     
     int lowerLimit = rMin + lockZone;
@@ -1231,7 +1229,6 @@ void MidiTask(void * pvParameters) {
     
     static bool unpluggedA = false;
     static bool unpluggedB = false;
-    static bool unpluggedC = false;
     
     static DebouncedButton carouselBtn(CAROUSEL_BUTTON_PIN); 
     carouselBtn.state = digitalRead(CAROUSEL_BUTTON_PIN); 
@@ -1307,14 +1304,6 @@ void MidiTask(void * pvParameters) {
                 unpluggedB = false;
             }
             
-            // PB3 Hardware Unplug Detection (Restored to INPUT_PULLUP logic)
-            // 4095 is absolute max. Physical pedals usually max around 3000-3800.
-            if (rawC >= 4094) {
-                unpluggedC = true;
-            } else if (rawC < 4050) {
-                unpluggedC = false;
-            }
-            
             if (stableRawA < 0) {
                 stableRawA = rawA;
             }
@@ -1354,13 +1343,11 @@ void MidiTask(void * pvParameters) {
                 }
             }
             
-            if (!unpluggedC) {
-                if (stableRawC < PB3_raw_min && stableRawC >= 0) {
-                    PB3_raw_min = stableRawC;
-                }
-                if (stableRawC > PB3_raw_max && stableRawC <= 4095) {
-                    PB3_raw_max = stableRawC;
-                }
+            if (stableRawC < PB3_raw_min && stableRawC >= 0) {
+                PB3_raw_min = stableRawC;
+            }
+            if (stableRawC > PB3_raw_max && stableRawC <= 4095) {
+                PB3_raw_max = stableRawC;
             }
             
             analog_t calA = map_raw_deadzone(stableRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
@@ -1373,14 +1360,11 @@ void MidiTask(void * pvParameters) {
             if (unpluggedB) {
                 calB = 8192;
             }
-            if (unpluggedC) {
-                // Centers to exactly middle pitch bend (0 in DAW)
-                calC = 8192; 
-            }
             
             bool moveA = (abs((int)calA - (int)lastMidiA) > 12) || ((calA == 8192 || calA == 0 || calA == 16383) && calA != lastMidiA);
             bool moveB = (abs((int)calB - (int)lastMidiB) > 12) || ((calB == 8192 || calB == 0 || calB == 16383) && calB != lastMidiB);
-            bool moveC = (abs((int)calC - (int)lastMidiC) >= 128) || ((calC == 0 || calC == 16383) && calC != lastMidiC) || (calC == 8192 && calC != lastMidiC);
+            
+            bool moveC = (abs((int)calC - (int)lastMidiC) >= 128) || ((calC == 0 || calC == 16383) && calC != lastMidiC);
             
             if (moveA || moveB || moveC) {
                 if (isScreenOff) { 
@@ -1648,8 +1632,6 @@ void setup() {
     
     pinMode(pinPB, INPUT_PULLUP); 
     pinMode(pinPB2, INPUT_PULLUP); 
-    
-    // --- PB3 Reverted back to PULLUP ---
     pinMode(pinPB3, INPUT_PULLUP); 
     
     delayBuffer = (float*)heap_caps_aligned_alloc(16, MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);

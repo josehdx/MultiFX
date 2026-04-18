@@ -11,6 +11,10 @@
 #include "driver/rtc_io.h"
 #include <math.h>
 
+// --- PEDAL CONFIGURATION ---
+// Set to 'true' ONLY if your pedal is backwards (Max Toe = 0, Heel = 16383)
+const bool INVERT_PB3 = true; 
+
 // --- BARE-METAL PRE-BOOT ASSASSIN ---
 void __attribute__((constructor)) pre_boot_kill_switch() {
     gpio_set_direction(GPIO_NUM_38, GPIO_MODE_OUTPUT);
@@ -208,24 +212,36 @@ analog_t map_raw_deadzone(float smoothRaw, uint16_t center, uint16_t rMin, uint1
 }
 
 // --- DYNAMIC RAW EXPRESSION MAPPING (PB3) ---
-analog_t map_raw_expression(float smoothRaw, uint16_t rMin, uint16_t rMax) {
+analog_t map_raw_expression(float smoothRaw, uint16_t rMin, uint16_t rMax, bool invert) {
     int raw = (int)smoothRaw;
     
-    int toeLockZone = 50;   // Less deadzone on the toe
-    int heelLockZone = 350; // More deadzone on the heel
+    // Asymmetrical Swept Area Locks
+    int heelLockZone = 250; 
+    int toeLockZone = 40;   
     
-    int lowerLimit = rMin + toeLockZone;
-    int upperLimit = rMax - heelLockZone;
+    int lowerLimit, upperLimit;
 
-    if (lowerLimit >= upperLimit) {
-        lowerLimit = rMin;
-        upperLimit = rMax;
+    if (!invert) {
+        // Normal Direction
+        lowerLimit = rMin + heelLockZone;
+        upperLimit = rMax - toeLockZone;
+
+        if (lowerLimit >= upperLimit) { lowerLimit = rMin; upperLimit = rMax; }
+
+        if (raw <= lowerLimit) return 0; 
+        if (raw >= upperLimit) return 16383; 
+        return map(raw, lowerLimit, upperLimit, 0, 16383);
+    } else {
+        // Inverted Direction
+        lowerLimit = rMin + toeLockZone;
+        upperLimit = rMax - heelLockZone;
+
+        if (lowerLimit >= upperLimit) { lowerLimit = rMin; upperLimit = rMax; }
+
+        if (raw <= lowerLimit) return 16383; 
+        if (raw >= upperLimit) return 0; 
+        return map(raw, lowerLimit, upperLimit, 16383, 0);
     }
-
-    if (raw <= lowerLimit) return 16383; 
-    if (raw >= upperLimit) return 0;
-    
-    return map(raw, lowerLimit, upperLimit, 16383, 0);
 }
 
 void calibratePBs() {
@@ -238,28 +254,14 @@ void calibratePBs() {
     
     long sum1 = 0;
     long sum2 = 0;
-    uint16_t min3 = 4095;
-    uint16_t max3 = 0;
     
     for (int i = 1; i <= 250; i++) {
         filterPB.update(); 
         filterPB2.update(); 
         filterPB3.update();
         
-        uint16_t r1 = filterPB.getValue();
-        uint16_t r2 = filterPB2.getValue();
-        uint16_t r3 = filterPB3.getValue();
-        
-        sum1 += r1; 
-        sum2 += r2;
-        
-        if (r3 < min3) {
-            min3 = r3;
-        }
-        if (r3 > max3) {
-            max3 = r3;
-        }
-        
+        sum1 += filterPB.getValue(); 
+        sum2 += filterPB2.getValue();
         delay(1);
     }
     
@@ -280,13 +282,8 @@ void calibratePBs() {
     PB2_raw_min = PB2_raw_center - 900; 
     PB2_raw_max = PB2_raw_center + 900;
     
-    if ((max3 - min3) < 100) {
-        PB3_raw_min = 1000; 
-        PB3_raw_max = 3000; 
-    } else {
-        PB3_raw_min = min3; 
-        PB3_raw_max = max3;
-    }
+    PB3_raw_min = 1000; 
+    PB3_raw_max = 3000; 
 }
 
 // --- LCD & SLEEP CONTROL ---
@@ -1196,9 +1193,12 @@ void MidiTask(void * pvParameters) {
     static float smoothRawB = -1.0f;
     static float smoothRawC = -1.0f;
     
+    static int stableRawA = -1;
+    static int stableRawB = -1;
+    static int stableRawC = -1;
+    
     static bool unpluggedA = false;
     static bool unpluggedB = false;
-    static bool unpluggedC = false;
     
     static DebouncedButton carouselBtn(CAROUSEL_BUTTON_PIN); 
     carouselBtn.state = digitalRead(CAROUSEL_BUTTON_PIN); 
@@ -1262,7 +1262,7 @@ void MidiTask(void * pvParameters) {
             analog_t rawB = filterPB2.getValue();
             analog_t rawC = filterPB3.getValue();
             
-            // --- HYSTERESIS UNPLUG DETECTION (UNIVERSAL PORTS) ---
+            // --- HYSTERESIS UNPLUG DETECTION FOR SPRING PEDALS ONLY ---
             if (rawA >= 4094) {
                 unpluggedA = true;
             } else if (rawA < 4050) {
@@ -1275,33 +1275,54 @@ void MidiTask(void * pvParameters) {
                 unpluggedB = false;
             }
             
-            if (rawC >= 4094) {
-                unpluggedC = true;
-            } else if (rawC < 4050) {
-                unpluggedC = false;
-            }
+            // --- RAW INTEGER DEADBAND ---
+            // Lowered to 8 so the Heel stays highly responsive, as requested!
+            if (stableRawA < 0) stableRawA = rawA;
+            if (abs((int)rawA - stableRawA) > 6) stableRawA = rawA;
             
+            if (stableRawB < 0) stableRawB = rawB;
+            if (abs((int)rawB - stableRawB) > 6) stableRawB = rawB;
+            
+            if (stableRawC < 0) stableRawC = rawC;
+            if (abs((int)rawC - stableRawC) > 8) stableRawC = rawC;
+            
+            // --- BUTTERY SMOOTH EMA FILTERS ---
             if (smoothRawA < 0) {
-                smoothRawA = rawA;
+                smoothRawA = stableRawA;
             }
-            smoothRawA = smoothRawA * 0.5f + (float)rawA * 0.5f; 
+            smoothRawA = smoothRawA * 0.5f + (float)stableRawA * 0.5f; 
             
             if (smoothRawB < 0) {
-                smoothRawB = rawB;
+                smoothRawB = stableRawB;
             }
-            smoothRawB = smoothRawB * 0.5f + (float)rawB * 0.5f; 
+            smoothRawB = smoothRawB * 0.5f + (float)stableRawB * 0.5f; 
             
             if (smoothRawC < 0) {
-                smoothRawC = rawC;
+                smoothRawC = stableRawC;
             }
-            smoothRawC = smoothRawC * 0.9f + (float)rawC * 0.1f;
             
-            // --- CONTINUOUS AUTO-TRACKER (UNIVERSAL PORTS) ---
+            // --- DYNAMIC ADAPTIVE EMA FILTER (THE ULTIMATE SMOOTHER) ---
+            float diffC = abs((float)stableRawC - smoothRawC);
+            float alphaC;
+            
+            if (diffC > 150.0f) {
+                alphaC = 0.8f;      // Fast Stomp -> Instant response, near zero filtering
+            } else if (diffC > 30.0f) {
+                alphaC = 0.3f;      // Normal Sweep -> Buttery smooth tracking
+            } else if (diffC > 8.0f) {
+                alphaC = 0.05f;     // Slow Creep -> Heavy friction to stabilize the output
+            } else {
+                alphaC = 0.01f;     // Resting Noise -> Cement block (kills decimal creep completely)
+            }
+            
+            smoothRawC = smoothRawC * (1.0f - alphaC) + (float)stableRawC * alphaC; 
+            
+            // --- CONTINUOUS AUTO-TRACKER ---
             if (!unpluggedA) {
                 if (smoothRawA < PB1_raw_min && smoothRawA > 100) {
                     PB1_raw_min = smoothRawA;
                 }
-                if (smoothRawA > PB1_raw_max && smoothRawA < 4090) {
+                if (smoothRawA > PB1_raw_max && smoothRawA < 4050) {
                     PB1_raw_max = smoothRawA;
                 }
             }
@@ -1310,43 +1331,66 @@ void MidiTask(void * pvParameters) {
                 if (smoothRawB < PB2_raw_min && smoothRawB > 100) {
                     PB2_raw_min = smoothRawB;
                 }
-                if (smoothRawB > PB2_raw_max && smoothRawB < 4090) {
+                if (smoothRawB > PB2_raw_max && smoothRawB < 4050) {
                     PB2_raw_max = smoothRawB;
                 }
             }
             
-            if (!unpluggedC) {
-                if (smoothRawC < PB3_raw_min && smoothRawC > 100) {
-                    PB3_raw_min = smoothRawC;
-                }
-                if (smoothRawC > PB3_raw_max && smoothRawC < 4090) {
-                    PB3_raw_max = smoothRawC;
-                }
+            // PB3 stretches infinitely to match your specific hardware limits
+            if (smoothRawC < PB3_raw_min && smoothRawC >= 0) {
+                PB3_raw_min = smoothRawC;
+            }
+            if (smoothRawC > PB3_raw_max && smoothRawC <= 4095) {
+                PB3_raw_max = smoothRawC;
             }
             
-            // Map the pedals cleanly using the dynamic bounds and heavy anchors
+            // Map the pedals cleanly using the stable bounds and correct inversion math
             analog_t calA = map_raw_deadzone(smoothRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
             analog_t calB = map_raw_deadzone(smoothRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
-            analog_t calC = map_raw_expression(smoothRawC, PB3_raw_min, PB3_raw_max);
+            analog_t calC = map_raw_expression(smoothRawC, PB3_raw_min, PB3_raw_max, INVERT_PB3);
             
-            // Enforce center if unplugged
+            // Enforce center if unplugged (ONLY for spring-loaded pedals)
             if (unpluggedA) {
                 calA = 8192;
             }
             if (unpluggedB) {
                 calB = 8192;
             }
-            if (unpluggedC) {
-                calC = 8192;
-            }
             
-            // --- ABSOLUTE ANCHOR FORCING & HYSTERESIS ---
+            // --- MOVEMENT FILTERS ---
             bool moveA = (abs((int)calA - (int)lastMidiA) > 12) || ((calA == 8192 || calA == 0 || calA == 16383) && calA != lastMidiA);
             bool moveB = (abs((int)calB - (int)lastMidiB) > 12) || ((calB == 8192 || calB == 0 || calB == 16383) && calB != lastMidiB);
             
-            // PB3 (Expression) gets a wider hysteresis (48) to prevent data flooding from resting jitter, 
-            // but still snaps perfectly to 0 and 16383 at the extremes!
-            bool moveC = (abs((int)calC - (int)lastMidiC) > 48) || ((calC == 0 || calC == 16383) && calC != lastMidiC);
+            // --- POSITION-AWARE SMART MIDI GATE (ANTI-FLOODING) ---
+            bool moveC = false;
+            static unsigned long lastMoveTimeC = 0;
+            
+            // Calculate a dynamic threshold based on WHERE the pedal is resting!
+            int dynamicThresholdC = 16; // Default to very sensitive
+            
+            if (lastMidiC > 14000) {
+                // TOE POSITION: Heavy lock to completely crush jitter.
+                dynamicThresholdC = 128;
+            } else if (lastMidiC >= 2000 && lastMidiC <= 14000) {
+                // MIDDLE POSITION: Strong lock to prevent resting flood.
+                dynamicThresholdC = 80;
+            } else {
+                // HEEL POSITION (< 2000): Left highly sensitive and unfiltered, exactly as requested!
+                dynamicThresholdC = 16;
+            }
+            
+            // If the pedal moves enough to break its zone's threshold (or hits an absolute edge), open the gate!
+            if (abs((int)calC - (int)lastMidiC) > dynamicThresholdC || ((calC == 0 || calC == 16383) && calC != lastMidiC)) {
+                moveC = true;
+                lastMoveTimeC = millis();
+            } 
+            // Settling Tail: For 200ms after a big move, lower the threshold to 4 so it glides to a smooth stop.
+            else if (millis() - lastMoveTimeC < 200) {
+                if (abs((int)calC - (int)lastMidiC) > 4) {
+                    moveC = true;
+                    lastMoveTimeC = millis(); 
+                }
+            }
             
             if (moveA || moveB || moveC) {
                 if (isScreenOff) { 

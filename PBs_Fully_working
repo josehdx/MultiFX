@@ -185,7 +185,9 @@ USBMIDI_Interface usbmidi;
 MIDI_PipeFactory<4> pipes;
 
 // --- DYNAMIC RAW DEADZONE MAPPING (PB1 & PB2) ---
-analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
+analog_t map_raw_deadzone(float smoothRaw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
+    int raw = (int)smoothRaw;
+    
     int lockZone = 200; 
     
     int lowerLimit = rMin + lockZone;
@@ -210,7 +212,7 @@ analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax
 
 // --- DYNAMIC RAW EXPRESSION MAPPING (PB3) ---
 analog_t map_raw_expression(int raw, uint16_t rMin, uint16_t rMax, bool invert) {
-    // Massive Lock zones to absorb all mechanical sag at endpoints
+    // Massive Lock zones to absorb mechanical sag at endpoints
     int heelLockZone = 350; 
     int toeLockZone = 150;   
     
@@ -1181,6 +1183,8 @@ void MidiTask(void * pvParameters) {
     static float smoothRawA = -1.0f;
     static float smoothRawB = -1.0f;
     
+    static int stableRawC = -1;
+    
     static bool unpluggedA = false;
     static bool unpluggedB = false;
     
@@ -1198,13 +1202,25 @@ void MidiTask(void * pvParameters) {
         if (currentBtState != lastBtState) { 
             lastBtState = currentBtState; 
             forceUIUpdate = true; 
-            if (isScreenOff) turnScreenOn(); 
+            
+            if (isScreenOff) { 
+                turnScreenOn(); 
+            }
+            
             lastActivityTime = millis(); 
         }
         
-        if (currentBtState) lastActivityTime = millis(); 
-        if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) goToLightSleep(); 
-        if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) turnScreenOff(); 
+        if (currentBtState) { 
+            lastActivityTime = millis(); 
+        }
+        
+        if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) { 
+            goToLightSleep(); 
+        }
+        
+        if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) { 
+            turnScreenOff(); 
+        }
         
         if (carouselBtn.update(100)) {
             if (carouselBtn.state == LOW) { 
@@ -1214,8 +1230,12 @@ void MidiTask(void * pvParameters) {
                 carouselBtn.isActive = false; 
                 if (millis() - carouselBtn.pressedTime < 400) { 
                     activeEffectMode = (activeEffectMode + 1) % 10; 
-                    chorusLfoPhase = 0.0f; feedbackLfoPhase = 0.0f; vibratoLfoPhase = 0.0f; swellGain = 0.0f; 
-                    isWhammyActive = true; updateLUT(); 
+                    chorusLfoPhase = 0.0f; 
+                    feedbackLfoPhase = 0.0f; 
+                    vibratoLfoPhase = 0.0f; 
+                    swellGain = 0.0f; 
+                    isWhammyActive = true; 
+                    updateLUT(); 
                 } 
                 forceUIUpdate = true;
             }
@@ -1230,82 +1250,114 @@ void MidiTask(void * pvParameters) {
             analog_t rawB = filterPB2.getValue();
             analog_t rawC = filterPB3.getValue();
             
-            if (rawA >= 4094) unpluggedA = true; 
-            else if (rawA < 4050) unpluggedA = false;
+            if (rawA >= 4094) {
+                unpluggedA = true;
+            } else if (rawA < 4050) {
+                unpluggedA = false;
+            }
             
-            if (rawB >= 4094) unpluggedB = true; 
-            else if (rawB < 4050) unpluggedB = false;
+            if (rawB >= 4094) {
+                unpluggedB = true;
+            } else if (rawB < 4050) {
+                unpluggedB = false;
+            }
             
-            // PB1 and PB2 EMA Filters
-            if (smoothRawA < 0) smoothRawA = rawA;
+            if (smoothRawA < 0) {
+                smoothRawA = rawA;
+            }
             smoothRawA = smoothRawA * 0.5f + (float)rawA * 0.5f; 
             
-            if (smoothRawB < 0) smoothRawB = rawB;
+            if (smoothRawB < 0) {
+                smoothRawB = rawB;
+            }
             smoothRawB = smoothRawB * 0.5f + (float)rawB * 0.5f; 
             
-            // --- PB3 EMA FILTER (Smooth out raw ADC noise before mapping) ---
-            static float smoothRawC = -1.0f;
-            if (smoothRawC < 0) smoothRawC = rawC;
-            smoothRawC = smoothRawC * 0.8f + (float)rawC * 0.2f; 
-            int processedRawC = (int)smoothRawC;
+            // --- STRICT INTEGER GATING TO KILL PB3 CREEP ---
+            if (stableRawC < 0) stableRawC = rawC;
+            if (abs((int)rawC - stableRawC) > 16) stableRawC = rawC; 
             
-            // Auto Trackers
             if (!unpluggedA) {
-                if (smoothRawA < PB1_raw_min && smoothRawA > 100) PB1_raw_min = smoothRawA;
-                if (smoothRawA > PB1_raw_max && smoothRawA < 4050) PB1_raw_max = smoothRawA;
+                if (smoothRawA < PB1_raw_min && smoothRawA > 100) {
+                    PB1_raw_min = smoothRawA;
+                }
+                if (smoothRawA > PB1_raw_max && smoothRawA < 4050) {
+                    PB1_raw_max = smoothRawA;
+                }
             }
             
             if (!unpluggedB) {
-                if (smoothRawB < PB2_raw_min && smoothRawB > 100) PB2_raw_min = smoothRawB;
-                if (smoothRawB > PB2_raw_max && smoothRawB < 4050) PB2_raw_max = smoothRawB;
+                if (smoothRawB < PB2_raw_min && smoothRawB > 100) {
+                    PB2_raw_min = smoothRawB;
+                }
+                if (smoothRawB > PB2_raw_max && smoothRawB < 4050) {
+                    PB2_raw_max = smoothRawB;
+                }
             }
             
-            if (processedRawC < PB3_raw_min && processedRawC >= 0) PB3_raw_min = processedRawC;
-            if (processedRawC > PB3_raw_max && processedRawC <= 4095) PB3_raw_max = processedRawC;
+            // PB3 stretches infinitely to match your specific hardware limits
+            if (stableRawC < PB3_raw_min && stableRawC >= 0) {
+                PB3_raw_min = stableRawC;
+            }
+            if (stableRawC > PB3_raw_max && stableRawC <= 4095) {
+                PB3_raw_max = stableRawC;
+            }
             
-            // Map Values
+            // Map the pedals cleanly using the stable bounds and correct inversion math
             analog_t calA = map_raw_deadzone(smoothRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
             analog_t calB = map_raw_deadzone(smoothRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
-            analog_t calC = map_raw_expression(processedRawC, PB3_raw_min, PB3_raw_max, INVERT_PB3);
+            analog_t calC = map_raw_expression(stableRawC, PB3_raw_min, PB3_raw_max, INVERT_PB3);
             
-            if (unpluggedA) calA = 8192; 
-            if (unpluggedB) calB = 8192;
-            
-            bool moveA = (abs((int)calA - (int)lastMidiA) > 16) || ((calA == 8192 || calA == 0 || calA == 16383) && calA != lastMidiA);
-            bool moveB = (abs((int)calB - (int)lastMidiB) > 16) || ((calB == 8192 || calB == 0 || calB == 16383) && calB != lastMidiB);
-            
-            // --- ABSOLUTE HYSTERESIS GATE FOR PB3 ---
-            // The pedal MUST move by a rigid 128 points to break the gate. 
-            // Electrical noise cannot bypass this wall. It guarantees absolute silence when resting!
-            bool moveC = false;
-            if (calC == 0 && lastMidiC != 0) {
-                moveC = true;
-            } else if (calC == 16383 && lastMidiC != 16383) {
-                moveC = true;
-            } else if (abs((int)calC - (int)lastMidiC) >= 128) {
-                moveC = true;
+            if (unpluggedA) {
+                calA = 8192;
+            }
+            if (unpluggedB) {
+                calB = 8192;
             }
             
+            bool moveA = (abs((int)calA - (int)lastMidiA) > 12) || ((calA == 8192 || calA == 0 || calA == 16383) && calA != lastMidiA);
+            bool moveB = (abs((int)calB - (int)lastMidiB) > 12) || ((calB == 8192 || calB == 0 || calB == 16383) && calB != lastMidiB);
+            
+            // --- MIDI HYSTERESIS WALL ---
+            bool moveC = (abs((int)calC - (int)lastMidiC) >= 128) || ((calC == 0 || calC == 16383) && calC != lastMidiC);
+            
             if (moveA || moveB || moveC) {
-                if (isScreenOff) turnScreenOn(); 
+                if (isScreenOff) { 
+                    turnScreenOn(); 
+                }
+                
                 lastScreenActivityTime = millis();
                 
                 if (moveA) { 
-                    if (!isVolumeMode) Control_Surface.sendPitchBend(Channel_1, calA); 
-                    lastMidiA = calA; currentPB1 = calA; 
+                    if (!isVolumeMode) { 
+                        Control_Surface.sendPitchBend(Channel_1, calA); 
+                    }
+                    lastMidiA = calA; 
+                    currentPB1 = calA; 
                 }
                 
                 if (moveB) { 
-                    if (!isVolumeMode) Control_Surface.sendPitchBend(Channel_2, calB); 
-                    lastMidiB = calB; currentPB2 = calB; 
+                    if (!isVolumeMode) { 
+                        Control_Surface.sendPitchBend(Channel_2, calB); 
+                    }
+                    lastMidiB = calB; 
+                    currentPB2 = calB; 
                 }
                 
                 if (moveC) { 
-                    if (!isVolumeMode) Control_Surface.sendPitchBend(Channel_3, calC); 
-                    lastMidiC = calC; currentPB3 = calC; 
+                    if (!isVolumeMode) { 
+                        Control_Surface.sendPitchBend(Channel_3, calC); 
+                    }
+                    lastMidiC = calC; 
+                    currentPB3 = calC; 
                 }
                 
-                analog_t activePedal = moveC ? calC : (moveB ? calB : calA);
+                analog_t activePedal = calA;
+                
+                if (moveC) { 
+                    activePedal = calC; 
+                } else if (moveB) { 
+                    activePedal = calB; 
+                }
                 
                 if (isVolumeMode) { 
                     uint8_t vCC = map(activePedal, 0, 16383, 0, 127); 
@@ -1326,11 +1378,19 @@ void MidiTask(void * pvParameters) {
                 Control_Surface.sendPitchBend(Channel_2, 8192);
                 Control_Surface.sendPitchBend(Channel_3, 8192);
                 
-                lastMidiA = 8192; lastMidiB = 8192; lastMidiC = 8192; 
-                currentPB1 = 8192; currentPB2 = 8192; currentPB3 = 8192; 
+                lastMidiA = 8192; 
+                lastMidiB = 8192; 
+                lastMidiC = 8192; 
                 
-                if (!isVolumeMode) pitchShiftFactor = pitchShiftLUT[8192]; 
-                else volumePedalGain = 8192.0f / 16383.0f; 
+                currentPB1 = 8192; 
+                currentPB2 = 8192; 
+                currentPB3 = 8192; 
+                
+                if (!isVolumeMode) { 
+                    pitchShiftFactor = pitchShiftLUT[8192]; 
+                } else { 
+                    volumePedalGain = 8192.0f / 16383.0f; 
+                }
                 
                 forceUIUpdate = true;
             }
@@ -1345,16 +1405,24 @@ bool channelMessageCallback(ChannelMessage cm) {
     if (cm.header == 0xB0) {
         if (cm.data1 == 20) { 
             isVolumeMode = (cm.data2 >= 64); 
-            if (!isVolumeMode) volumePedalGain = 1.0f; 
+            if (!isVolumeMode) { 
+                volumePedalGain = 1.0f; 
+            } 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 4 && cm.data2 >= 64) { 
-            activeEffectMode = (activeEffectMode == 0) ? 9 : activeEffectMode - 1; 
-            updateLUT(); forceUIUpdate = true; 
+            if (activeEffectMode == 0) { 
+                activeEffectMode = 9; 
+            } else { 
+                activeEffectMode = activeEffectMode - 1; 
+            }
+            updateLUT(); 
+            forceUIUpdate = true; 
         }
         else if (cm.data1 == 5 && cm.data2 >= 64) { 
             activeEffectMode = (activeEffectMode + 1) % 10; 
-            updateLUT(); forceUIUpdate = true; 
+            updateLUT(); 
+            forceUIUpdate = true; 
         }
         else if (cm.data1 == 6 && cm.data2 >= 64) { 
             latencyMode = (latencyMode + 1) % 4; 
@@ -1363,39 +1431,128 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 7) {
             globalAudioResetRequested = true; 
             isWhammyActive = (cm.data2 < 64); 
-            isFrozen = isFeedbackActive = isHarmonizerMode = isCapoMode = isSynthMode = isPadMode = isChorusMode = isSwellMode = isVibratoMode = isVolumeMode = false;
-            volumePedalGain = 1.0f; updateLUT(); forceUIUpdate = true;
+            isFrozen = false; 
+            isFeedbackActive = false; 
+            isHarmonizerMode = false;
+            isCapoMode = false; 
+            isSynthMode = false; 
+            isPadMode = false; 
+            isChorusMode = false; 
+            isSwellMode = false;
+            isVibratoMode = false; 
+            isVolumeMode = false;
+            
+            volumePedalGain = 1.0f; 
+            updateLUT(); 
+            forceUIUpdate = true;
         }
-        else if (cm.data1 == 8) { isFrozen = (cm.data2 >= 64); if (activeEffectMode == 1) isWhammyActive = isFrozen; forceUIUpdate = true; }
-        else if (cm.data1 == 9) { isFeedbackActive = (cm.data2 >= 64); if (activeEffectMode == 2) isWhammyActive = isFeedbackActive; forceUIUpdate = true; }
-        else if (cm.data1 == 10) { isHarmonizerMode = (cm.data2 >= 64); if (activeEffectMode == 3) isWhammyActive = isHarmonizerMode; forceUIUpdate = true; }
-        else if (cm.data1 == 12) { isCapoMode = (cm.data2 >= 64); if (activeEffectMode == 4) isWhammyActive = isCapoMode; updateLUT(); forceUIUpdate = true; }
-        else if (cm.data1 == 13) { isSynthMode = (cm.data2 >= 64); if (activeEffectMode == 5) isWhammyActive = isSynthMode; forceUIUpdate = true; }
-        else if (cm.data1 == 14) { isPadMode = (cm.data2 >= 64); if (activeEffectMode == 6) isWhammyActive = isPadMode; forceUIUpdate = true; }
-        else if (cm.data1 == 15) { isChorusMode = (cm.data2 >= 64); if (activeEffectMode == 7) isWhammyActive = isChorusMode; forceUIUpdate = true; }
-        else if (cm.data1 == 16) { isSwellMode = (cm.data2 >= 64); if (activeEffectMode == 8) isWhammyActive = isSwellMode; forceUIUpdate = true; }
-        else if (cm.data1 == 21) { isVibratoMode = (cm.data2 >= 64); if (activeEffectMode == 9) isWhammyActive = isVibratoMode; forceUIUpdate = true; }
+        else if (cm.data1 == 8) { 
+            isFrozen = (cm.data2 >= 64); 
+            if (activeEffectMode == 1) { 
+                isWhammyActive = isFrozen; 
+            } 
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 9) { 
+            isFeedbackActive = (cm.data2 >= 64); 
+            if (activeEffectMode == 2) { 
+                isWhammyActive = isFeedbackActive; 
+            } 
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 10) { 
+            isHarmonizerMode = (cm.data2 >= 64); 
+            if (activeEffectMode == 3) { 
+                isWhammyActive = isHarmonizerMode; 
+            } 
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 12) { 
+            isCapoMode = (cm.data2 >= 64); 
+            if (activeEffectMode == 4) { 
+                isWhammyActive = isCapoMode; 
+            } 
+            updateLUT(); 
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 13) { 
+            isSynthMode = (cm.data2 >= 64); 
+            if (activeEffectMode == 5) { 
+                isWhammyActive = isSynthMode; 
+            } 
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 14) { 
+            isPadMode = (cm.data2 >= 64); 
+            if (activeEffectMode == 6) { 
+                isWhammyActive = isPadMode; 
+            } 
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 15) { 
+            isChorusMode = (cm.data2 >= 64); 
+            if (activeEffectMode == 7) { 
+                isWhammyActive = isChorusMode; 
+            } 
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 16) { 
+            isSwellMode = (cm.data2 >= 64); 
+            if (activeEffectMode == 8) { 
+                isWhammyActive = isSwellMode; 
+            } 
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 21) { 
+            isVibratoMode = (cm.data2 >= 64); 
+            if (activeEffectMode == 9) { 
+                isWhammyActive = isVibratoMode; 
+            } 
+            forceUIUpdate = true; 
+        }
         else if (cm.data1 == 18 || cm.data1 == 17) {
             float direction = (cm.data2 < 64) ? 1.0f : -1.0f;
+            
             if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
-                if (cm.data1 == 18) effectMemory[0] = constrain(effectMemory[0] + direction, -24.0f, 24.0f); 
-                else effectMemory[5] = constrain(effectMemory[5] + direction, -24.0f, 24.0f); 
+                if (cm.data1 == 18) { 
+                    effectMemory[0] = constrain(effectMemory[0] + direction, -24.0f, 24.0f); 
+                } else { 
+                    effectMemory[5] = constrain(effectMemory[5] + direction, -24.0f, 24.0f); 
+                }
             } else if (activeEffectMode == 4) {
                 float change = (cm.data1 == 18) ? 1.0f : 0.01f;
                 effectMemory[4] = constrain(effectMemory[4] + change * direction, -24.0f, 24.0f);
             } else if (activeEffectMode == 2) { 
-                feedbackIntervalIdx = (direction > 0) ? (feedbackIntervalIdx + 1) % 5 : (feedbackIntervalIdx + 4) % 5;
+                if (direction > 0) { 
+                    feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5; 
+                } else { 
+                    feedbackIntervalIdx = (feedbackIntervalIdx + 4) % 5; 
+                }
             } else { 
                 int memIndex = activeEffectMode; 
-                if (memIndex >= 5 && memIndex <= 7) memIndex++; 
+                
+                if (memIndex == 5) { 
+                    memIndex = 6; 
+                } else if (memIndex == 6) { 
+                    memIndex = 7; 
+                } else if (memIndex == 7) { 
+                    memIndex = 8; 
+                } else if (memIndex == 9) { 
+                    memIndex = 9; 
+                }
+                
                 effectMemory[memIndex] = constrain(effectMemory[memIndex] + direction, -24.0f, 24.0f); 
             }
-            updateLUT(); forceUIUpdate = true;
+            
+            updateLUT(); 
+            forceUIUpdate = true;
         }
         else if (cm.data1 == 11) { 
             uint16_t mappedCC = map(cm.data2, 0, 127, 0, 16383); 
-            currentCC11 = mappedCC; currentPB3 = mappedCC; 
-            pitchShiftFactor = pitchShiftLUT[mappedCC]; forceUIUpdate = true; 
+            currentCC11 = mappedCC; 
+            currentPB3 = mappedCC; 
+            pitchShiftFactor = pitchShiftLUT[mappedCC]; 
+            forceUIUpdate = true; 
         }
     }
     return false;
@@ -1403,26 +1560,46 @@ bool channelMessageCallback(ChannelMessage cm) {
 
 void setup() {
     pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP); 
-    pinMode(38, OUTPUT); digitalWrite(38, LOW); 
-    pinMode(15, OUTPUT); digitalWrite(15, HIGH);
+    
+    pinMode(38, OUTPUT); 
+    digitalWrite(38, LOW); 
+    
+    pinMode(15, OUTPUT); 
+    digitalWrite(15, HIGH);
     
     Serial.begin(115200); 
-    tft.init(); tft.setRotation(1); 
-    spr.createSprite(tft.width(), tft.height()); meterSpr.createSprite(6, 98);
-    tft.fillScreen(TFT_BLACK); tft.setTextDatum(MC_DATUM); tft.setTextSize(3); 
-    tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.drawString("BOOTING...", 160, 85);
+    tft.init(); 
+    tft.setRotation(1); 
     
-    delay(120); digitalWrite(38, HIGH); btmidi.setName("Whammy_S3"); 
+    spr.createSprite(tft.width(), tft.height()); 
+    meterSpr.createSprite(6, 98);
     
-    pinMode(pinPB, INPUT_PULLUP); pinMode(pinPB2, INPUT_PULLUP); pinMode(pinPB3, INPUT_PULLUP);
+    tft.fillScreen(TFT_BLACK); 
+    tft.setTextDatum(MC_DATUM); 
+    tft.setTextSize(3); 
+    tft.setTextColor(TFT_WHITE, TFT_BLACK); 
+    tft.drawString("BOOTING...", 160, 85);
+    
+    delay(120); 
+    digitalWrite(38, HIGH); 
+    btmidi.setName("Whammy_S3"); 
+    
+    pinMode(pinPB, INPUT_PULLUP); 
+    pinMode(pinPB2, INPUT_PULLUP); 
+    pinMode(pinPB3, INPUT_PULLUP);
     
     delayBuffer = (float*)heap_caps_aligned_alloc(16, MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     fbDelayBuffer = (float*)heap_caps_aligned_alloc(16, FB_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     freezeBuffer = (float*)heap_caps_aligned_alloc(16, FREEZE_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     
     if (delayBuffer == nullptr || fbDelayBuffer == nullptr || freezeBuffer == nullptr) {
-        tft.fillScreen(TFT_RED); tft.setTextColor(TFT_WHITE, TFT_RED); tft.drawString("MEMORY ERROR", 160, 85);
-        while(1) delay(100); 
+        tft.fillScreen(TFT_RED); 
+        tft.setTextColor(TFT_WHITE, TFT_RED); 
+        tft.drawString("MEMORY ERROR", 160, 85);
+        
+        while(1) { 
+            delay(100); 
+        }
     }
     
     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float)); 
@@ -1434,32 +1611,52 @@ void setup() {
         lfoLUT[i] = powf(2.0f, (15.0f * sinf(TWO_PI * ((float)i / 1024.0f))) / 1200.0f); 
     }
     
-    for (int i = 0; i < 2048; i++) synthLUT[i] = sinf((((float)i - 1024.0f) / 1024.0f) * 45.0f); 
+    for (int i = 0; i < 2048; i++) { 
+        synthLUT[i] = sinf((((float)i - 1024.0f) / 1024.0f) * 45.0f); 
+    }
     
-    FilteredAnalog<>::setupADC(); calibratePBs(); updateLUT();
+    FilteredAnalog<>::setupADC(); 
+    calibratePBs(); 
+    updateLUT();
     
-    Control_Surface >> pipes >> btmidi; Control_Surface >> pipes >> usbmidi; 
-    usbmidi >> pipes >> Control_Surface; btmidi >> pipes >> Control_Surface;
+    Control_Surface >> pipes >> btmidi; 
+    Control_Surface >> pipes >> usbmidi; 
+    usbmidi >> pipes >> Control_Surface; 
+    btmidi >> pipes >> Control_Surface;
     
     Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); 
     Control_Surface.begin();
     
     i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
-    i2sConfig.dma_desc_num = 6; i2sConfig.dma_frame_num = 256; i2sConfig.auto_clear = true;
+    i2sConfig.dma_desc_num = 6; 
+    i2sConfig.dma_frame_num = 256; 
+    i2sConfig.auto_clear = true;
+    
     i2s_new_channel(&i2sConfig, &tx_chan, &rx_chan);
     
     i2s_std_config_t stdConfig = { 
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLING_FREQUENCY), 
         .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
-        .gpio_cfg = { .mclk = GPIO_NUM_43, .bclk = GPIO_NUM_44, .ws = GPIO_NUM_18, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } 
+        .gpio_cfg = { 
+            .mclk = GPIO_NUM_43, 
+            .bclk = GPIO_NUM_44, 
+            .ws = GPIO_NUM_18, 
+            .dout = GPIO_NUM_16, 
+            .din = GPIO_NUM_17 
+        } 
     };
     
-    i2s_channel_init_std_mode(tx_chan, &stdConfig); i2s_channel_init_std_mode(rx_chan, &stdConfig); 
-    i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan);
+    i2s_channel_init_std_mode(tx_chan, &stdConfig); 
+    i2s_channel_init_std_mode(rx_chan, &stdConfig); 
+    
+    i2s_channel_enable(tx_chan); 
+    i2s_channel_enable(rx_chan);
     
     xTaskCreatePinnedToCore(DisplayTask, "UI", 8192, NULL, 1, NULL, 0); 
     xTaskCreatePinnedToCore(MidiTask, "Midi", 8192, NULL, 2, NULL, 0);
     xTaskCreatePinnedToCore(AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES - 1, &audioTaskHandle, 1);
 }
 
-void loop() {}
+void loop() {
+    // Everything handled in RTOS Tasks
+}

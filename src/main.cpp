@@ -171,7 +171,7 @@ uint16_t PB2_raw_center = 2048;
 uint16_t PB3_raw_min = 1000;
 uint16_t PB3_raw_max = 3000;
 
-int deadzone_size = 400; // Increased to hide mechanical spring sag
+int deadzone_size = 400; 
 
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB = pinPB;
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
@@ -180,8 +180,7 @@ BluetoothMIDI_Interface btmidi;
 USBMIDI_Interface usbmidi;
 MIDI_PipeFactory<4> pipes;
 
-// --- DYNAMIC RAW DEADZONE MAPPING WITH DRIFT ANCHORS ---
-// Safely handles inverted bounds and sloppy pedal springs
+// --- DYNAMIC RAW DEADZONE MAPPING (PB1 & PB2) ---
 analog_t map_raw_deadzone(float smoothRaw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
     int raw = (int)smoothRaw;
     
@@ -193,18 +192,14 @@ analog_t map_raw_deadzone(float smoothRaw, uint16_t center, uint16_t rMin, uint1
     int deadLower = center - dZone;
     int deadUpper = center + dZone;
 
-    // FAILSAFE: Prevent math inversions if the auto-tracker bounds are too tight at boot
     if (lowerLimit >= deadLower) lowerLimit = deadLower - 1;
     if (upperLimit <= deadUpper) upperLimit = deadUpper + 1;
 
-    // Bottom and Top Anchor Locks
     if (raw <= lowerLimit) return 0;
-    if (raw >= upperLimit) return 16383; // Locks to +8191 in your DAW perfectly!
+    if (raw >= upperLimit) return 16383; 
     
-    // Dead Center Lock
     if (raw > deadLower && raw < deadUpper) return 8192;
 
-    // Smooth Monotonic Mapping
     if (raw <= deadLower) {
         return map(raw, lowerLimit, deadLower, 0, 8191);
     } else {
@@ -212,8 +207,28 @@ analog_t map_raw_deadzone(float smoothRaw, uint16_t center, uint16_t rMin, uint1
     }
 }
 
+// --- DYNAMIC RAW EXPRESSION MAPPING (PB3) ---
+analog_t map_raw_expression(float smoothRaw, uint16_t rMin, uint16_t rMax) {
+    int raw = (int)smoothRaw;
+    
+    int toeLockZone = 50;   // Less deadzone on the toe
+    int heelLockZone = 350; // More deadzone on the heel
+    
+    int lowerLimit = rMin + toeLockZone;
+    int upperLimit = rMax - heelLockZone;
+
+    if (lowerLimit >= upperLimit) {
+        lowerLimit = rMin;
+        upperLimit = rMax;
+    }
+
+    if (raw <= lowerLimit) return 16383; 
+    if (raw >= upperLimit) return 0;
+    
+    return map(raw, lowerLimit, upperLimit, 16383, 0);
+}
+
 void calibratePBs() {
-    // Purge the initial power-on noise
     for (int i = 0; i < 50; i++) { 
         filterPB.update(); 
         filterPB2.update(); 
@@ -226,7 +241,6 @@ void calibratePBs() {
     uint16_t min3 = 4095;
     uint16_t max3 = 0;
     
-    // Boot Phase: Read the spring-loaded resting positions
     for (int i = 1; i <= 250; i++) {
         filterPB.update(); 
         filterPB2.update(); 
@@ -252,7 +266,6 @@ void calibratePBs() {
     PB1_raw_center = sum1 / 250;
     PB2_raw_center = sum2 / 250;
     
-    // Fallbacks just in case booted while unplugged or pressed
     if (PB1_raw_center > 4000 || PB1_raw_center < 100) {
         PB1_raw_center = 2048;
     }
@@ -261,7 +274,6 @@ void calibratePBs() {
         PB2_raw_center = 2048;
     }
     
-    // Set initial tracking bounds tight enough that ANY pedal can push past them and auto-calibrate
     PB1_raw_min = PB1_raw_center - 900; 
     PB1_raw_max = PB1_raw_center + 900;
     
@@ -636,8 +648,8 @@ void DisplayTask(void * pvParameters) {
         }
         
         if (forceUIUpdate) { 
-            updateDisplay(); 
             forceUIUpdate = false; 
+            updateDisplay(); 
         } else if (!isScreenOff && (ui_audio_level > 0.02f || ui_output_level > 0.02f)) { 
             updateMeters(); 
         }
@@ -1250,22 +1262,22 @@ void MidiTask(void * pvParameters) {
             analog_t rawB = filterPB2.getValue();
             analog_t rawC = filterPB3.getValue();
             
-            // --- HYSTERESIS UNPLUG DETECTION ---
+            // --- HYSTERESIS UNPLUG DETECTION (UNIVERSAL PORTS) ---
             if (rawA >= 4094) {
                 unpluggedA = true;
-            } else if (rawA < 4080) {
+            } else if (rawA < 4050) {
                 unpluggedA = false;
             }
             
             if (rawB >= 4094) {
                 unpluggedB = true;
-            } else if (rawB < 4080) {
+            } else if (rawB < 4050) {
                 unpluggedB = false;
             }
             
             if (rawC >= 4094) {
                 unpluggedC = true;
-            } else if (rawC < 4080) {
+            } else if (rawC < 4050) {
                 unpluggedC = false;
             }
             
@@ -1284,30 +1296,30 @@ void MidiTask(void * pvParameters) {
             }
             smoothRawC = smoothRawC * 0.9f + (float)rawC * 0.1f;
             
-            // --- CONTINUOUS AUTO-TRACKER ---
+            // --- CONTINUOUS AUTO-TRACKER (UNIVERSAL PORTS) ---
             if (!unpluggedA) {
-                if (smoothRawA < PB1_raw_min && smoothRawA > 20) {
+                if (smoothRawA < PB1_raw_min && smoothRawA > 100) {
                     PB1_raw_min = smoothRawA;
                 }
-                if (smoothRawA > PB1_raw_max && smoothRawA < 4050) {
+                if (smoothRawA > PB1_raw_max && smoothRawA < 4090) {
                     PB1_raw_max = smoothRawA;
                 }
             }
             
             if (!unpluggedB) {
-                if (smoothRawB < PB2_raw_min && smoothRawB > 20) {
+                if (smoothRawB < PB2_raw_min && smoothRawB > 100) {
                     PB2_raw_min = smoothRawB;
                 }
-                if (smoothRawB > PB2_raw_max && smoothRawB < 4050) {
+                if (smoothRawB > PB2_raw_max && smoothRawB < 4090) {
                     PB2_raw_max = smoothRawB;
                 }
             }
             
             if (!unpluggedC) {
-                if (smoothRawC < PB3_raw_min && smoothRawC > 20) {
+                if (smoothRawC < PB3_raw_min && smoothRawC > 100) {
                     PB3_raw_min = smoothRawC;
                 }
-                if (smoothRawC > PB3_raw_max && smoothRawC < 4050) {
+                if (smoothRawC > PB3_raw_max && smoothRawC < 4090) {
                     PB3_raw_max = smoothRawC;
                 }
             }
@@ -1315,18 +1327,7 @@ void MidiTask(void * pvParameters) {
             // Map the pedals cleanly using the dynamic bounds and heavy anchors
             analog_t calA = map_raw_deadzone(smoothRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
             analog_t calB = map_raw_deadzone(smoothRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
-            
-            // PB3 also gets a 120-point lock buffer built into its constrain and map
-            int lockC = 120;
-            int conC = constrain((int)smoothRawC, PB3_raw_min + lockC, PB3_raw_max - lockC); 
-            analog_t calC = map(conC, PB3_raw_min + lockC, PB3_raw_max - lockC, 16383, 0); 
-            
-            if (calC < 50) {
-                calC = 0;
-            } 
-            if (calC > 16333) {
-                calC = 16383;
-            } 
+            analog_t calC = map_raw_expression(smoothRawC, PB3_raw_min, PB3_raw_max);
             
             // Enforce center if unplugged
             if (unpluggedA) {
@@ -1339,9 +1340,13 @@ void MidiTask(void * pvParameters) {
                 calC = 8192;
             }
             
-            bool moveA = (abs((int)calA - (int)lastMidiA) > 12);
-            bool moveB = (abs((int)calB - (int)lastMidiB) > 12);
-            bool moveC = (abs((int)calC - (int)lastMidiC) > 12);
+            // --- ABSOLUTE ANCHOR FORCING & HYSTERESIS ---
+            bool moveA = (abs((int)calA - (int)lastMidiA) > 12) || ((calA == 8192 || calA == 0 || calA == 16383) && calA != lastMidiA);
+            bool moveB = (abs((int)calB - (int)lastMidiB) > 12) || ((calB == 8192 || calB == 0 || calB == 16383) && calB != lastMidiB);
+            
+            // PB3 (Expression) gets a wider hysteresis (48) to prevent data flooding from resting jitter, 
+            // but still snaps perfectly to 0 and 16383 at the extremes!
+            bool moveC = (abs((int)calC - (int)lastMidiC) > 48) || ((calC == 0 || calC == 16383) && calC != lastMidiC);
             
             if (moveA || moveB || moveC) {
                 if (isScreenOff) { 

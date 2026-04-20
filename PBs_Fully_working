@@ -1229,7 +1229,6 @@ void MidiTask(void * pvParameters) {
     
     static bool unpluggedA = false;
     static bool unpluggedB = false;
-    static bool unpluggedC = false;
     
     static DebouncedButton carouselBtn(CAROUSEL_BUTTON_PIN); 
     carouselBtn.state = digitalRead(CAROUSEL_BUTTON_PIN); 
@@ -1305,14 +1304,6 @@ void MidiTask(void * pvParameters) {
                 unpluggedB = false;
             }
             
-            // PB3 Hardware Unplug Detection
-            // Since we use INPUT_PULLDOWN, a floating unplugged cable goes straight to 0.
-            if (rawC < 15) {
-                unpluggedC = true;
-            } else if (rawC > 50) {
-                unpluggedC = false;
-            }
-            
             if (stableRawA < 0) {
                 stableRawA = rawA;
             }
@@ -1327,7 +1318,6 @@ void MidiTask(void * pvParameters) {
                 stableRawB = rawB;
             }
             
-            // --- THE 1ST WALL: HARDWARE INTEGER DEADBAND ---
             if (stableRawC < 0) {
                 stableRawC = rawC;
             }
@@ -1353,13 +1343,11 @@ void MidiTask(void * pvParameters) {
                 }
             }
             
-            if (!unpluggedC) {
-                if (stableRawC < PB3_raw_min && stableRawC >= 0) {
-                    PB3_raw_min = stableRawC;
-                }
-                if (stableRawC > PB3_raw_max && stableRawC <= 4095) {
-                    PB3_raw_max = stableRawC;
-                }
+            if (stableRawC < PB3_raw_min && stableRawC >= 0) {
+                PB3_raw_min = stableRawC;
+            }
+            if (stableRawC > PB3_raw_max && stableRawC <= 4095) {
+                PB3_raw_max = stableRawC;
             }
             
             analog_t calA = map_raw_deadzone(stableRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
@@ -1372,14 +1360,10 @@ void MidiTask(void * pvParameters) {
             if (unpluggedB) {
                 calB = 8192;
             }
-            if (unpluggedC) {
-                calC = 0; 
-            }
             
             bool moveA = (abs((int)calA - (int)lastMidiA) > 12) || ((calA == 8192 || calA == 0 || calA == 16383) && calA != lastMidiA);
             bool moveB = (abs((int)calB - (int)lastMidiB) > 12) || ((calB == 8192 || calB == 0 || calB == 16383) && calB != lastMidiB);
             
-            // --- THE 2ND WALL: THE MIDI CHUNK GATE ---
             bool moveC = (abs((int)calC - (int)lastMidiC) >= 128) || ((calC == 0 || calC == 16383) && calC != lastMidiC);
             
             if (moveA || moveB || moveC) {
@@ -1621,18 +1605,6 @@ bool channelMessageCallback(ChannelMessage cm) {
 }
 
 void setup() {
-    // --- FORCE USB RE-ENUMERATION (SIMULATE UNPLUG/PLUG) ---
-    // ESP32-S3 Native USB uses GPIO 19 (D-) and 20 (D+). 
-    // Pulling BOTH low for 200ms guarantees the PC drops the connection on reset.
-    pinMode(19, OUTPUT);
-    pinMode(20, OUTPUT);
-    digitalWrite(19, LOW);
-    digitalWrite(20, LOW);
-    delay(200);
-    pinMode(19, INPUT);
-    pinMode(20, INPUT);
-    // -------------------------------------------------------
-
     pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP); 
     
     pinMode(38, OUTPUT); 
@@ -1660,10 +1632,7 @@ void setup() {
     
     pinMode(pinPB, INPUT_PULLUP); 
     pinMode(pinPB2, INPUT_PULLUP); 
-    
-    // --- PB3 UNPLUG DETECTION HARDWARE TRICK ---
-    // PULLDOWN ensures a physically unplugged cable reads 0 volts immediately.
-    pinMode(pinPB3, INPUT_PULLDOWN); 
+    pinMode(pinPB3, INPUT_PULLUP); 
     
     delayBuffer = (float*)heap_caps_aligned_alloc(16, MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     fbDelayBuffer = (float*)heap_caps_aligned_alloc(16, FB_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);

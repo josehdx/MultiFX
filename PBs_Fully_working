@@ -45,6 +45,7 @@ float* delayBuffer = nullptr;
 float* fbDelayBuffer = nullptr;  
 float* freezeBuffer = nullptr;   
 float* pitchShiftLUT = nullptr; 
+float* pitchShiftLUT_temp = nullptr; 
 
 int writeIndex = 0;
 int fbDelayWriteIdx = 0;
@@ -138,6 +139,7 @@ const float LATENCY_WINDOWS[] = {1024.0f, 2048.0f, 4096.0f, 8192.0f};
 
 // --- GLOBAL BUFFER WIPE FLAG ---
 volatile bool globalAudioResetRequested = false;
+volatile bool clearBuffersRequested = false;
 
 // --- POWER SAVING & UI GLOBALS ---
 unsigned long lastActivityTime = 0;       
@@ -341,7 +343,7 @@ void toggleSampleRate() {
     
     // 5. Update DSP Dependencies
     freezeLength = currentSampleRate;
-    lutNeedsUpdate = true; // Flag for background update instead of blocking
+    lutNeedsUpdate = true; // Flag for background update instead of blocking MIDI thread
     
     // 6. Turn hardware back on and wake the DSP task
     i2s_channel_enable(tx_chan);
@@ -444,16 +446,19 @@ void updateLUT() {
     float toeBend = effectMemory[0]; 
     float heelBend = effectMemory[5];
     
-    // Writes directly to live array: Saves 65KB RAM and speeds up execution
+    // Writes to background array to prevent tearing and restore expression pedal response
     for (int i = 0; i < 16384; i++) {
         float normalizedThrow = (i >= 8192) ? ((float)(i - 8192) / 8191.0f) : ((float)(i - 8192) / 8192.0f);
         // Uses explicit fabsf to stop slow-emulated double-precision compilation
         float dynamicBend = (normalizedThrow >= 0.0f) ? (toeBend * normalizedThrow) : (heelBend * fabsf(normalizedThrow));
-        pitchShiftLUT[i] = powf(2.0f, (basePitch + dynamicBend) / 12.0f);
+        pitchShiftLUT_temp[i] = powf(2.0f, (basePitch + dynamicBend) / 12.0f);
         
         // Lets the Bluetooth RTOS stack breathe every 2048 operations
         if (i % 2048 == 0) { vTaskDelay(pdMS_TO_TICKS(1)); }
     }
+    
+    // Instant bulletproof double-buffer flash
+    memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
     if (!isVolumeMode) { 
         pitchShiftFactor = pitchShiftLUT[constrain(currentPB1, 0, 16383)]; 
@@ -780,6 +785,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static int freezePlayCounterVar = 0; 
     static int freezeStartIdxVar = 0;
     
+    static int muteCounter = 0;
+    
     const float normFactor = 1.0f / 2147483648.0f; 
     const float DC_OFFSET = 1e-9f;
     
@@ -816,12 +823,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     dc_state[j] = 0.0f; 
                 }
                 
-                memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float));
-                memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(float));
-                memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(float));
-                
                 ui_audio_level = 0.0f; 
                 ui_output_level = 0.0f; 
+                
+                // Mute for ~20ms and push massive PSRAM memset to the background loop to prevent DMA underflow crackle
+                clearBuffersRequested = true;
+                muteCounter = (int)(0.02f * currentSampleRate); 
                 globalAudioResetRequested = false;
             }
 
@@ -991,10 +998,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float rFrz = (freezeReadCache1[i] * hannLUT[(int)(phaseRead * 1023.0f)]) + 
                                  (freezeReadCache2[i] * hannLUT[(int)(phase2 * 1023.0f)]);
                     
-                    // FIX: DC_OFFSET removed from All-Pass Filters to prevent runaway denormal clipping popping
+                    // FIX: Hard flush-to-zero added to prevent extreme denormal float emulation spikes
                     float d1 = apf1Buffer[apf1Idx]; 
                     float a1 = -0.6f * rFrz + d1; 
-                    apf1Buffer[apf1Idx] = rFrz + 0.6f * d1; 
+                    float next_apf1 = rFrz + 0.6f * d1; 
+                    if (fabsf(next_apf1) < 1e-6f) next_apf1 = 0.0f;
+                    apf1Buffer[apf1Idx] = next_apf1;
                     apf1Idx++; 
                     
                     if (apf1Idx >= 1009) { 
@@ -1003,7 +1012,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     
                     float d2 = apf2Buffer[apf2Idx]; 
                     float a2 = -0.6f * a1 + d2; 
-                    apf2Buffer[apf2Idx] = a1 + 0.6f * d2; 
+                    float next_apf2 = a1 + 0.6f * d2;
+                    if (fabsf(next_apf2) < 1e-6f) next_apf2 = 0.0f;
+                    apf2Buffer[apf2Idx] = next_apf2; 
                     apf2Idx++; 
                     
                     if (apf2Idx >= 863) { 
@@ -1160,13 +1171,16 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             bool dryGroup = chorusActive || padActive || frzActive || feedbackActive || (freezeRamp > 0.0f) || (feedbackRamp > 0.0f);
             bool repeatGroup = capoActive || synthActive || vibratoActive || padActive || harmActive;
             
-            #pragma GCC ivdep
-            for (int i = 0; i < framesRead; i++) {
-                float sMix = DC_OFFSET;
-                
-                if (!activeGroup && freezeRamp <= 0.0f && feedbackRamp <= 0.0f && pad_block[i] < 0.001f) {
-                    sMix = dry_block[i];
-                } else {
+            // FIX: Extracted pad_block evaluation into a clean scalar check to restore 128-bit vectorization!
+            bool padIsAudible = padActive || (padFilter > 0.001f);
+            
+            if (!activeGroup && freezeRamp <= 0.0f && feedbackRamp <= 0.0f && !padIsAudible) {
+                memcpy(mix_block, dry_block, framesRead * sizeof(float));
+            } else {
+                #pragma GCC ivdep
+                for (int i = 0; i < framesRead; i++) {
+                    float sMix = DC_OFFSET;
+                    
                     if (dryGroup) { 
                         if (!repeatGroup) { 
                             sMix += (dry_block[i] * 0.4f); 
@@ -1185,7 +1199,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         sMix += (w3_block[i] * 0.4f); 
                     }
                     
-                    if (padActive || pad_block[i] > 0.001f) { 
+                    if (padIsAudible) { 
                         sMix += (pad_block[i] * 1.5f); 
                     }
                     
@@ -1198,9 +1212,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     }
                     
                     sMix = sMix * (1.0f - (0.1f * sMix * sMix));
+                    mix_block[i] = sMix;
                 }
-                
-                mix_block[i] = sMix;
             }
             
             if (!frzActive) {
@@ -1227,6 +1240,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             #pragma GCC ivdep
             for (int i = 0; i < framesRead; i++) {
                 float outStage = mix_block[i] * swellGain * volumePedalGain; 
+                
+                // FIX: Mute audio temporarily precisely when memory buffers are asynchronously reset to prevent underflow popping
+                if (muteCounter > 0) {
+                    outStage = 0.0f;
+                    muteCounter--;
+                }
+                
                 dsp_out_block[i * 2] = outStage; 
                 dsp_out_block[i * 2 + 1] = outStage;
                 
@@ -1338,7 +1358,7 @@ void MidiTask(void * pvParameters) {
                     vibratoLfoPhase = 0.0f; 
                     swellGain = 0.0f; 
                     isWhammyActive = true; 
-                    lutNeedsUpdate = true; // Fix: Prevent MIDI/UI callback deadlock
+                    lutNeedsUpdate = true; // Non-blocking background signal
                 } 
                 forceUIUpdate = true;
             }
@@ -1702,8 +1722,9 @@ void setup() {
     fbDelayBuffer = (float*)heap_caps_aligned_alloc(16, FB_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     freezeBuffer = (float*)heap_caps_aligned_alloc(16, FREEZE_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     pitchShiftLUT = (float*)heap_caps_aligned_alloc(16, 16384 * sizeof(float), MALLOC_CAP_SPIRAM);
+    pitchShiftLUT_temp = (float*)heap_caps_aligned_alloc(16, 16384 * sizeof(float), MALLOC_CAP_SPIRAM);
     
-    if (delayBuffer == nullptr || fbDelayBuffer == nullptr || freezeBuffer == nullptr || pitchShiftLUT == nullptr) {
+    if (delayBuffer == nullptr || fbDelayBuffer == nullptr || freezeBuffer == nullptr || pitchShiftLUT == nullptr || pitchShiftLUT_temp == nullptr) {
         tft.fillScreen(TFT_RED); 
         tft.setTextColor(TFT_WHITE, TFT_RED); 
         tft.drawString("MEMORY ERROR", 160, 85);
@@ -1717,9 +1738,9 @@ void setup() {
     memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(float)); 
     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(float));
     memset(pitchShiftLUT, 0, 16384 * sizeof(float));
+    memset(pitchShiftLUT_temp, 0, 16384 * sizeof(float));
     memset(hannLUT, 0, 1024 * sizeof(float));           
     
-    // Mathematically perfect Hann Window prevents 3dB volume bump during crossfade
     for (int i = 0; i < 1024; i++) { 
         hannLUT[i] = 0.5f * (1.0f - cosf(TWO_PI * ((float)i / 1023.0f))); 
         lfoLUT[i] = powf(2.0f, (15.0f * sinf(TWO_PI * ((float)i / 1024.0f))) / 1200.0f); 
@@ -1741,7 +1762,6 @@ void setup() {
     Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); 
     Control_Surface.begin();
     
-    // Shrinks DMA descriptors to prevent audio crackling and provides instantaneous 2.6ms finger tracking
     i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
     i2sConfig.dma_desc_num = 8; 
     i2sConfig.dma_frame_num = HOP_SIZE; 
@@ -1778,5 +1798,14 @@ void loop() {
         updateLUT();
         lutNeedsUpdate = false;
     }
+    
+    // FIX: Process massive PSRAM clearing safely on the empty background task to prevent audio DMA crackle
+    if (clearBuffersRequested) {
+        memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float));
+        memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(float));
+        memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(float));
+        clearBuffersRequested = false;
+    }
+    
     vTaskDelay(pdMS_TO_TICKS(10));
 }

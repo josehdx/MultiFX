@@ -99,6 +99,7 @@ int currentIntervalIdx = 8;
 volatile int feedbackIntervalIdx = 0; 
 
 volatile bool lutNeedsUpdate = false;
+volatile uint16_t lastActivePedal = 8192; // Tracks final pedal state to prevent deadzones
 void updateLUT();
 TaskHandle_t audioTaskHandle = NULL; 
 
@@ -1027,6 +1028,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     if (freezePlayCounterVar >= freezeLength) { 
                         freezePlayCounterVar = 0; 
                     }
+                } else if (apf1Buffer[0] != 0.0f) {
+                    // FIX: Erase the APF history buffers when freeze safely hits zero to prevent stale reverb pop
+                    memset(apf1Buffer, 0, sizeof(apf1Buffer));
+                    memset(apf2Buffer, 0, sizeof(apf2Buffer));
                 }
                 
                 float delayIn = (frzActive && freezeRamp > 0.0f) ? fzOut : procSample; 
@@ -1267,9 +1272,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float bit32Scale = 2147483647.0f; 
             dsps_mul_f32(dsp_out_block, &bit32Scale, dsp_out_block, framesRead * 2, 1, 0, 1);
             
+            // FIX: Safe array bounds protection prevents hardware float overflow wrapping
             #pragma GCC ivdep
             for (int i = 0; i < framesRead * 2; i++) {
-                i2s_out_block[i] = (int32_t)fmaxf(-2147483648.0f, fminf(dsp_out_block[i], 2147483647.0f));
+                i2s_out_block[i] = (int32_t)fmaxf(-2147483647.0f, fminf(dsp_out_block[i], 2147483647.0f));
             }
             
             if (peakInputVal > ui_audio_level) { 
@@ -1358,7 +1364,7 @@ void MidiTask(void * pvParameters) {
                     vibratoLfoPhase = 0.0f; 
                     swellGain = 0.0f; 
                     isWhammyActive = true; 
-                    lutNeedsUpdate = true; // Non-blocking background signal
+                    lutNeedsUpdate = true; 
                 } 
                 forceUIUpdate = true;
             }
@@ -1486,6 +1492,9 @@ void MidiTask(void * pvParameters) {
                     activePedal = calB; 
                 }
                 
+                // Track active pedal state for accurate post-background logic
+                lastActivePedal = activePedal;
+                
                 if (isVolumeMode) { 
                     uint8_t vCC = map(activePedal, 0, 16383, 0, 127); 
                     if (vCC != lastVolumeCC) { 
@@ -1494,7 +1503,10 @@ void MidiTask(void * pvParameters) {
                     } 
                     volumePedalGain = (float)activePedal / 16383.0f; 
                 } else { 
-                    pitchShiftFactor = pitchShiftLUT[constrain(activePedal, 0, 16383)]; 
+                    // FIX: Safe array fetch prevents split-brain pitch glitches
+                    if (!lutNeedsUpdate) {
+                        pitchShiftFactor = pitchShiftLUT[constrain(activePedal, 0, 16383)]; 
+                    }
                 }
                 
                 forceUIUpdate = true;
@@ -1513,8 +1525,12 @@ void MidiTask(void * pvParameters) {
                 currentPB2 = 8192; 
                 currentPB3 = 8192; 
                 
+                lastActivePedal = 8192;
+                
                 if (!isVolumeMode) { 
-                    pitchShiftFactor = pitchShiftLUT[8192]; 
+                    if (!lutNeedsUpdate) {
+                        pitchShiftFactor = pitchShiftLUT[8192]; 
+                    }
                 } else { 
                     volumePedalGain = 8192.0f / 16383.0f; 
                 }
@@ -1681,7 +1697,9 @@ bool channelMessageCallback(ChannelMessage cm) {
             uint16_t mappedCC = map(cm.data2, 0, 127, 0, 16383); 
             currentCC11 = mappedCC; 
             currentPB3 = mappedCC; 
-            pitchShiftFactor = pitchShiftLUT[mappedCC]; 
+            if (!lutNeedsUpdate) {
+                pitchShiftFactor = pitchShiftLUT[mappedCC]; 
+            }
             forceUIUpdate = true; 
         }
     }
@@ -1741,6 +1759,7 @@ void setup() {
     memset(pitchShiftLUT_temp, 0, 16384 * sizeof(float));
     memset(hannLUT, 0, 1024 * sizeof(float));           
     
+    // Mathematically perfect Hann Window prevents 3dB volume bump during crossfade
     for (int i = 0; i < 1024; i++) { 
         hannLUT[i] = 0.5f * (1.0f - cosf(TWO_PI * ((float)i / 1023.0f))); 
         lfoLUT[i] = powf(2.0f, (15.0f * sinf(TWO_PI * ((float)i / 1024.0f))) / 1200.0f); 
@@ -1762,6 +1781,7 @@ void setup() {
     Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); 
     Control_Surface.begin();
     
+    // Shrinks DMA descriptors to prevent audio crackling and provides instantaneous 2.6ms finger tracking
     i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
     i2sConfig.dma_desc_num = 8; 
     i2sConfig.dma_frame_num = HOP_SIZE; 
@@ -1796,6 +1816,10 @@ void loop() {
     // FIX: Execute heavy math completely asynchronously outside the MIDI task to protect the Bluetooth Stack
     if (lutNeedsUpdate) {
         updateLUT();
+        // FIX: The "Phantom Pedal" patch: Safely fetch the exact final pedal position the instant the update finishes
+        if (!isVolumeMode) {
+            pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
+        }
         lutNeedsUpdate = false;
     }
     

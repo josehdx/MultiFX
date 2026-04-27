@@ -45,7 +45,6 @@ float* delayBuffer = nullptr;
 float* fbDelayBuffer = nullptr;  
 float* freezeBuffer = nullptr;   
 float* pitchShiftLUT = nullptr; 
-float* pitchShiftLUT_temp = nullptr; 
 
 int writeIndex = 0;
 int fbDelayWriteIdx = 0;
@@ -406,7 +405,7 @@ void goToLightSleep() {
 }
 
 // --- OPTIMIZED FIXED-POINT LINEAR HERMITE INTERPOLATOR ---
-// Added Integer bit-shift multiplier logic to entirely bypass FPU during lookup calculations
+// Using circular bounds math (& BUFFER_MASK) to safely read directly from PSRAM without copying
 inline float IRAM_ATTR processTap(uint32_t tapPhase, const float* buffer, int currentWriteIdx, uint32_t windowMask, uint32_t hannIntMult) {
     int T = (tapPhase >> 16) & windowMask;
     float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
@@ -443,19 +442,16 @@ void updateLUT() {
     float toeBend = effectMemory[0]; 
     float heelBend = effectMemory[5];
     
-    // Calculates in a temporary background array to prevent multi-thread data corruption
+    // Writes directly to live array: Saves 65KB RAM and speeds up execution
     for (int i = 0; i < 16384; i++) {
         float normalizedThrow = (i >= 8192) ? ((float)(i - 8192) / 8191.0f) : ((float)(i - 8192) / 8192.0f);
         // Uses explicit fabsf to stop slow-emulated double-precision compilation
         float dynamicBend = (normalizedThrow >= 0.0f) ? (toeBend * normalizedThrow) : (heelBend * fabsf(normalizedThrow));
-        pitchShiftLUT_temp[i] = powf(2.0f, (basePitch + dynamicBend) / 12.0f);
+        pitchShiftLUT[i] = powf(2.0f, (basePitch + dynamicBend) / 12.0f);
         
         // Lets the Bluetooth RTOS stack breathe every 2048 operations
         if (i % 2048 == 0) { vTaskDelay(pdMS_TO_TICKS(1)); }
     }
-    
-    // Instant bulletproof double-buffer flash
-    memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
     if (!isVolumeMode) { 
         pitchShiftFactor = pitchShiftLUT[constrain(currentPB1, 0, 16383)]; 
@@ -919,6 +915,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             int frzBlockStart = freezeWriteIdxVar; 
             int fbBlockStart = fbDelayWriteIdx;
             
+            // --- VOLATILE HOISTING OPTIMIZATION ---
+            // Saves thousands of RAM fetches per loop
+            float currentPitch = pitchShiftFactor; 
+            float harmPitch = currentPitch * globalHarmRatio;
+            float choPitch  = currentPitch * globalChorusRatio;
+            float fbPitch   = currentPitch * globalFbRatio;
+            
             for (int i = 0; i < HOP_SIZE; i++) {
                 float inSample = dc_block[i]; 
                 inputEnvelope = inputEnvelope * 0.99f + fabsf(inSample) * 0.01f + DC_OFFSET;
@@ -1015,7 +1018,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 int localWriteIdx = writeIndex; 
                 delayBuffer[localWriteIdx] = boundedDelayIn;
                 
-                float spd1 = pitchShiftFactor;
+                float spd1 = currentPitch;
                 
                 if (vibratoActive) {
                     vibratoLfoPhase += globalVibratoPhaseInc; 
@@ -1027,8 +1030,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     spd1 *= lfoLUT[(int)vibratoLfoPhase];
                 }
                 
-                float spd2 = pitchShiftFactor * globalHarmRatio; 
-                float spd3 = pitchShiftFactor * globalChorusRatio;
+                float spd2 = harmPitch; 
+                float spd3 = choPitch;
                 
                 if (chorusActive) { 
                     chorusLfoPhase += chorusPhaseIncr; 
@@ -1052,7 +1055,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     
                     float lfoVal = lfoLUT[(int)feedbackLfoPhase]; 
                     spd4 = lfoVal; 
-                    spd5 = pitchShiftFactor * globalFbRatio * lfoVal; 
+                    spd5 = fbPitch * lfoVal; 
                 }
                 
                 float w1 = processTap(tap_w1_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
@@ -1693,9 +1696,8 @@ void setup() {
     fbDelayBuffer = (float*)heap_caps_aligned_alloc(16, FB_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     freezeBuffer = (float*)heap_caps_aligned_alloc(16, FREEZE_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     pitchShiftLUT = (float*)heap_caps_aligned_alloc(16, 16384 * sizeof(float), MALLOC_CAP_SPIRAM);
-    pitchShiftLUT_temp = (float*)heap_caps_aligned_alloc(16, 16384 * sizeof(float), MALLOC_CAP_SPIRAM);
     
-    if (delayBuffer == nullptr || fbDelayBuffer == nullptr || freezeBuffer == nullptr || pitchShiftLUT == nullptr || pitchShiftLUT_temp == nullptr) {
+    if (delayBuffer == nullptr || fbDelayBuffer == nullptr || freezeBuffer == nullptr || pitchShiftLUT == nullptr) {
         tft.fillScreen(TFT_RED); 
         tft.setTextColor(TFT_WHITE, TFT_RED); 
         tft.drawString("MEMORY ERROR", 160, 85);
@@ -1709,11 +1711,11 @@ void setup() {
     memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(float)); 
     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(float));
     memset(pitchShiftLUT, 0, 16384 * sizeof(float));
-    memset(pitchShiftLUT_temp, 0, 16384 * sizeof(float));
     memset(hannLUT, 0, 1024 * sizeof(float));           
     
+    // Mathematically perfect Hann Window prevents 3dB volume bump during crossfade
     for (int i = 0; i < 1024; i++) { 
-        hannLUT[i] = sinf(PI * ((float)i / 1023.0f)); 
+        hannLUT[i] = 0.5f * (1.0f - cosf(TWO_PI * ((float)i / 1023.0f))); 
         lfoLUT[i] = powf(2.0f, (15.0f * sinf(TWO_PI * ((float)i / 1024.0f))) / 1200.0f); 
     }
     
@@ -1733,7 +1735,7 @@ void setup() {
     Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); 
     Control_Surface.begin();
     
-    // Shrinks DMA descriptors to prevent audio crackling and provides instantaneous 2.6ms finger tracking
+    // Shrinks DMA descriptors to prevent audio crackling and provides instantaneous 5ms finger tracking
     i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
     i2sConfig.dma_desc_num = 8; 
     i2sConfig.dma_frame_num = HOP_SIZE; 

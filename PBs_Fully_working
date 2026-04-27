@@ -331,9 +331,9 @@ void toggleSampleRate() {
     i2s_channel_disable(tx_chan);
     i2s_channel_disable(rx_chan);
     
-    // Delay to let the I2S PLL safely sync to the new frequency boundary
     vTaskDelay(pdMS_TO_TICKS(10));
     
+    // Flip the variable
     if (currentSampleRate == 96000) {
         currentSampleRate = 48000;
     } else {
@@ -823,7 +823,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 globalAudioResetRequested = false;
             }
 
-            // FIX: Ensure clearBuffersRequested lock is cached outside loop to prevent mid-block audio tearing pops
+            // Mute block status dynamically stored to prevent intra-block array tearing
             bool blockIsMuted = clearBuffersRequested;
 
             uint32_t start_cycles = xthal_get_ccount(); 
@@ -958,7 +958,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     procSample *= padEnv; 
                 }
                 
-                // FIX: Write directly to Freeze PSRAM without memcpy wrappers
+                // Write directly to Freeze PSRAM without memcpy wrappers
                 if (!frzActive) { 
                     if (!blockIsMuted) {
                         freezeBuffer[freezeWriteIdxVar] = procSample;
@@ -985,7 +985,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         phase2 -= 1.0f; 
                     }
                     
-                    // FIX: Read directly from Hardware Data Cache to completely fix granular crossfade loop bounds
+                    // Read directly from Hardware Data Cache to completely fix granular crossfade loop bounds
                     int idx1 = (freezeStartIdxVar + freezePlayCounterVar) % freezeLength;
                     int counter2 = (freezePlayCounterVar + (activeFreezeLength / 2)) % activeFreezeLength;
                     int idx2 = (freezeStartIdxVar + counter2) % freezeLength;
@@ -1064,45 +1064,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float spd4 = 1.0f; 
                 float spd5 = 1.0f;
                 
-                if (feedbackActive || feedbackRamp > 0.0f) { 
-                    feedbackLfoPhase += feedbackPhaseIncr; 
-                    
-                    if (feedbackLfoPhase >= LFO_LUT_SIZE) { 
-                        feedbackLfoPhase -= LFO_LUT_SIZE; 
-                    }
-                    
-                    float lfoVal = lfoLUT[(int)feedbackLfoPhase]; 
-                    spd4 = lfoVal; 
-                    spd5 = fbPitch * lfoVal; 
-                }
-                
-                float w1 = processTap(tap_w1_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                           processTap(tap_w1_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
-                w1_block[i] = w1; 
-                
-                float w2 = 0.0f;
-                if (harmActive) {
-                    w2 = processTap(tap_w2_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                         processTap(tap_w2_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
-                }
-                w2_block[i] = w2; 
-                
-                float w3 = 0.0f;
-                if (chorusActive) {
-                    w3 = processTap(tap_w3_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                         processTap(tap_w3_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
-                }
-                w3_block[i] = w3; 
-                
-                float w4 = 0.0f; 
-                float w5 = 0.0f; 
-                
                 float fbOutNode = 0.0f;
                 if (feedbackActive || feedbackRamp > 0.0f) { 
-                    w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                         processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
-                    w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                         processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                    float w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                               processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                    float w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                               processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                          
                     if (feedbackActive) {
                         if (inputEnvelope > 0.005f) { 
@@ -1123,7 +1090,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
                     float satFb = feedbackFilterVar * (feedbackRamp * feedbackRamp * feedbackRamp) * 0.85f; 
                     
-                    // FIX: Direct write/read to FB PSRAM bypasses sluggish residual block memcopies
+                    // Direct write/read to FB PSRAM bypasses sluggish residual block memcopies
                     if (!blockIsMuted) {
                         fbDelayBuffer[fbDelayWriteIdx] = satFb;
                     }
@@ -1134,8 +1101,24 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     
                     fbDelayWriteIdx = (fbDelayWriteIdx + 1) & FB_BUFFER_MASK;
                 }
-                w4_block[i] = w4; 
-                w5_block[i] = w5; 
+                
+                float w1 = processTap(tap_w1_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                           processTap(tap_w1_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                w1_block[i] = w1; 
+                
+                float w2 = 0.0f;
+                if (harmActive) {
+                    w2 = processTap(tap_w2_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                         processTap(tap_w2_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                }
+                w2_block[i] = w2; 
+                
+                float w3 = 0.0f;
+                if (chorusActive) {
+                    w3 = processTap(tap_w3_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                         processTap(tap_w3_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                }
+                w3_block[i] = w3; 
                 
                 int32_t step1 = (int32_t)((1.0f - spd1) * 65536.0f); 
                 tap_w1_1 += step1; 
@@ -1171,48 +1154,50 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 fbOut_block[i] = fbOutNode;
             }
             
+            // --- SIMD AUTO-VECTORIZED WET/DRY MIXING ---
             bool activeGroup = isWhammyActive || harmActive || chorusActive || feedbackActive || synthActive || padActive || frzActive || vibratoActive || capoActive;
             bool dryGroup = chorusActive || padActive || frzActive || feedbackActive || (freezeRamp > 0.0f) || (feedbackRamp > 0.0f);
             bool repeatGroup = capoActive || synthActive || vibratoActive || padActive || harmActive;
             
+            // Extracted pad_block evaluation into a clean scalar check to restore 128-bit vectorization!
             bool padIsAudible = padActive || (padFilter > 0.001f);
             
             if (!activeGroup && freezeRamp <= 0.0f && feedbackRamp <= 0.0f && !padIsAudible) {
                 memcpy(mix_block, dry_block, framesRead * sizeof(float));
             } else {
+                
+                // 1. Hoist branches OUTSIDE the loop to restore 128-bit MAC Vectorization
+                float g_base = 0.0f;
+                if (dryGroup) {
+                    if (!repeatGroup) g_base = 0.4f;
+                } else if (harmActive) {
+                    g_base = 0.5f;
+                } else {
+                    g_base = 1.0f;
+                }
+                
+                float g_w2 = harmActive ? 0.5f : 0.0f;
+                float g_w3 = chorusActive ? 0.4f : 0.0f;
+                float g_pad = padIsAudible ? 1.5f : 0.0f;
+                float g_frz = (!frzActive && freezeRamp > 0.0f) ? 0.5f : 0.0f;
+                float g_fb = (feedbackActive || feedbackRamp > 0.0f) ? 0.6f : 0.0f;
+                
+                float g_whammy = isWhammyActive ? 1.0f : 0.0f;
+                float g_dry = isWhammyActive ? 0.0f : 1.0f;
+
                 #pragma GCC ivdep
                 for (int i = 0; i < framesRead; i++) {
+                    
+                    // 2. UNIVERSAL BASE SIGNAL: Branchless master pitch foundation canvas
+                    float baseSignal = (w1_block[i] * g_whammy) + (dry_block[i] * g_dry);
+                    
                     float sMix = DC_OFFSET;
-                    
-                    if (dryGroup) { 
-                        if (!repeatGroup) { 
-                            sMix += (dry_block[i] * 0.4f); 
-                        } 
-                    } else if (harmActive) { 
-                        sMix += (w1_block[i] * 0.5f); 
-                    } else { 
-                        sMix += w1_block[i]; 
-                    }
-                    
-                    if (harmActive) { 
-                        sMix += (w2_block[i] * 0.5f); 
-                    }
-                    
-                    if (chorusActive) { 
-                        sMix += (w3_block[i] * 0.4f); 
-                    }
-                    
-                    if (padIsAudible) { 
-                        sMix += (pad_block[i] * 1.5f); 
-                    }
-                    
-                    if (!frzActive && freezeRamp > 0.0f) { 
-                        sMix += (fz_block[i] * 0.5f); 
-                    }
-                    
-                    if (feedbackActive || feedbackRamp > 0.0f) { 
-                        sMix += (fbOut_block[i] * 0.6f); 
-                    }
+                    sMix += baseSignal * g_base;
+                    sMix += w2_block[i] * g_w2;
+                    sMix += w3_block[i] * g_w3;
+                    sMix += pad_block[i] * g_pad;
+                    sMix += fz_block[i] * g_frz;
+                    sMix += fbOut_block[i] * g_fb;
                     
                     sMix = sMix * (1.0f - (0.1f * sMix * sMix));
                     mix_block[i] = sMix;

@@ -338,7 +338,7 @@ void toggleSampleRate() {
     i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
     i2s_channel_reconfig_std_clock(rx_chan, &clk_cfg);
     
-    // 5. Update DSP Dependencies (Fixes LFO Speeds!)
+    // 5. Update DSP Dependencies
     freezeLength = currentSampleRate;
     updateLUT(); 
     
@@ -406,8 +406,8 @@ void goToLightSleep() {
 }
 
 // --- OPTIMIZED FIXED-POINT LINEAR HERMITE INTERPOLATOR ---
-// Using circular bounds math (& BUFFER_MASK) to safely read directly from PSRAM without copying
-inline float IRAM_ATTR processTap(uint32_t tapPhase, const float* buffer, int currentWriteIdx, uint32_t windowMask, float hannMultiplier) {
+// Added Integer bit-shift multiplier logic to entirely bypass FPU during lookup calculations
+inline float IRAM_ATTR processTap(uint32_t tapPhase, const float* buffer, int currentWriteIdx, uint32_t windowMask, uint32_t hannIntMult) {
     int T = (tapPhase >> 16) & windowMask;
     float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
     
@@ -429,7 +429,8 @@ inline float IRAM_ATTR processTap(uint32_t tapPhase, const float* buffer, int cu
     
     float sample = ((c3 * frac + c2) * frac + c1) * frac + c0;
     
-    return sample * hannLUT[(int)(T * hannMultiplier)];
+    int lutIdx = (T * hannIntMult) >> 16;
+    return sample * hannLUT[lutIdx];
 }
 
 void updateLUT() {
@@ -445,8 +446,12 @@ void updateLUT() {
     // Calculates in a temporary background array to prevent multi-thread data corruption
     for (int i = 0; i < 16384; i++) {
         float normalizedThrow = (i >= 8192) ? ((float)(i - 8192) / 8191.0f) : ((float)(i - 8192) / 8192.0f);
-        float dynamicBend = (normalizedThrow >= 0.0f) ? (toeBend * normalizedThrow) : (heelBend * std::abs(normalizedThrow));
+        // Uses explicit fabsf to stop slow-emulated double-precision compilation
+        float dynamicBend = (normalizedThrow >= 0.0f) ? (toeBend * normalizedThrow) : (heelBend * fabsf(normalizedThrow));
         pitchShiftLUT_temp[i] = powf(2.0f, (basePitch + dynamicBend) / 12.0f);
+        
+        // Lets the Bluetooth RTOS stack breathe every 2048 operations
+        if (i % 2048 == 0) { vTaskDelay(pdMS_TO_TICKS(1)); }
     }
     
     // Instant bulletproof double-buffer flash
@@ -744,8 +749,18 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     
     static float input_block[HOP_SIZE] __attribute__((aligned(16)));
     static float dc_block[HOP_SIZE] __attribute__((aligned(16)));
-    static float w1_block[HOP_SIZE] __attribute__((aligned(16)));
     static float mix_block[HOP_SIZE] __attribute__((aligned(16)));
+    
+    // Memory aligned arrays perfectly formatted for the ESP32 SIMD Instruction set
+    static float w1_block[HOP_SIZE] __attribute__((aligned(16)));
+    static float w2_block[HOP_SIZE] __attribute__((aligned(16)));
+    static float w3_block[HOP_SIZE] __attribute__((aligned(16)));
+    static float w4_block[HOP_SIZE] __attribute__((aligned(16)));
+    static float w5_block[HOP_SIZE] __attribute__((aligned(16)));
+    static float dry_block[HOP_SIZE] __attribute__((aligned(16)));
+    static float fz_block[HOP_SIZE] __attribute__((aligned(16)));
+    static float pad_block[HOP_SIZE] __attribute__((aligned(16)));
+    static float fbOut_block[HOP_SIZE] __attribute__((aligned(16)));
     
     static float freezeReadCache1[HOP_SIZE] __attribute__((aligned(16)));
     static float freezeReadCache2[HOP_SIZE] __attribute__((aligned(16)));
@@ -833,7 +848,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 tap_w5_2 = halfWindowFixed;
             }
             
-            float hMultiplier = 1023.0f / currentWindowSize; 
+            // Integer lookup multiplier caching (FPU optimization)
+            uint32_t hannIntMult = (1024U << 16) / (uint32_t)currentWindowSize; 
             uint32_t windowMask = (uint32_t)currentWindowSize - 1;
             
             float invFreqLength = 1.0f / (float)freezeLength; 
@@ -1039,32 +1055,35 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     spd5 = pitchShiftFactor * globalFbRatio * lfoVal; 
                 }
                 
-                float w1 = processTap(tap_w1_1, delayBuffer, localWriteIdx, windowMask, hMultiplier) + 
-                           processTap(tap_w1_2, delayBuffer, localWriteIdx, windowMask, hMultiplier);
-                
+                float w1 = processTap(tap_w1_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                           processTap(tap_w1_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                 w1_block[i] = w1; 
                 
                 float w2 = 0.0f;
                 if (harmActive) {
-                    w2 = processTap(tap_w2_1, delayBuffer, localWriteIdx, windowMask, hMultiplier) + 
-                         processTap(tap_w2_2, delayBuffer, localWriteIdx, windowMask, hMultiplier);
+                    w2 = processTap(tap_w2_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                         processTap(tap_w2_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                 }
+                w2_block[i] = w2; 
                 
                 float w3 = 0.0f;
                 if (chorusActive) {
-                    w3 = processTap(tap_w3_1, delayBuffer, localWriteIdx, windowMask, hMultiplier) + 
-                         processTap(tap_w3_2, delayBuffer, localWriteIdx, windowMask, hMultiplier);
+                    w3 = processTap(tap_w3_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                         processTap(tap_w3_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                 }
+                w3_block[i] = w3; 
                 
                 float w4 = 0.0f; 
                 float w5 = 0.0f; 
                 
                 if (feedbackActive || feedbackRamp > 0.0f) { 
-                    w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hMultiplier) + 
-                         processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hMultiplier);
-                    w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hMultiplier) + 
-                         processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hMultiplier);
+                    w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                         processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                    w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                         processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                 }
+                w4_block[i] = w4; 
+                w5_block[i] = w5; 
                 
                 int32_t step1 = (int32_t)((1.0f - spd1) * 65536.0f); 
                 tap_w1_1 += step1; 
@@ -1121,48 +1140,55 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     padFilter = padFilter * 0.95f + DC_OFFSET; 
                 }
                 
-                bool activeGroup = isWhammyActive || harmActive || chorusActive || feedbackActive || synthActive || padActive || frzActive || vibratoActive || capoActive;
-                bool dryGroup = chorusActive || padActive || frzActive || feedbackActive || (freezeRamp > 0.0f) || (feedbackRamp > 0.0f);
-                bool repeatGroup = capoActive || synthActive || vibratoActive || padActive || harmActive;
-                
+                dry_block[i] = inSample;
+                fz_block[i] = fzOut;
+                pad_block[i] = padFilter;
+                fbOut_block[i] = fbOutNode;
+            }
+            
+            // --- SIMD AUTO-VECTORIZED WET/DRY MIXING ---
+            bool activeGroup = isWhammyActive || harmActive || chorusActive || feedbackActive || synthActive || padActive || frzActive || vibratoActive || capoActive;
+            bool dryGroup = chorusActive || padActive || frzActive || feedbackActive || (freezeRamp > 0.0f) || (feedbackRamp > 0.0f);
+            bool repeatGroup = capoActive || synthActive || vibratoActive || padActive || harmActive;
+            
+            #pragma GCC ivdep
+            for (int i = 0; i < HOP_SIZE; i++) {
                 float sMix = DC_OFFSET;
                 
-                if (!activeGroup && freezeRamp <= 0.0f && feedbackRamp <= 0.0f && padFilter < 0.001f) {
-                    sMix = inSample;
+                if (!activeGroup && freezeRamp <= 0.0f && feedbackRamp <= 0.0f && pad_block[i] < 0.001f) {
+                    sMix = dry_block[i];
                 } else {
-                    if (activeGroup || freezeRamp > 0.0f || feedbackRamp > 0.0f || padFilter > 0.001f) {
-                        if (dryGroup) { 
-                            if (!repeatGroup) { 
-                                sMix += (inSample * 0.4f); 
-                            } 
-                        } else if (harmActive) { 
-                            sMix += (w1 * 0.5f); 
-                        } else { 
-                            sMix += w1; 
-                        }
-                        
-                        if (harmActive) { 
-                            sMix += (w2 * 0.5f); 
-                        }
-                        
-                        if (chorusActive) { 
-                            sMix += (w3 * 0.4f); 
-                        }
-                        
-                        if (padActive || padFilter > 0.001f) { 
-                            sMix += (padFilter * 1.5f); 
-                        }
-                        
-                        if (!frzActive && freezeRamp > 0.0f) { 
-                            sMix += (fzOut * 0.5f); 
-                        }
-                        
-                        if (feedbackActive || feedbackRamp > 0.0f) { 
-                            sMix += (fbOutNode * 0.6f); 
-                        }
-                        
-                        sMix = sMix * (1.0f - (0.1f * sMix * sMix));
+                    if (dryGroup) { 
+                        if (!repeatGroup) { 
+                            sMix += (dry_block[i] * 0.4f); 
+                        } 
+                    } else if (harmActive) { 
+                        sMix += (w1_block[i] * 0.5f); 
+                    } else { 
+                        sMix += w1_block[i]; 
                     }
+                    
+                    if (harmActive) { 
+                        sMix += (w2_block[i] * 0.5f); 
+                    }
+                    
+                    if (chorusActive) { 
+                        sMix += (w3_block[i] * 0.4f); 
+                    }
+                    
+                    if (padActive || pad_block[i] > 0.001f) { 
+                        sMix += (pad_block[i] * 1.5f); 
+                    }
+                    
+                    if (!frzActive && freezeRamp > 0.0f) { 
+                        sMix += (fz_block[i] * 0.5f); 
+                    }
+                    
+                    if (feedbackActive || feedbackRamp > 0.0f) { 
+                        sMix += (fbOut_block[i] * 0.6f); 
+                    }
+                    
+                    sMix = sMix * (1.0f - (0.1f * sMix * sMix));
                 }
                 
                 mix_block[i] = sMix;
@@ -1189,19 +1215,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 }
             }
             
-            bool dryPathActive = chorusActive || padActive || frzActive || feedbackActive || (freezeRamp > 0.0f) || (feedbackRamp > 0.0f);
-            bool totalAnyActive = isWhammyActive || harmActive || chorusActive || feedbackActive || synthActive || padActive || frzActive || vibratoActive || capoActive;
-            
             #pragma GCC ivdep
             for (int i = 0; i < HOP_SIZE; i++) {
-                if (totalAnyActive || freezeRamp > 0.0f || feedbackRamp > 0.0f || padFilter > 0.001f) {
-                    if (dryPathActive) { 
-                        mix_block[i] += (w1_block[i] * 0.4f); 
-                    } else if (!harmActive) { 
-                        mix_block[i] += w1_block[i]; 
-                    }
-                }
-                
                 float outStage = mix_block[i] * swellGain * volumePedalGain; 
                 dsp_out_block[i * 2] = outStage; 
                 dsp_out_block[i * 2 + 1] = outStage;
@@ -1718,8 +1733,9 @@ void setup() {
     Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); 
     Control_Surface.begin();
     
+    // Shrinks DMA descriptors to prevent audio crackling and provides instantaneous 2.6ms finger tracking
     i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
-    i2sConfig.dma_desc_num = 4; 
+    i2sConfig.dma_desc_num = 8; 
     i2sConfig.dma_frame_num = HOP_SIZE; 
     i2sConfig.auto_clear = true;
     

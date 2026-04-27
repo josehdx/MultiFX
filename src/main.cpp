@@ -44,8 +44,8 @@ volatile uint32_t currentSampleRate = 96000;
 float* delayBuffer = nullptr;    
 float* fbDelayBuffer = nullptr;  
 float* freezeBuffer = nullptr;   
-float* internalDelayCache = nullptr; 
 float* pitchShiftLUT = nullptr; 
+float* pitchShiftLUT_temp = nullptr; 
 
 int writeIndex = 0;
 int fbDelayWriteIdx = 0;
@@ -315,9 +315,11 @@ void toggleSampleRate() {
     sleepRequested = true; 
     globalAudioResetRequested = true; 
     
-    // 1. STRICT HANDSHAKE: Wait indefinitely until Audio Task safely parks itself
-    while (!isSleeping) { 
+    // 1. SAFETY TIMEOUT HANDSHAKE: Wait up to 200ms to override deadlocks
+    int timeoutCounter = 0;
+    while (!isSleeping && timeoutCounter < 40) { 
         vTaskDelay(pdMS_TO_TICKS(5)); 
+        timeoutCounter++;
     }
     
     // 2. Safely shut down the hardware
@@ -404,15 +406,16 @@ void goToLightSleep() {
 }
 
 // --- OPTIMIZED FIXED-POINT LINEAR HERMITE INTERPOLATOR ---
-inline float IRAM_ATTR processTap(uint32_t tapPhase, const float* buffer, int localWriteIdx, uint32_t windowMask, float hannMultiplier) {
+// Using circular bounds math (& BUFFER_MASK) to safely read directly from PSRAM without copying
+inline float IRAM_ATTR processTap(uint32_t tapPhase, const float* buffer, int currentWriteIdx, uint32_t windowMask, float hannMultiplier) {
     int T = (tapPhase >> 16) & windowMask;
     float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
     
     int effTap = T + 2; 
-    int idx1 = localWriteIdx - effTap;
-    int idx0 = idx1 + 1; 
-    int idx2 = idx1 - 1; 
-    int idx3 = idx1 - 2;
+    int idx1 = (currentWriteIdx - effTap) & BUFFER_MASK;
+    int idx0 = (idx1 + 1) & BUFFER_MASK; 
+    int idx2 = (idx1 - 1) & BUFFER_MASK; 
+    int idx3 = (idx1 - 2) & BUFFER_MASK;
     
     float y0 = buffer[idx0]; 
     float y1 = buffer[idx1];
@@ -439,11 +442,15 @@ void updateLUT() {
     float toeBend = effectMemory[0]; 
     float heelBend = effectMemory[5];
     
+    // Calculates in a temporary background array to prevent multi-thread data corruption
     for (int i = 0; i < 16384; i++) {
         float normalizedThrow = (i >= 8192) ? ((float)(i - 8192) / 8191.0f) : ((float)(i - 8192) / 8192.0f);
         float dynamicBend = (normalizedThrow >= 0.0f) ? (toeBend * normalizedThrow) : (heelBend * std::abs(normalizedThrow));
-        pitchShiftLUT[i] = powf(2.0f, (basePitch + dynamicBend) / 12.0f);
+        pitchShiftLUT_temp[i] = powf(2.0f, (basePitch + dynamicBend) / 12.0f);
     }
+    
+    // Instant bulletproof double-buffer flash
+    memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
     if (!isVolumeMode) { 
         pitchShiftFactor = pitchShiftLUT[constrain(currentPB1, 0, 16383)]; 
@@ -783,19 +790,14 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 inputEnvelope = 0.0f; 
                 feedbackFilterVar = 0.0f;
                 
-                // --- NEW FIX: RESET ALL PLAYHEADS TO 0 ---
                 freezeWriteIdxVar = 0; 
                 freezePlayCounterVar = 0; 
                 freezeStartIdxVar = 0;
                 fbDelayWriteIdx = 0;
                 writeIndex = 0;
-                // -----------------------------------------
                 
                 for(int j = 0; j < 4; j++) { 
                     dc_state[j] = 0.0f; 
-                }
-                for(int j = 0; j < 17000; j++) { 
-                    internalDelayCache[j] = 0.0f; 
                 }
                 
                 memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float));
@@ -857,19 +859,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float peakInputVal = 0.0f; 
             float peakOutputVal = 0.0f;
             
-            int winSizeInt = (int)currentWindowSize; 
-            int historySize = winSizeInt + 4;
-            int psramStartIdx = (writeIndex - historySize + MAX_BUFFER_SIZE) & BUFFER_MASK;
-            
-            if (psramStartIdx + historySize > MAX_BUFFER_SIZE) {
-                int part1 = MAX_BUFFER_SIZE - psramStartIdx; 
-                int part2 = historySize - part1;
-                memcpy(&internalDelayCache[0], &delayBuffer[psramStartIdx], part1 * sizeof(float));
-                memcpy(&internalDelayCache[part1], &delayBuffer[0], part2 * sizeof(float));
-            } else {
-                memcpy(&internalDelayCache[0], &delayBuffer[psramStartIdx], historySize * sizeof(float));
-            }
-            
             if (freezeRamp > 0.0f || frzActive) {
                 int start1 = (freezeStartIdxVar + freezePlayCounterVar) % freezeLength;
                 
@@ -911,7 +900,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             dsps_biquad_f32(input_block, dc_block, HOP_SIZE, dc_coeffs, dc_state);
             
-            int blockWriteStart = writeIndex; 
             int frzBlockStart = freezeWriteIdxVar; 
             int fbBlockStart = fbDelayWriteIdx;
             
@@ -1008,8 +996,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float delayIn = (frzActive && freezeRamp > 0.0f) ? fzOut : procSample; 
                 float boundedDelayIn = constrain(delayIn, -1.0f, 1.0f);
                 
-                int localWriteIdx = historySize + i; 
-                internalDelayCache[localWriteIdx] = boundedDelayIn;
+                int localWriteIdx = writeIndex; 
+                delayBuffer[localWriteIdx] = boundedDelayIn;
                 
                 float spd1 = pitchShiftFactor;
                 
@@ -1051,31 +1039,31 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     spd5 = pitchShiftFactor * globalFbRatio * lfoVal; 
                 }
                 
-                float w1 = processTap(tap_w1_1, internalDelayCache, localWriteIdx, windowMask, hMultiplier) + 
-                           processTap(tap_w1_2, internalDelayCache, localWriteIdx, windowMask, hMultiplier);
+                float w1 = processTap(tap_w1_1, delayBuffer, localWriteIdx, windowMask, hMultiplier) + 
+                           processTap(tap_w1_2, delayBuffer, localWriteIdx, windowMask, hMultiplier);
                 
                 w1_block[i] = w1; 
                 
                 float w2 = 0.0f;
                 if (harmActive) {
-                    w2 = processTap(tap_w2_1, internalDelayCache, localWriteIdx, windowMask, hMultiplier) + 
-                         processTap(tap_w2_2, internalDelayCache, localWriteIdx, windowMask, hMultiplier);
+                    w2 = processTap(tap_w2_1, delayBuffer, localWriteIdx, windowMask, hMultiplier) + 
+                         processTap(tap_w2_2, delayBuffer, localWriteIdx, windowMask, hMultiplier);
                 }
                 
                 float w3 = 0.0f;
                 if (chorusActive) {
-                    w3 = processTap(tap_w3_1, internalDelayCache, localWriteIdx, windowMask, hMultiplier) + 
-                         processTap(tap_w3_2, internalDelayCache, localWriteIdx, windowMask, hMultiplier);
+                    w3 = processTap(tap_w3_1, delayBuffer, localWriteIdx, windowMask, hMultiplier) + 
+                         processTap(tap_w3_2, delayBuffer, localWriteIdx, windowMask, hMultiplier);
                 }
                 
                 float w4 = 0.0f; 
                 float w5 = 0.0f; 
                 
                 if (feedbackActive || feedbackRamp > 0.0f) { 
-                    w4 = processTap(tap_w4_1, internalDelayCache, localWriteIdx, windowMask, hMultiplier) + 
-                         processTap(tap_w4_2, internalDelayCache, localWriteIdx, windowMask, hMultiplier);
-                    w5 = processTap(tap_w5_1, internalDelayCache, localWriteIdx, windowMask, hMultiplier) + 
-                         processTap(tap_w5_2, internalDelayCache, localWriteIdx, windowMask, hMultiplier);
+                    w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hMultiplier) + 
+                         processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hMultiplier);
+                    w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hMultiplier) + 
+                         processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hMultiplier);
                 }
                 
                 int32_t step1 = (int32_t)((1.0f - spd1) * 65536.0f); 
@@ -1178,15 +1166,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 }
                 
                 mix_block[i] = sMix;
-            }
-            
-            if (blockWriteStart + HOP_SIZE > MAX_BUFFER_SIZE) {
-                int p1 = MAX_BUFFER_SIZE - blockWriteStart; 
-                int p2 = HOP_SIZE - p1;
-                memcpy(&delayBuffer[blockWriteStart], &internalDelayCache[historySize], p1 * sizeof(float));
-                memcpy(&delayBuffer[0], &internalDelayCache[historySize + p1], p2 * sizeof(float));
-            } else {
-                memcpy(&delayBuffer[blockWriteStart], &internalDelayCache[historySize], HOP_SIZE * sizeof(float));
             }
             
             if (!frzActive) {
@@ -1698,10 +1677,10 @@ void setup() {
     delayBuffer = (float*)heap_caps_aligned_alloc(16, MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     fbDelayBuffer = (float*)heap_caps_aligned_alloc(16, FB_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     freezeBuffer = (float*)heap_caps_aligned_alloc(16, FREEZE_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
-    internalDelayCache = (float*)heap_caps_aligned_alloc(16, 17000 * sizeof(float), MALLOC_CAP_INTERNAL);
     pitchShiftLUT = (float*)heap_caps_aligned_alloc(16, 16384 * sizeof(float), MALLOC_CAP_SPIRAM);
+    pitchShiftLUT_temp = (float*)heap_caps_aligned_alloc(16, 16384 * sizeof(float), MALLOC_CAP_SPIRAM);
     
-    if (delayBuffer == nullptr || fbDelayBuffer == nullptr || freezeBuffer == nullptr || internalDelayCache == nullptr || pitchShiftLUT == nullptr) {
+    if (delayBuffer == nullptr || fbDelayBuffer == nullptr || freezeBuffer == nullptr || pitchShiftLUT == nullptr || pitchShiftLUT_temp == nullptr) {
         tft.fillScreen(TFT_RED); 
         tft.setTextColor(TFT_WHITE, TFT_RED); 
         tft.drawString("MEMORY ERROR", 160, 85);
@@ -1714,8 +1693,8 @@ void setup() {
     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float)); 
     memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(float)); 
     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(float));
-    memset(internalDelayCache, 0, 17000 * sizeof(float));
     memset(pitchShiftLUT, 0, 16384 * sizeof(float));
+    memset(pitchShiftLUT_temp, 0, 16384 * sizeof(float));
     memset(hannLUT, 0, 1024 * sizeof(float));           
     
     for (int i = 0; i < 1024; i++) { 
@@ -1740,8 +1719,8 @@ void setup() {
     Control_Surface.begin();
     
     i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
-    i2sConfig.dma_desc_num = 6; 
-    i2sConfig.dma_frame_num = 256; 
+    i2sConfig.dma_desc_num = 4; 
+    i2sConfig.dma_frame_num = HOP_SIZE; 
     i2sConfig.auto_clear = true;
     
     i2s_new_channel(&i2sConfig, &tx_chan, &rx_chan);

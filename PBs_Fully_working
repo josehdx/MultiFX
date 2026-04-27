@@ -30,7 +30,7 @@ void __attribute__((constructor)) pre_boot_kill_switch() {
 /// --- GLOBALS & I2S HANDLES ---
 i2s_chan_handle_t tx_chan;
 i2s_chan_handle_t rx_chan;
-#define SAMPLING_FREQUENCY 96000 
+#define SAMPLING_FREQUENCY 48000 
 #define HOP_SIZE 64            
 
 // --- TIME-DOMAIN DSP BUFFERS ---
@@ -777,9 +777,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float hMultiplier = 1023.0f / currentWindowSize; 
             uint32_t windowMask = (uint32_t)currentWindowSize - 1;
             
-            float invFreqLength = 1.0f / 48000.0f; 
-            float chorusPhaseIncr = 1536.0f / 96000.0f; 
-            float feedbackPhaseIncr = 5120.0f / 96000.0f;
+            float invFreqLength = 1.0f / (float)freezeLength; 
+            float chorusPhaseIncr = 1536.0f / (float)SAMPLING_FREQUENCY; 
+            float feedbackPhaseIncr = 5120.0f / (float)SAMPLING_FREQUENCY;
             
             bool frzActive = ((activeEffectMode == 1 && isWhammyActive) || isFrozen); 
             if (frzActive && !wasFrozen) { 

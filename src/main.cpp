@@ -30,7 +30,8 @@ void __attribute__((constructor)) pre_boot_kill_switch() {
 /// --- GLOBALS & I2S HANDLES ---
 i2s_chan_handle_t tx_chan;
 i2s_chan_handle_t rx_chan;
-#define SAMPLING_FREQUENCY 96000 
+
+volatile uint32_t currentSampleRate = 96000; 
 #define HOP_SIZE 64            
 
 // --- TIME-DOMAIN DSP BUFFERS ---
@@ -38,11 +39,13 @@ i2s_chan_handle_t rx_chan;
 #define BUFFER_MASK 0xFFFF 
 #define FB_BUFFER_SIZE 8192
 #define FB_BUFFER_MASK 0x1FFF
-#define FREEZE_BUFFER_SIZE 65536
+#define FREEZE_BUFFER_SIZE 131072
 
 float* delayBuffer = nullptr;    
 float* fbDelayBuffer = nullptr;  
 float* freezeBuffer = nullptr;   
+float* internalDelayCache = nullptr; 
+float* pitchShiftLUT = nullptr; 
 
 int writeIndex = 0;
 int fbDelayWriteIdx = 0;
@@ -55,7 +58,6 @@ int fbDelayWriteIdx = 0;
 DRAM_ATTR float hannLUT[HANN_LUT_SIZE];
 DRAM_ATTR float lfoLUT[LFO_LUT_SIZE];
 DRAM_ATTR float synthLUT[WAVE_LUT_SIZE];
-volatile float pitchShiftLUT[16384]; 
 
 // --- DSP PRE-CALCULATED RATIOS ---
 volatile float globalHarmRatio = 1.0f;
@@ -82,7 +84,7 @@ uint32_t tap_w5_2 = 256 << 16;
 float currentWindowSize = 1024.0f; 
 
 // --- FREEZE STATE & ALL-PASS FILTERS ---
-const int freezeLength = 48000; 
+int freezeLength = 96000; 
 bool wasFrozen = false;
 volatile float freezeRamp = 0.0f;
 
@@ -95,7 +97,7 @@ int apf2Idx = 0;
 const float intervalList[] = {-12.0f, -7.0f, -5.0f, -2.0f, 0.0f, 2.0f, 5.0f, 7.0f, 12.0f};
 int currentIntervalIdx = 8; 
 volatile int feedbackIntervalIdx = 0; 
-
+void updateLUT();
 TaskHandle_t audioTaskHandle = NULL; 
 
 // --- TFT DISPLAY ---
@@ -131,7 +133,7 @@ volatile float feedbackRamp = 0.0f;
 float fbHpfState = 0.0f;
 float feedbackFilter = 0.0f;
 volatile int latencyMode = 1; 
-const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
+const float LATENCY_WINDOWS[] = {1024.0f, 2048.0f, 4096.0f, 8192.0f};
 
 // --- GLOBAL BUFFER WIPE FLAG ---
 volatile bool globalAudioResetRequested = false;
@@ -222,7 +224,6 @@ analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax
 
 // --- DYNAMIC RAW EXPRESSION MAPPING (PB3) ---
 analog_t map_raw_expression(int raw, uint16_t rMin, uint16_t rMax, bool invert) {
-    // Massive Lock zones to absorb mechanical sag at endpoints
     int heelLockZone = 350; 
     int toeLockZone = 150;   
     
@@ -307,6 +308,44 @@ void calibratePBs() {
     
     PB3_raw_min = 1000; 
     PB3_raw_max = 3000; 
+}
+
+// --- SAMPLE RATE HARDWARE TOGGLE ---
+void toggleSampleRate() {
+    sleepRequested = true; 
+    globalAudioResetRequested = true; 
+    
+    // 1. STRICT HANDSHAKE: Wait indefinitely until Audio Task safely parks itself
+    while (!isSleeping) { 
+        vTaskDelay(pdMS_TO_TICKS(5)); 
+    }
+    
+    // 2. Safely shut down the hardware
+    i2s_channel_disable(tx_chan);
+    i2s_channel_disable(rx_chan);
+    
+    // 3. Flip the variable
+    if (currentSampleRate == 96000) {
+        currentSampleRate = 48000;
+    } else {
+        currentSampleRate = 96000;
+    }
+    
+    // 4. Reprogram the clocks
+    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate);
+    i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
+    i2s_channel_reconfig_std_clock(rx_chan, &clk_cfg);
+    
+    // 5. Update DSP Dependencies (Fixes LFO Speeds!)
+    freezeLength = currentSampleRate;
+    updateLUT(); 
+    
+    // 6. Turn hardware back on and wake the DSP task
+    i2s_channel_enable(tx_chan);
+    i2s_channel_enable(rx_chan);
+    
+    sleepRequested = false;
+    forceUIUpdate = true;
 }
 
 // --- LCD & SLEEP CONTROL ---
@@ -417,7 +456,7 @@ void updateLUT() {
     globalFbRatio = powf(2.0f, fbIntervals[feedbackIntervalIdx % 5] / 12.0f);
     
     float vibHz = (effectMemory[9] != 0.0f) ? fabsf(effectMemory[9]) : 2.0f;
-    globalVibratoPhaseInc = (vibHz * LFO_LUT_SIZE) / SAMPLING_FREQUENCY;
+    globalVibratoPhaseInc = (vibHz * LFO_LUT_SIZE) / (float)currentSampleRate;
 }
 
 void updateMeters() {
@@ -547,21 +586,31 @@ void updateDisplay() {
     
     char cpuUsageBuffer[16]; 
     sprintf(cpuUsageBuffer, "CPU:%2d%%", (int)core1_load); 
-    spr.drawString(cpuUsageBuffer, 10, statsRowY);
+    spr.drawString(cpuUsageBuffer, 2, statsRowY);
     
     char internalSramBuffer[16]; 
     sprintf(internalSramBuffer, "SRM:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024)); 
-    spr.drawString(internalSramBuffer, 75, statsRowY);
+    spr.drawString(internalSramBuffer, 52, statsRowY);
     
     char psramBuffer[16]; 
     sprintf(psramBuffer, "PSR:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024)); 
-    spr.drawString(psramBuffer, 150, statsRowY);
+    spr.drawString(psramBuffer, 107, statsRowY);
 
     spr.setTextDatum(MC_DATUM); 
     spr.setTextColor(TFT_WHITE); 
-    spr.drawRect(235, statsRowY - 7, 75, 14, TFT_DARKGREY);
+    
+    // UI - Sample Rate Box
+    spr.drawRect(165, statsRowY - 7, 50, 14, TFT_DARKGREY);
+    if (currentSampleRate == 96000) {
+        spr.drawString("96kHz", 190, statsRowY);
+    } else {
+        spr.drawString("48kHz", 190, statsRowY);
+    }
+    
+    // UI - Latency Box
+    spr.drawRect(225, statsRowY - 7, 85, 14, TFT_DARKGREY);
     const char* latencyLabelStrings[] = {"U.Low Lat", "Low Lat", "Mid Lat", "High Lat"}; 
-    spr.drawString(latencyLabelStrings[latencyMode], 272, statsRowY);
+    spr.drawString(latencyLabelStrings[latencyMode], 267, statsRowY);
 
     spr.setTextSize(2); 
     spr.setTextDatum(MC_DATUM); 
@@ -691,7 +740,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float w1_block[HOP_SIZE] __attribute__((aligned(16)));
     static float mix_block[HOP_SIZE] __attribute__((aligned(16)));
     
-    static float internalDelayCache[4200] __attribute__((aligned(16)));
     static float freezeReadCache1[HOP_SIZE] __attribute__((aligned(16)));
     static float freezeReadCache2[HOP_SIZE] __attribute__((aligned(16)));
     static float freezeWriteCache[HOP_SIZE] __attribute__((aligned(16)));
@@ -735,10 +783,18 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 inputEnvelope = 0.0f; 
                 feedbackFilterVar = 0.0f;
                 
+                // --- NEW FIX: RESET ALL PLAYHEADS TO 0 ---
+                freezeWriteIdxVar = 0; 
+                freezePlayCounterVar = 0; 
+                freezeStartIdxVar = 0;
+                fbDelayWriteIdx = 0;
+                writeIndex = 0;
+                // -----------------------------------------
+                
                 for(int j = 0; j < 4; j++) { 
                     dc_state[j] = 0.0f; 
                 }
-                for(int j = 0; j < 4200; j++) { 
+                for(int j = 0; j < 17000; j++) { 
                     internalDelayCache[j] = 0.0f; 
                 }
                 
@@ -752,7 +808,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             }
 
             uint32_t start_cycles = xthal_get_ccount(); 
-            float targetWindow = LATENCY_WINDOWS[latencyMode];
+            
+            float targetWindow = LATENCY_WINDOWS[latencyMode] * (currentSampleRate == 96000 ? 2.0f : 1.0f);
             
             if (currentWindowSize != targetWindow) { 
                 currentWindowSize = targetWindow; 
@@ -777,9 +834,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float hMultiplier = 1023.0f / currentWindowSize; 
             uint32_t windowMask = (uint32_t)currentWindowSize - 1;
             
-            float invFreqLength = 1.0f / 48000.0f; 
-            float chorusPhaseIncr = 1536.0f / 96000.0f; 
-            float feedbackPhaseIncr = 5120.0f / 96000.0f;
+            float invFreqLength = 1.0f / (float)freezeLength; 
+            float chorusPhaseIncr = 1536.0f / (float)currentSampleRate; 
+            float feedbackPhaseIncr = 5120.0f / (float)currentSampleRate;
             
             bool frzActive = ((activeEffectMode == 1 && isWhammyActive) || isFrozen); 
             if (frzActive && !wasFrozen) { 
@@ -836,7 +893,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             }
             
             if (feedbackActive || feedbackRamp > 0.0f) {
-                int fbReadStart = (fbDelayWriteIdx - (int)(SAMPLING_FREQUENCY * 0.02f) + FB_BUFFER_SIZE) & FB_BUFFER_MASK;
+                int fbReadStart = (fbDelayWriteIdx - (int)(currentSampleRate * 0.02f) + FB_BUFFER_SIZE) & FB_BUFFER_MASK;
                 
                 if (fbReadStart + HOP_SIZE > FB_BUFFER_SIZE) {
                     int p1 = FB_BUFFER_SIZE - fbReadStart;
@@ -1180,7 +1237,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             }
             
             uint32_t end_timer = xthal_get_ccount(); 
-            float currentLoadPercentage = ((float)(end_timer - start_cycles) / 160000.0f) * 100.0f;
+            float max_cycles = (240000000.0f / (float)currentSampleRate) * (float)HOP_SIZE;
+            float currentLoadPercentage = ((float)(end_timer - start_cycles) / max_cycles) * 100.0f;
             core1_load = core1_load * 0.95f + fminf(100.0f, currentLoadPercentage) * 0.05f; 
             
             float bit32Scale = 2147483647.0f; 
@@ -1449,14 +1507,14 @@ void MidiTask(void * pvParameters) {
 
 bool channelMessageCallback(ChannelMessage cm) {
     if (cm.header == 0xB0) {
-        if (cm.data1 == 20) { 
+        if (cm.data1 == 5) { 
             isVolumeMode = (cm.data2 >= 64); 
             if (!isVolumeMode) { 
                 volumePedalGain = 1.0f; 
             } 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 4 && cm.data2 >= 64) { 
+        else if (cm.data1 == 0 && cm.data2 >= 64) { 
             if (activeEffectMode == 0) { 
                 activeEffectMode = 9; 
             } else { 
@@ -1465,16 +1523,16 @@ bool channelMessageCallback(ChannelMessage cm) {
             updateLUT(); 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 5 && cm.data2 >= 64) { 
+        else if (cm.data1 == 1 && cm.data2 >= 64) { 
             activeEffectMode = (activeEffectMode + 1) % 10; 
             updateLUT(); 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 6 && cm.data2 >= 64) { 
+        else if (cm.data1 == 2 && cm.data2 >= 64) { 
             latencyMode = (latencyMode + 1) % 4; 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 7) {
+        else if (cm.data1 == 3) {
             globalAudioResetRequested = true; 
             isWhammyActive = (cm.data2 < 64); 
             isFrozen = false; 
@@ -1491,6 +1549,9 @@ bool channelMessageCallback(ChannelMessage cm) {
             volumePedalGain = 1.0f; 
             updateLUT(); 
             forceUIUpdate = true;
+        }
+        else if (cm.data1 == 4 && cm.data2 >= 64) { 
+            toggleSampleRate();
         }
         else if (cm.data1 == 8) { 
             isFrozen = (cm.data2 >= 64); 
@@ -1549,7 +1610,7 @@ bool channelMessageCallback(ChannelMessage cm) {
             } 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 21) { 
+        else if (cm.data1 == 7) { 
             isVibratoMode = (cm.data2 >= 64); 
             if (activeEffectMode == 9) { 
                 isWhammyActive = isVibratoMode; 
@@ -1637,8 +1698,10 @@ void setup() {
     delayBuffer = (float*)heap_caps_aligned_alloc(16, MAX_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     fbDelayBuffer = (float*)heap_caps_aligned_alloc(16, FB_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
     freezeBuffer = (float*)heap_caps_aligned_alloc(16, FREEZE_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
+    internalDelayCache = (float*)heap_caps_aligned_alloc(16, 17000 * sizeof(float), MALLOC_CAP_INTERNAL);
+    pitchShiftLUT = (float*)heap_caps_aligned_alloc(16, 16384 * sizeof(float), MALLOC_CAP_SPIRAM);
     
-    if (delayBuffer == nullptr || fbDelayBuffer == nullptr || freezeBuffer == nullptr) {
+    if (delayBuffer == nullptr || fbDelayBuffer == nullptr || freezeBuffer == nullptr || internalDelayCache == nullptr || pitchShiftLUT == nullptr) {
         tft.fillScreen(TFT_RED); 
         tft.setTextColor(TFT_WHITE, TFT_RED); 
         tft.drawString("MEMORY ERROR", 160, 85);
@@ -1651,6 +1714,9 @@ void setup() {
     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float)); 
     memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(float)); 
     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(float));
+    memset(internalDelayCache, 0, 17000 * sizeof(float));
+    memset(pitchShiftLUT, 0, 16384 * sizeof(float));
+    memset(hannLUT, 0, 1024 * sizeof(float));           
     
     for (int i = 0; i < 1024; i++) { 
         hannLUT[i] = sinf(PI * ((float)i / 1023.0f)); 
@@ -1681,7 +1747,7 @@ void setup() {
     i2s_new_channel(&i2sConfig, &tx_chan, &rx_chan);
     
     i2s_std_config_t stdConfig = { 
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLING_FREQUENCY), 
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate), 
         .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
         .gpio_cfg = { 
             .mclk = GPIO_NUM_43, 

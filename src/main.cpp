@@ -341,7 +341,7 @@ void toggleSampleRate() {
     
     // 5. Update DSP Dependencies
     freezeLength = currentSampleRate;
-    lutNeedsUpdate = true; // Flag for background update instead of blocking
+    lutNeedsUpdate = true; // Flag for background update instead of blocking MIDI thread
     
     // 6. Turn hardware back on and wake the DSP task
     i2s_channel_enable(tx_chan);
@@ -991,10 +991,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float rFrz = (freezeReadCache1[i] * hannLUT[(int)(phaseRead * 1023.0f)]) + 
                                  (freezeReadCache2[i] * hannLUT[(int)(phase2 * 1023.0f)]);
                     
-                    // FIX: DC_OFFSET removed from All-Pass Filters to prevent runaway denormal clipping popping
+                    // FIX: Hard flush-to-zero added to prevent extreme denormal float emulation spikes
                     float d1 = apf1Buffer[apf1Idx]; 
                     float a1 = -0.6f * rFrz + d1; 
-                    apf1Buffer[apf1Idx] = rFrz + 0.6f * d1; 
+                    float next_apf1 = rFrz + 0.6f * d1; 
+                    if (fabsf(next_apf1) < 1e-6f) next_apf1 = 0.0f;
+                    apf1Buffer[apf1Idx] = next_apf1;
                     apf1Idx++; 
                     
                     if (apf1Idx >= 1009) { 
@@ -1003,7 +1005,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     
                     float d2 = apf2Buffer[apf2Idx]; 
                     float a2 = -0.6f * a1 + d2; 
-                    apf2Buffer[apf2Idx] = a1 + 0.6f * d2; 
+                    float next_apf2 = a1 + 0.6f * d2;
+                    if (fabsf(next_apf2) < 1e-6f) next_apf2 = 0.0f;
+                    apf2Buffer[apf2Idx] = next_apf2; 
                     apf2Idx++; 
                     
                     if (apf2Idx >= 863) { 
@@ -1474,7 +1478,10 @@ void MidiTask(void * pvParameters) {
                     } 
                     volumePedalGain = (float)activePedal / 16383.0f; 
                 } else { 
-                    pitchShiftFactor = pitchShiftLUT[constrain(activePedal, 0, 16383)]; 
+                    // FIX: Safe array fetch prevents split-brain pitch glitches
+                    if (!lutNeedsUpdate) {
+                        pitchShiftFactor = pitchShiftLUT[constrain(activePedal, 0, 16383)]; 
+                    }
                 }
                 
                 forceUIUpdate = true;
@@ -1494,7 +1501,9 @@ void MidiTask(void * pvParameters) {
                 currentPB3 = 8192; 
                 
                 if (!isVolumeMode) { 
-                    pitchShiftFactor = pitchShiftLUT[8192]; 
+                    if (!lutNeedsUpdate) {
+                        pitchShiftFactor = pitchShiftLUT[8192]; 
+                    }
                 } else { 
                     volumePedalGain = 8192.0f / 16383.0f; 
                 }

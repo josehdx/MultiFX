@@ -839,410 +839,427 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             bool blockIsMuted = clearBuffersRequested;
 
             uint32_t start_cycles = xthal_get_ccount(); 
-            
-            float targetWindow = LATENCY_WINDOWS[latencyMode] * (currentSampleRate == 96000 ? 2.0f : 1.0f);
-            
-            if (currentWindowSize != targetWindow) { 
-                currentWindowSize = targetWindow; 
-                uint32_t halfWindowFixed = ((uint32_t)targetWindow / 2) << 16;
+
+            // FIX: If the background task is actively zeroing memory, we completely bypass the heavy DSP loops 
+            // This permanently prevents Floating-Point "NaN" Poisoning caused by tearing cross-core memory reads
+            if (blockIsMuted) {
+                memset(dsp_out_block, 0, framesRead * 2 * sizeof(float));
+                ui_audio_level = 0.0f;
+                ui_output_level = 0.0f;
+            } else {
+
+                float targetWindow = LATENCY_WINDOWS[latencyMode] * (currentSampleRate == 96000 ? 2.0f : 1.0f);
                 
-                tap_w1_1 = 0; 
-                tap_w1_2 = halfWindowFixed; 
-                
-                tap_w2_1 = 0; 
-                tap_w2_2 = halfWindowFixed;
-                
-                tap_w3_1 = 0; 
-                tap_w3_2 = halfWindowFixed; 
-                
-                tap_w4_1 = 0; 
-                tap_w4_2 = halfWindowFixed; 
-                
-                tap_w5_1 = 0; 
-                tap_w5_2 = halfWindowFixed;
-            }
-            
-            uint32_t hannIntMult = (1024U << 16) / (uint32_t)currentWindowSize; 
-            uint32_t windowMask = (uint32_t)currentWindowSize - 1;
-            
-            float chorusPhaseIncr = 1536.0f / (float)currentSampleRate; 
-            float feedbackPhaseIncr = 5120.0f / (float)currentSampleRate;
-            
-            bool frzActive = ((activeEffectMode == 1 && isWhammyActive) || isFrozen); 
-            
-            if (frzActive && !wasFrozen) { 
-                freezePlayCounterVar = 0; 
-                
-                int bestStart = freezeWriteIdxVar;
-                for (int s = 0; s < 4000; s++) {
-                    int idx = (freezeWriteIdxVar - s + freezeLength) % freezeLength;
-                    int prev = (idx - 1 + freezeLength) % freezeLength;
-                    if (freezeBuffer[idx] >= 0.0f && freezeBuffer[prev] < 0.0f) {
-                        bestStart = idx;
-                        break;
-                    }
-                }
-                freezeStartIdxVar = bestStart;
-                
-                activeFreezeLength = freezeLength;
-                int searchEnd = (bestStart - 1 + freezeLength) % freezeLength;
-                for (int s = 0; s < 4000; s++) {
-                    int idx = (searchEnd - s + freezeLength) % freezeLength;
-                    int prev = (idx - 1 + freezeLength) % freezeLength;
-                    if (freezeBuffer[idx] >= 0.0f && freezeBuffer[prev] < 0.0f) {
-                        activeFreezeLength = freezeLength - s;
-                        break;
-                    }
+                if (currentWindowSize != targetWindow) { 
+                    currentWindowSize = targetWindow; 
+                    uint32_t halfWindowFixed = ((uint32_t)targetWindow / 2) << 16;
+                    
+                    tap_w1_1 = 0; 
+                    tap_w1_2 = halfWindowFixed; 
+                    
+                    tap_w2_1 = 0; 
+                    tap_w2_2 = halfWindowFixed;
+                    
+                    tap_w3_1 = 0; 
+                    tap_w3_2 = halfWindowFixed; 
+                    
+                    tap_w4_1 = 0; 
+                    tap_w4_2 = halfWindowFixed; 
+                    
+                    tap_w5_1 = 0; 
+                    tap_w5_2 = halfWindowFixed;
                 }
                 
-                if (activeFreezeLength < freezeLength / 2) {
+                uint32_t hannIntMult = (1024U << 16) / (uint32_t)currentWindowSize; 
+                uint32_t windowMask = (uint32_t)currentWindowSize - 1;
+                
+                float chorusPhaseIncr = 1536.0f / (float)currentSampleRate; 
+                float feedbackPhaseIncr = 5120.0f / (float)currentSampleRate;
+                
+                bool frzActive = ((activeEffectMode == 1 && isWhammyActive) || isFrozen); 
+                
+                if (frzActive && !wasFrozen) { 
+                    freezePlayCounterVar = 0; 
+                    
+                    int bestStart = freezeWriteIdxVar;
+                    for (int s = 0; s < 4000; s++) {
+                        int idx = (freezeWriteIdxVar - s + freezeLength) % freezeLength;
+                        int prev = (idx - 1 + freezeLength) % freezeLength;
+                        if (freezeBuffer[idx] >= 0.0f && freezeBuffer[prev] < 0.0f) {
+                            bestStart = idx;
+                            break;
+                        }
+                    }
+                    freezeStartIdxVar = bestStart;
+                    
                     activeFreezeLength = freezeLength;
-                }
-            } 
-            
-            if (!frzActive && wasFrozen) {
-                apfNeedsClear = true;
-            }
-            wasFrozen = frzActive;
-            
-            float activeInvFreqLength = 1.0f / (float)activeFreezeLength;
-            
-            bool synthActive = ((activeEffectMode == 5 && isWhammyActive) || isSynthMode);
-            bool padActive = ((activeEffectMode == 6 && isWhammyActive) || isPadMode);
-            bool harmActive = ((activeEffectMode == 3 && isWhammyActive) || isHarmonizerMode);
-            bool swellActive = ((activeEffectMode == 8 && isWhammyActive) || isSwellMode);
-            bool chorusActive = ((activeEffectMode == 7 && isWhammyActive) || isChorusMode);
-            bool feedbackActive = ((activeEffectMode == 2 && isWhammyActive) || isFeedbackActive);
-            bool vibratoActive = ((activeEffectMode == 9 && isWhammyActive) || isVibratoMode);
-            bool capoActive = ((activeEffectMode == 4 && isWhammyActive) || isCapoMode);
-            
-            float peakInputVal = 0.0f; 
-            float peakOutputVal = 0.0f;
-            
-            #pragma GCC ivdep
-            for (int i = 0; i < framesRead; i++) { 
-                input_block[i] = ((float)i2s_in_block[i * 2] * normFactor); 
-            }
-            
-            dsps_biquad_f32(input_block, dc_block, framesRead, dc_coeffs, dc_state);
-            
-            float currentPitch = pitchShiftFactor; 
-            float harmPitch = currentPitch * globalHarmRatio;
-            float choPitch  = currentPitch * globalChorusRatio;
-            float fbPitch   = currentPitch * globalFbRatio;
-            
-            for (int i = 0; i < framesRead; i++) {
-                float inSample = dc_block[i]; 
-                inputEnvelope = inputEnvelope * 0.99f + fabsf(inSample) * 0.01f + DC_OFFSET;
-                
-                if (swellActive) {
-                    if (inputEnvelope > 0.015f) { 
-                        swellGain = fminf(1.0f, swellGain + 0.00002f); 
-                    } else { 
-                        swellGain = fmaxf(0.0f, swellGain - 0.00005f); 
-                    }
-                } else { 
-                    swellGain = 1.0f; 
-                }
-                
-                float procSample = inSample;
-                
-                if (synthActive) { 
-                    if (inputEnvelope > 0.005f) { 
-                        synthEnv = fminf(1.0f, synthEnv + 0.1f); 
-                    } else { 
-                        synthEnv = fmaxf(0.0f, synthEnv - 0.005f); 
+                    int searchEnd = (bestStart - 1 + freezeLength) % freezeLength;
+                    for (int s = 0; s < 4000; s++) {
+                        int idx = (searchEnd - s + freezeLength) % freezeLength;
+                        int prev = (idx - 1 + freezeLength) % freezeLength;
+                        if (freezeBuffer[idx] >= 0.0f && freezeBuffer[prev] < 0.0f) {
+                            activeFreezeLength = freezeLength - s;
+                            break;
+                        }
                     }
                     
-                    int waveIdx = constrain((int)((procSample + 1.0f) * 1023.5f), 0, WAVE_LUT_SIZE - 1);
-                    procSample = synthLUT[waveIdx]; 
-                    
-                    synthFilter = synthFilter + (0.3f + 0.8f * synthEnv) * (procSample - synthFilter) + DC_OFFSET; 
-                    procSample = synthFilter * 0.1f;
+                    if (activeFreezeLength < freezeLength / 2) {
+                        activeFreezeLength = freezeLength;
+                    }
                 } 
                 
-                if (padActive) { 
-                    if (inputEnvelope > 0.005f) { 
-                        padEnv = fminf(1.0f, padEnv + 0.00002f); 
-                    } else { 
-                        padEnv = fmaxf(0.0f, padEnv - 0.000005f); 
-                    }
-                    procSample *= padEnv; 
+                if (!frzActive && wasFrozen) {
+                    apfNeedsClear = true;
+                }
+                wasFrozen = frzActive;
+                
+                float activeInvFreqLength = 1.0f / (float)activeFreezeLength;
+                
+                bool synthActive = ((activeEffectMode == 5 && isWhammyActive) || isSynthMode);
+                bool padActive = ((activeEffectMode == 6 && isWhammyActive) || isPadMode);
+                bool harmActive = ((activeEffectMode == 3 && isWhammyActive) || isHarmonizerMode);
+                bool swellActive = ((activeEffectMode == 8 && isWhammyActive) || isSwellMode);
+                bool chorusActive = ((activeEffectMode == 7 && isWhammyActive) || isChorusMode);
+                bool feedbackActive = ((activeEffectMode == 2 && isWhammyActive) || isFeedbackActive);
+                bool vibratoActive = ((activeEffectMode == 9 && isWhammyActive) || isVibratoMode);
+                bool capoActive = ((activeEffectMode == 4 && isWhammyActive) || isCapoMode);
+                
+                float peakInputVal = 0.0f; 
+                float peakOutputVal = 0.0f;
+                
+                #pragma GCC ivdep
+                for (int i = 0; i < framesRead; i++) { 
+                    input_block[i] = ((float)i2s_in_block[i * 2] * normFactor); 
                 }
                 
-                // Write directly to Freeze PSRAM without memcpy wrappers
-                if (!frzActive) { 
-                    if (!blockIsMuted) {
-                        freezeBuffer[freezeWriteIdxVar] = procSample;
-                    }
-                    freezeWriteIdxVar++;
-                    if (freezeWriteIdxVar >= freezeLength) freezeWriteIdxVar = 0;
-                }
+                dsps_biquad_f32(input_block, dc_block, framesRead, dc_coeffs, dc_state);
                 
-                if (freezeRamp > 0.0f || frzActive) {
-                    if (frzActive) { 
-                        freezeRamp = fminf(1.0f, freezeRamp + 0.0002f); 
-                    } else { 
-                        freezeRamp = fmaxf(0.0f, freezeRamp - 0.00005f); 
-                    }
-                }
+                float currentPitch = pitchShiftFactor; 
+                float harmPitch = currentPitch * globalHarmRatio;
+                float choPitch  = currentPitch * globalChorusRatio;
+                float fbPitch   = currentPitch * globalFbRatio;
                 
-                float fzOut = 0.0f;
-                
-                if (freezeRamp > 0.0f) { 
-                    float phaseRead = (float)freezePlayCounterVar * activeInvFreqLength; 
-                    float phase2 = (phaseRead + 0.5f); 
+                for (int i = 0; i < framesRead; i++) {
+                    float inSample = dc_block[i]; 
+                    inputEnvelope = inputEnvelope * 0.99f + fabsf(inSample) * 0.01f + DC_OFFSET;
                     
-                    if (phase2 >= 1.0f) { 
-                        phase2 -= 1.0f; 
-                    }
-                    
-                    // Read directly from Hardware Data Cache to completely fix granular crossfade loop bounds
-                    int idx1 = (freezeStartIdxVar + freezePlayCounterVar) % freezeLength;
-                    int counter2 = (freezePlayCounterVar + (activeFreezeLength / 2)) % activeFreezeLength;
-                    int idx2 = (freezeStartIdxVar + counter2) % freezeLength;
-                    
-                    float rFrz = (freezeBuffer[idx1] * hannLUT[(int)(phaseRead * 1023.0f)]) + 
-                                 (freezeBuffer[idx2] * hannLUT[(int)(phase2 * 1023.0f)]);
-                    
-                    float d1 = apf1Buffer[apf1Idx]; 
-                    float a1 = -0.6f * rFrz + d1; 
-                    float next_apf1 = rFrz + 0.6f * d1; 
-                    if (fabsf(next_apf1) < 1e-6f) next_apf1 = 0.0f;
-                    apf1Buffer[apf1Idx] = next_apf1;
-                    apf1Idx++; 
-                    
-                    if (apf1Idx >= 1009) { 
-                        apf1Idx = 0; 
-                    }
-                    
-                    float d2 = apf2Buffer[apf2Idx]; 
-                    float a2 = -0.6f * a1 + d2; 
-                    float next_apf2 = a1 + 0.6f * d2;
-                    if (fabsf(next_apf2) < 1e-6f) next_apf2 = 0.0f;
-                    apf2Buffer[apf2Idx] = next_apf2; 
-                    apf2Idx++; 
-                    
-                    if (apf2Idx >= 863) { 
-                        apf2Idx = 0; 
-                    }
-                    
-                    fzOut = a2 * freezeRamp; 
-                    freezePlayCounterVar++; 
-                    
-                    if (freezePlayCounterVar >= activeFreezeLength) { 
-                        freezePlayCounterVar = 0; 
-                    }
-                } else if (apfNeedsClear) {
-                    memset(apf1Buffer, 0, sizeof(apf1Buffer));
-                    memset(apf2Buffer, 0, sizeof(apf2Buffer));
-                    apfNeedsClear = false;
-                }
-                
-                float delayIn = (frzActive && freezeRamp > 0.0f) ? fzOut : procSample; 
-                float boundedDelayIn = constrain(delayIn, -1.0f, 1.0f);
-                
-                int localWriteIdx = writeIndex; 
-                
-                if (!blockIsMuted) {
-                    delayBuffer[localWriteIdx] = boundedDelayIn;
-                }
-                
-                float spd1 = currentPitch;
-                
-                if (vibratoActive) {
-                    vibratoLfoPhase += globalVibratoPhaseInc; 
-                    
-                    if (vibratoLfoPhase >= LFO_LUT_SIZE) { 
-                        vibratoLfoPhase -= LFO_LUT_SIZE; 
-                    }
-                    
-                    spd1 *= lfoLUT[(int)vibratoLfoPhase];
-                }
-                
-                float spd2 = harmPitch; 
-                float spd3 = choPitch;
-                
-                if (chorusActive) { 
-                    chorusLfoPhase += chorusPhaseIncr; 
-                    
-                    if (chorusLfoPhase >= LFO_LUT_SIZE) { 
-                        chorusLfoPhase -= LFO_LUT_SIZE; 
-                    }
-                    
-                    spd3 *= lfoLUT[(int)chorusLfoPhase]; 
-                }
-                
-                float spd4 = 1.0f; 
-                float spd5 = 1.0f;
-                
-                float w4 = 0.0f;
-                float w5 = 0.0f;
-                float fbOutNode = 0.0f;
-                
-                if (feedbackActive || feedbackRamp > 0.0f) { 
-                    w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                         processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
-                    w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                         processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
-                         
-                    if (feedbackActive) {
-                        if (inputEnvelope > 0.005f) { 
-                            feedbackRamp = fminf(1.0f, feedbackRamp + 0.000011f); 
+                    if (swellActive) {
+                        if (inputEnvelope > 0.015f) { 
+                            swellGain = fminf(1.0f, swellGain + 0.00002f); 
                         } else { 
-                            feedbackRamp = fmaxf(0.0f, feedbackRamp - 0.005f); 
+                            swellGain = fmaxf(0.0f, swellGain - 0.00005f); 
                         }
                     } else { 
-                        feedbackRamp = fmaxf(0.0f, feedbackRamp - 0.0001f); 
+                        swellGain = 1.0f; 
                     }
                     
-                    float mixV = fmaxf(0.0f, fminf((feedbackRamp - 0.1f) * 2.0f, 1.0f));
-                    float feedInput = (frzActive && freezeRamp > 0.0f) ? fzOut : (w4 * (1.0f - mixV)) + (w5 * mixV);
+                    float procSample = inSample;
                     
-                    fbHpfState += 0.05f * (feedInput - fbHpfState) + DC_OFFSET; 
-                    float gainDrive = constrain((feedInput - fbHpfState) * 30.0f, -1.0f, 1.0f); 
+                    if (synthActive) { 
+                        if (inputEnvelope > 0.005f) { 
+                            synthEnv = fminf(1.0f, synthEnv + 0.1f); 
+                        } else { 
+                            synthEnv = fmaxf(0.0f, synthEnv - 0.005f); 
+                        }
+                        
+                        int waveIdx = constrain((int)((procSample + 1.0f) * 1023.5f), 0, WAVE_LUT_SIZE - 1);
+                        procSample = synthLUT[waveIdx]; 
+                        
+                        synthFilter = synthFilter + (0.3f + 0.8f * synthEnv) * (procSample - synthFilter) + DC_OFFSET; 
+                        procSample = synthFilter * 0.1f;
+                    } 
                     
-                    feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
-                    float satFb = feedbackFilterVar * (feedbackRamp * feedbackRamp * feedbackRamp) * 0.85f; 
+                    if (padActive) { 
+                        if (inputEnvelope > 0.005f) { 
+                            padEnv = fminf(1.0f, padEnv + 0.00002f); 
+                        } else { 
+                            padEnv = fmaxf(0.0f, padEnv - 0.000005f); 
+                        }
+                        procSample *= padEnv; 
+                    }
                     
-                    // Direct write/read to FB PSRAM bypasses sluggish residual block memcopies
-                    if (!blockIsMuted) {
+                    // Write directly to Freeze PSRAM without memcpy wrappers
+                    if (!frzActive) { 
+                        freezeBuffer[freezeWriteIdxVar] = procSample;
+                        freezeWriteIdxVar++;
+                        if (freezeWriteIdxVar >= freezeLength) freezeWriteIdxVar = 0;
+                    }
+                    
+                    if (freezeRamp > 0.0f || frzActive) {
+                        if (frzActive) { 
+                            freezeRamp = fminf(1.0f, freezeRamp + 0.0002f); 
+                        } else { 
+                            freezeRamp = fmaxf(0.0f, freezeRamp - 0.00005f); 
+                        }
+                    }
+                    
+                    float fzOut = 0.0f;
+                    
+                    if (freezeRamp > 0.0f) { 
+                        float phaseRead = (float)freezePlayCounterVar * activeInvFreqLength; 
+                        float phase2 = (phaseRead + 0.5f); 
+                        
+                        if (phase2 >= 1.0f) { 
+                            phase2 -= 1.0f; 
+                        }
+                        
+                        // Read directly from Hardware Data Cache to completely fix granular crossfade loop bounds
+                        int idx1 = (freezeStartIdxVar + freezePlayCounterVar) % freezeLength;
+                        int counter2 = (freezePlayCounterVar + (activeFreezeLength / 2)) % activeFreezeLength;
+                        int idx2 = (freezeStartIdxVar + counter2) % freezeLength;
+                        
+                        float rFrz = (freezeBuffer[idx1] * hannLUT[(int)(phaseRead * 1023.0f)]) + 
+                                     (freezeBuffer[idx2] * hannLUT[(int)(phase2 * 1023.0f)]);
+                        
+                        float d1 = apf1Buffer[apf1Idx]; 
+                        float a1 = -0.6f * rFrz + d1; 
+                        float next_apf1 = rFrz + 0.6f * d1; 
+                        if (fabsf(next_apf1) < 1e-6f) next_apf1 = 0.0f;
+                        apf1Buffer[apf1Idx] = next_apf1;
+                        apf1Idx++; 
+                        
+                        if (apf1Idx >= 1009) { 
+                            apf1Idx = 0; 
+                        }
+                        
+                        float d2 = apf2Buffer[apf2Idx]; 
+                        float a2 = -0.6f * a1 + d2; 
+                        float next_apf2 = a1 + 0.6f * d2;
+                        if (fabsf(next_apf2) < 1e-6f) next_apf2 = 0.0f;
+                        apf2Buffer[apf2Idx] = next_apf2; 
+                        apf2Idx++; 
+                        
+                        if (apf2Idx >= 863) { 
+                            apf2Idx = 0; 
+                        }
+                        
+                        fzOut = a2 * freezeRamp; 
+                        freezePlayCounterVar++; 
+                        
+                        if (freezePlayCounterVar >= activeFreezeLength) { 
+                            freezePlayCounterVar = 0; 
+                        }
+                    } else if (apfNeedsClear) {
+                        memset(apf1Buffer, 0, sizeof(apf1Buffer));
+                        memset(apf2Buffer, 0, sizeof(apf2Buffer));
+                        apfNeedsClear = false;
+                    }
+                    
+                    float delayIn = (frzActive && freezeRamp > 0.0f) ? fzOut : procSample; 
+                    float boundedDelayIn = constrain(delayIn, -1.0f, 1.0f);
+                    
+                    int localWriteIdx = writeIndex; 
+                    
+                    delayBuffer[localWriteIdx] = boundedDelayIn;
+                    
+                    float spd1 = currentPitch;
+                    
+                    if (vibratoActive) {
+                        vibratoLfoPhase += globalVibratoPhaseInc; 
+                        
+                        if (vibratoLfoPhase >= LFO_LUT_SIZE) { 
+                            vibratoLfoPhase -= LFO_LUT_SIZE; 
+                        }
+                        
+                        spd1 *= lfoLUT[(int)vibratoLfoPhase];
+                    }
+                    
+                    float spd2 = harmPitch; 
+                    float spd3 = choPitch;
+                    
+                    if (chorusActive) { 
+                        chorusLfoPhase += chorusPhaseIncr; 
+                        
+                        if (chorusLfoPhase >= LFO_LUT_SIZE) { 
+                            chorusLfoPhase -= LFO_LUT_SIZE; 
+                        }
+                        
+                        spd3 *= lfoLUT[(int)chorusLfoPhase]; 
+                    }
+                    
+                    float spd4 = 1.0f; 
+                    float spd5 = 1.0f;
+                    
+                    float w4 = 0.0f;
+                    float w5 = 0.0f;
+                    float fbOutNode = 0.0f;
+                    
+                    if (feedbackActive || feedbackRamp > 0.0f) { 
+                        w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                             processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                        w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                             processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                             
+                        if (feedbackActive) {
+                            if (inputEnvelope > 0.005f) { 
+                                feedbackRamp = fminf(1.0f, feedbackRamp + 0.000011f); 
+                            } else { 
+                                feedbackRamp = fmaxf(0.0f, feedbackRamp - 0.005f); 
+                            }
+                        } else { 
+                            feedbackRamp = fmaxf(0.0f, feedbackRamp - 0.0001f); 
+                        }
+                        
+                        float mixV = fmaxf(0.0f, fminf((feedbackRamp - 0.1f) * 2.0f, 1.0f));
+                        float feedInput = (frzActive && freezeRamp > 0.0f) ? fzOut : (w4 * (1.0f - mixV)) + (w5 * mixV);
+                        
+                        fbHpfState += 0.05f * (feedInput - fbHpfState) + DC_OFFSET; 
+                        float gainDrive = constrain((feedInput - fbHpfState) * 30.0f, -1.0f, 1.0f); 
+                        
+                        feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
+                        float satFb = feedbackFilterVar * (feedbackRamp * feedbackRamp * feedbackRamp) * 0.85f; 
+                        
                         fbDelayBuffer[fbDelayWriteIdx] = satFb;
+                        
+                        int delaySamples = (int)(currentSampleRate * 0.02f);
+                        int fbReadIdx = (fbDelayWriteIdx - delaySamples + FB_BUFFER_SIZE) & FB_BUFFER_MASK;
+                        fbOutNode = fbDelayBuffer[fbReadIdx];
+                        
+                        fbDelayWriteIdx = (fbDelayWriteIdx + 1) & FB_BUFFER_MASK;
                     }
                     
-                    int delaySamples = (int)(currentSampleRate * 0.02f);
-                    int fbReadIdx = (fbDelayWriteIdx - delaySamples + FB_BUFFER_SIZE) & FB_BUFFER_MASK;
-                    fbOutNode = fbDelayBuffer[fbReadIdx];
+                    float w1 = processTap(tap_w1_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                               processTap(tap_w1_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                    w1_block[i] = w1; 
                     
-                    fbDelayWriteIdx = (fbDelayWriteIdx + 1) & FB_BUFFER_MASK;
+                    float w2 = 0.0f;
+                    if (harmActive) {
+                        w2 = processTap(tap_w2_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                             processTap(tap_w2_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                    }
+                    w2_block[i] = w2; 
+                    
+                    float w3 = 0.0f;
+                    if (chorusActive) {
+                        w3 = processTap(tap_w3_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                             processTap(tap_w3_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                    }
+                    w3_block[i] = w3; 
+                    
+                    w4_block[i] = w4; 
+                    w5_block[i] = w5; 
+                    
+                    int32_t step1 = (int32_t)((1.0f - spd1) * 65536.0f); 
+                    tap_w1_1 += step1; 
+                    tap_w1_2 += step1; 
+                    
+                    int32_t step2 = (int32_t)((1.0f - spd2) * 65536.0f); 
+                    tap_w2_1 += step2; 
+                    tap_w2_2 += step2; 
+                    
+                    int32_t step3 = (int32_t)((1.0f - spd3) * 65536.0f); 
+                    tap_w3_1 += step3; 
+                    tap_w3_2 += step3; 
+                    
+                    int32_t step4 = (int32_t)((1.0f - spd4) * 65536.0f); 
+                    tap_w4_1 += step4; 
+                    tap_w4_2 += step4; 
+                    
+                    int32_t step5 = (int32_t)((1.0f - spd5) * 65536.0f); 
+                    tap_w5_1 += step5; 
+                    tap_w5_2 += step5; 
+                    
+                    writeIndex = (writeIndex + 1) & BUFFER_MASK;
+                    
+                    if (padActive) { 
+                        padFilter = padFilter * 0.95f + w1 * 0.05f + DC_OFFSET; 
+                    } else { 
+                        padFilter = padFilter * 0.95f + DC_OFFSET; 
+                    }
+                    
+                    dry_block[i] = inSample;
+                    fz_block[i] = fzOut;
+                    pad_block[i] = padFilter;
+                    fbOut_block[i] = fbOutNode;
                 }
                 
-                float w1 = processTap(tap_w1_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                           processTap(tap_w1_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
-                w1_block[i] = w1; 
+                // --- SIMD AUTO-VECTORIZED WET/DRY MIXING ---
+                bool activeGroup = isWhammyActive || harmActive || chorusActive || feedbackActive || synthActive || padActive || frzActive || vibratoActive || capoActive;
+                bool dryGroup = chorusActive || padActive || frzActive || feedbackActive || (freezeRamp > 0.0f) || (feedbackRamp > 0.0f);
+                bool repeatGroup = capoActive || synthActive || vibratoActive || padActive || harmActive;
                 
-                float w2 = 0.0f;
-                if (harmActive) {
-                    w2 = processTap(tap_w2_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                         processTap(tap_w2_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
-                }
-                w2_block[i] = w2; 
+                // Extracted pad_block evaluation into a clean scalar check to restore 128-bit vectorization!
+                bool padIsAudible = padActive || (padFilter > 0.001f);
                 
-                float w3 = 0.0f;
-                if (chorusActive) {
-                    w3 = processTap(tap_w3_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                         processTap(tap_w3_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
-                }
-                w3_block[i] = w3; 
-                
-                w4_block[i] = w4; 
-                w5_block[i] = w5; 
-                
-                int32_t step1 = (int32_t)((1.0f - spd1) * 65536.0f); 
-                tap_w1_1 += step1; 
-                tap_w1_2 += step1; 
-                
-                int32_t step2 = (int32_t)((1.0f - spd2) * 65536.0f); 
-                tap_w2_1 += step2; 
-                tap_w2_2 += step2; 
-                
-                int32_t step3 = (int32_t)((1.0f - spd3) * 65536.0f); 
-                tap_w3_1 += step3; 
-                tap_w3_2 += step3; 
-                
-                int32_t step4 = (int32_t)((1.0f - spd4) * 65536.0f); 
-                tap_w4_1 += step4; 
-                tap_w4_2 += step4; 
-                
-                int32_t step5 = (int32_t)((1.0f - spd5) * 65536.0f); 
-                tap_w5_1 += step5; 
-                tap_w5_2 += step5; 
-                
-                writeIndex = (writeIndex + 1) & BUFFER_MASK;
-                
-                if (padActive) { 
-                    padFilter = padFilter * 0.95f + w1 * 0.05f + DC_OFFSET; 
-                } else { 
-                    padFilter = padFilter * 0.95f + DC_OFFSET; 
-                }
-                
-                dry_block[i] = inSample;
-                fz_block[i] = fzOut;
-                pad_block[i] = padFilter;
-                fbOut_block[i] = fbOutNode;
-            }
-            
-            // --- SIMD AUTO-VECTORIZED WET/DRY MIXING ---
-            bool activeGroup = isWhammyActive || harmActive || chorusActive || feedbackActive || synthActive || padActive || frzActive || vibratoActive || capoActive;
-            bool dryGroup = chorusActive || padActive || frzActive || feedbackActive || (freezeRamp > 0.0f) || (feedbackRamp > 0.0f);
-            bool repeatGroup = capoActive || synthActive || vibratoActive || padActive || harmActive;
-            
-            // Extracted pad_block evaluation into a clean scalar check to restore 128-bit vectorization!
-            bool padIsAudible = padActive || (padFilter > 0.001f);
-            
-            if (!activeGroup && freezeRamp <= 0.0f && feedbackRamp <= 0.0f && !padIsAudible) {
-                memcpy(mix_block, dry_block, framesRead * sizeof(float));
-            } else {
-                
-                // Hoist branches OUTSIDE the loop to guarantee 128-bit MAC Hardware Vectorization
-                float g_base = 0.0f;
-                if (dryGroup) {
-                    if (!repeatGroup) g_base = 0.4f;
-                } else if (harmActive) {
-                    g_base = 0.5f;
+                if (!activeGroup && freezeRamp <= 0.0f && feedbackRamp <= 0.0f && !padIsAudible) {
+                    memcpy(mix_block, dry_block, framesRead * sizeof(float));
                 } else {
-                    g_base = 1.0f;
+                    
+                    // Hoist branches OUTSIDE the loop to guarantee 128-bit MAC Hardware Vectorization
+                    float g_base = 0.0f;
+                    if (dryGroup) {
+                        if (!repeatGroup) g_base = 0.4f;
+                    } else if (harmActive) {
+                        g_base = 0.5f;
+                    } else {
+                        g_base = 1.0f;
+                    }
+                    
+                    float g_w2 = harmActive ? 0.5f : 0.0f;
+                    float g_w3 = chorusActive ? 0.4f : 0.0f;
+                    float g_pad = padIsAudible ? 1.5f : 0.0f;
+                    float g_frz = (!frzActive && freezeRamp > 0.0f) ? 0.5f : 0.0f;
+                    float g_fb = (feedbackActive || feedbackRamp > 0.0f) ? 0.6f : 0.0f;
+                    
+                    float g_whammy = isWhammyActive ? 1.0f : 0.0f;
+                    float g_dry = isWhammyActive ? 0.0f : 1.0f;
+
+                    #pragma GCC ivdep
+                    for (int i = 0; i < framesRead; i++) {
+                        
+                        // UNIVERSAL BASE SIGNAL: Branchless master pitch foundation canvas
+                        float baseSignal = (w1_block[i] * g_whammy) + (dry_block[i] * g_dry);
+                        
+                        float sMix = DC_OFFSET;
+                        sMix += baseSignal * g_base;
+                        sMix += w2_block[i] * g_w2;
+                        sMix += w3_block[i] * g_w3;
+                        sMix += pad_block[i] * g_pad;
+                        sMix += fz_block[i] * g_frz;
+                        sMix += fbOut_block[i] * g_fb;
+                        
+                        // Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
+                        sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
+                        sMix = sMix * (1.0f - (0.1f * sMix * sMix));
+                        mix_block[i] = sMix;
+                    }
                 }
                 
-                float g_w2 = harmActive ? 0.5f : 0.0f;
-                float g_w3 = chorusActive ? 0.4f : 0.0f;
-                float g_pad = padIsAudible ? 1.5f : 0.0f;
-                float g_frz = (!frzActive && freezeRamp > 0.0f) ? 0.5f : 0.0f;
-                float g_fb = (feedbackActive || feedbackRamp > 0.0f) ? 0.6f : 0.0f;
-                
-                float g_whammy = isWhammyActive ? 1.0f : 0.0f;
-                float g_dry = isWhammyActive ? 0.0f : 1.0f;
-
                 #pragma GCC ivdep
                 for (int i = 0; i < framesRead; i++) {
+                    float outStage = mix_block[i] * swellGain * volumePedalGain; 
                     
-                    // UNIVERSAL BASE SIGNAL: Branchless master pitch foundation canvas
-                    float baseSignal = (w1_block[i] * g_whammy) + (dry_block[i] * g_dry);
+                    dsp_out_block[i * 2] = outStage; 
+                    dsp_out_block[i * 2 + 1] = outStage;
                     
-                    float sMix = DC_OFFSET;
-                    sMix += baseSignal * g_base;
-                    sMix += w2_block[i] * g_w2;
-                    sMix += w3_block[i] * g_w3;
-                    sMix += pad_block[i] * g_pad;
-                    sMix += fz_block[i] * g_frz;
-                    sMix += fbOut_block[i] * g_fb;
+                    if (fabsf(dc_block[i]) > peakInputVal) { 
+                        peakInputVal = fabsf(dc_block[i]); 
+                    }
                     
-                    // Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
-                    sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
-                    sMix = sMix * (1.0f - (0.1f * sMix * sMix));
-                    mix_block[i] = sMix;
+                    if (fabsf(outStage) > peakOutputVal) { 
+                        peakOutputVal = fabsf(outStage); 
+                    }
                 }
-            }
-            
-            #pragma GCC ivdep
-            for (int i = 0; i < framesRead; i++) {
-                float outStage = mix_block[i] * swellGain * volumePedalGain; 
-                
-                if (blockIsMuted) {
-                    outStage = 0.0f;
-                }
-                
-                dsp_out_block[i * 2] = outStage; 
-                dsp_out_block[i * 2 + 1] = outStage;
-                
-                if (fabsf(dc_block[i]) > peakInputVal) { 
-                    peakInputVal = fabsf(dc_block[i]); 
+
+                if (peakInputVal > ui_audio_level) { 
+                    ui_audio_level = peakInputVal; 
+                } else { 
+                    ui_audio_level *= 0.998f; 
+                    if (ui_audio_level < 1e-5f) {
+                        ui_audio_level = 0.0f;
+                    }
                 }
                 
-                if (fabsf(outStage) > peakOutputVal) { 
-                    peakOutputVal = fabsf(outStage); 
+                if (peakOutputVal > ui_output_level) { 
+                    ui_output_level = peakOutputVal; 
+                } else { 
+                    ui_output_level *= 0.998f; 
+                    if (ui_output_level < 1e-5f) {
+                        ui_output_level = 0.0f;
+                    }
                 }
-            }
+
+            } // --- END OF !blockIsMuted DSP BYPASS ---
             
             uint32_t end_timer = xthal_get_ccount(); 
             float max_cycles = (240000000.0f / (float)currentSampleRate) * (float)framesRead;
@@ -1252,28 +1269,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float bit32Scale = 2147483647.0f; 
             dsps_mul_f32(dsp_out_block, &bit32Scale, dsp_out_block, framesRead * 2, 1, 0, 1);
             
-            // FIX: C++ Safe Integer Casting bounds protection avoids wrap-to-infinity hardware pop
+            // FIX: C++ Safe Integer Casting bounds protection avoids wrap-to-infinity hardware FPU popping
             #pragma GCC ivdep
             for (int i = 0; i < framesRead * 2; i++) {
                 i2s_out_block[i] = (int32_t)fmaxf(-2147483520.0f, fminf(dsp_out_block[i], 2147483520.0f));
-            }
-            
-            if (peakInputVal > ui_audio_level) { 
-                ui_audio_level = peakInputVal; 
-            } else { 
-                ui_audio_level *= 0.998f; 
-                if (ui_audio_level < 1e-5f) {
-                    ui_audio_level = 0.0f;
-                }
-            }
-            
-            if (peakOutputVal > ui_output_level) { 
-                ui_output_level = peakOutputVal; 
-            } else { 
-                ui_output_level *= 0.998f; 
-                if (ui_output_level < 1e-5f) {
-                    ui_output_level = 0.0f;
-                }
             }
             
             size_t bytesWrittenCount; 

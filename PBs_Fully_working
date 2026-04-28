@@ -460,7 +460,9 @@ void updateLUT() {
     
     memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
-    // FIX: Pitch factor assignment deleted here to prevent cross-thread jitter before main loop applies lastActivePedal
+    if (!isVolumeMode) { 
+        pitchShiftFactor = pitchShiftLUT[constrain(currentPB1, 0, 16383)]; 
+    }
     
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f);
     globalChorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
@@ -717,6 +719,8 @@ struct DebouncedButton {
 };
 
 void DisplayTask(void * pvParameters) {
+    // FIX: metersNeedClear flag permanently fixes the frozen UI visual glitch
+    bool metersNeedClear = false;
     for (;;) {
         if (wakeupPending) { 
             pinMode(15, OUTPUT); 
@@ -734,8 +738,18 @@ void DisplayTask(void * pvParameters) {
         if (forceUIUpdate) { 
             forceUIUpdate = false; 
             updateDisplay(); 
-        } else if (!isScreenOff && (ui_audio_level > 0.02f || ui_output_level > 0.02f)) { 
-            updateMeters(); 
+            metersNeedClear = true;
+        } else if (!isScreenOff) {
+            if (ui_audio_level > 0.02f || ui_output_level > 0.02f) { 
+                updateMeters(); 
+                metersNeedClear = true;
+            } else if (metersNeedClear) {
+                // Instantly zero the meters to draw a blank frame and stop CPU burn
+                ui_audio_level = 0.0f;
+                ui_output_level = 0.0f;
+                updateMeters();
+                metersNeedClear = false;
+            }
         }
         
         vTaskDelay(pdMS_TO_TICKS(16));
@@ -1203,8 +1217,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     sMix += fz_block[i] * g_frz;
                     sMix += fbOut_block[i] * g_fb;
                     
-                    // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion
-                    // Clamping precisely to +/- 1.8f prevents the foldback curve from dropping the volume of extreme peaks
+                    // Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
                     sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
                     sMix = sMix * (1.0f - (0.1f * sMix * sMix));
                     mix_block[i] = sMix;
@@ -1724,6 +1737,7 @@ void setup() {
     memset(pitchShiftLUT_temp, 0, 16384 * sizeof(float));
     memset(hannLUT, 0, 1024 * sizeof(float));           
     
+    // Mathematically perfect Hann Window prevents 3dB volume bump during crossfade
     for (int i = 0; i < 1024; i++) { 
         hannLUT[i] = 0.5f * (1.0f - cosf(TWO_PI * ((float)i / 1023.0f))); 
         lfoLUT[i] = powf(2.0f, (15.0f * sinf(TWO_PI * ((float)i / 1024.0f))) / 1200.0f); 

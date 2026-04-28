@@ -780,6 +780,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static int freezeStartIdxVar = 0;
     static int activeFreezeLength = 96000;
     
+    static int muteCounter = 0;
+    
     const float normFactor = 1.0f / 2147483648.0f; 
     const float DC_OFFSET = 1e-9f;
     
@@ -820,6 +822,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 ui_output_level = 0.0f; 
                 
                 clearBuffersRequested = true;
+                muteCounter = (int)(0.02f * currentSampleRate); 
                 globalAudioResetRequested = false;
             }
 
@@ -858,7 +861,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             bool frzActive = ((activeEffectMode == 1 && isWhammyActive) || isFrozen); 
             
-            // Deterministic APF flush flag avoids single-sample zero-crossing failures
             if (frzActive && !wasFrozen) { 
                 freezePlayCounterVar = 0; 
                 
@@ -1033,7 +1035,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 int localWriteIdx = writeIndex; 
                 
-                // Mute lock perfectly protects PSRAM from overwrites during background memset
                 if (!blockIsMuted) {
                     delayBuffer[localWriteIdx] = boundedDelayIn;
                 }
@@ -1168,7 +1169,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 memcpy(mix_block, dry_block, framesRead * sizeof(float));
             } else {
                 
-                // 1. Hoist branches OUTSIDE the loop to restore 128-bit MAC Vectorization
+                // Hoist branches OUTSIDE the loop to restore 128-bit MAC Vectorization
                 float g_base = 0.0f;
                 if (dryGroup) {
                     if (!repeatGroup) g_base = 0.4f;
@@ -1190,7 +1191,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 #pragma GCC ivdep
                 for (int i = 0; i < framesRead; i++) {
                     
-                    // 2. UNIVERSAL BASE SIGNAL: Branchless master pitch foundation canvas
+                    // UNIVERSAL BASE SIGNAL: Branchless master pitch foundation canvas
                     float baseSignal = (w1_block[i] * g_whammy) + (dry_block[i] * g_dry);
                     
                     float sMix = DC_OFFSET;
@@ -1201,6 +1202,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     sMix += fz_block[i] * g_frz;
                     sMix += fbOut_block[i] * g_fb;
                     
+                    // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
+                    sMix = fmaxf(-3.0f, fminf(sMix, 3.0f));
                     sMix = sMix * (1.0f - (0.1f * sMix * sMix));
                     mix_block[i] = sMix;
                 }

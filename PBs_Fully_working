@@ -823,7 +823,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 globalAudioResetRequested = false;
             }
 
-            // Mute block status dynamically stored to prevent intra-block array tearing
+            // Ensure clearBuffersRequested lock is cached outside loop to prevent mid-block audio tearing pops
             bool blockIsMuted = clearBuffersRequested;
 
             uint32_t start_cycles = xthal_get_ccount(); 
@@ -858,6 +858,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             bool frzActive = ((activeEffectMode == 1 && isWhammyActive) || isFrozen); 
             
+            // Deterministic APF flush flag avoids single-sample zero-crossing failures
             if (frzActive && !wasFrozen) { 
                 freezePlayCounterVar = 0; 
                 
@@ -1032,6 +1033,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 int localWriteIdx = writeIndex; 
                 
+                // Mute lock perfectly protects PSRAM from overwrites during background memset
                 if (!blockIsMuted) {
                     delayBuffer[localWriteIdx] = boundedDelayIn;
                 }
@@ -1234,7 +1236,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             #pragma GCC ivdep
             for (int i = 0; i < framesRead * 2; i++) {
-                i2s_out_block[i] = (int32_t)fmaxf(-2147483647.0f, fminf(dsp_out_block[i], 2147483647.0f));
+                i2s_out_block[i] = (int32_t)fmaxf(-2147483648.0f, fminf(dsp_out_block[i], 2147483647.0f));
             }
             
             if (peakInputVal > ui_audio_level) { 

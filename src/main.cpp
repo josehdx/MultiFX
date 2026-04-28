@@ -460,8 +460,6 @@ void updateLUT() {
     
     memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
-    // FIX: Pitch factor cross-thread assignment removed. Pitch is safely fetched synchronously in loop().
-    
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f);
     globalChorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
     
@@ -1081,6 +1079,17 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float fbOutNode = 0.0f;
                     
                     if (feedbackActive || feedbackRamp > 0.0f) { 
+                        // FIX: Restored LFO phase increment to re-activate Analog Feedback Swirl
+                        feedbackLfoPhase += feedbackPhaseIncr; 
+                        
+                        if (feedbackLfoPhase >= LFO_LUT_SIZE) { 
+                            feedbackLfoPhase -= LFO_LUT_SIZE; 
+                        }
+                        
+                        float lfoVal = lfoLUT[(int)feedbackLfoPhase]; 
+                        spd4 = lfoVal; 
+                        spd5 = fbPitch * lfoVal; 
+                        
                         w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
                              processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                         w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
@@ -1788,7 +1797,10 @@ void setup() {
 void loop() {
     if (lutNeedsUpdate) {
         updateLUT();
-        // FIX: Removed cross-thread parameter assignment here to fix micro-stutter
+        // FIX: Re-introduced synchronous assignment so presets instantly apply without requiring pedal movement
+        if (!isVolumeMode) {
+            pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
+        }
         lutNeedsUpdate = false;
     }
     

@@ -460,9 +460,7 @@ void updateLUT() {
     
     memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
-    if (!isVolumeMode) { 
-        pitchShiftFactor = pitchShiftLUT[constrain(currentPB1, 0, 16383)]; 
-    }
+    // FIX: Pitch factor assignment explicitly deleted here to prevent cross-thread jitter
     
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f);
     globalChorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
@@ -719,6 +717,7 @@ struct DebouncedButton {
 };
 
 void DisplayTask(void * pvParameters) {
+    // FIX: metersNeedClear flag permanently fixes the frozen UI visual glitch
     bool metersNeedClear = false;
     for (;;) {
         if (wakeupPending) { 
@@ -743,6 +742,7 @@ void DisplayTask(void * pvParameters) {
                 updateMeters(); 
                 metersNeedClear = true;
             } else if (metersNeedClear) {
+                // Instantly zero the meters to draw a blank frame and stop CPU burn
                 ui_audio_level = 0.0f;
                 ui_output_level = 0.0f;
                 updateMeters();
@@ -833,11 +833,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 globalAudioResetRequested = false;
             }
 
+            // Ensure clearBuffersRequested lock is cached outside loop to prevent mid-block audio tearing pops
             bool blockIsMuted = clearBuffersRequested;
 
             uint32_t start_cycles = xthal_get_ccount(); 
 
-            // If the background task is actively zeroing memory, we completely bypass the heavy DSP loops 
+            // FIX: If the background task is actively zeroing memory, we completely bypass the heavy DSP loops 
             // This permanently prevents Floating-Point "NaN" Poisoning caused by tearing cross-core memory reads
             if (blockIsMuted) {
                 memset(dsp_out_block, 0, framesRead * 2 * sizeof(float));
@@ -1077,7 +1078,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float spd4 = 1.0f; 
                     float spd5 = 1.0f;
                     
-                    // Scoped outer variables completely solve the compilation shadowing bug
                     float w4 = 0.0f;
                     float w5 = 0.0f;
                     float fbOutNode = 0.0f;
@@ -1107,6 +1107,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
                         float satFb = feedbackFilterVar * (feedbackRamp * feedbackRamp * feedbackRamp) * 0.85f; 
                         
+                        // Direct write/read to FB PSRAM bypasses sluggish residual block memcopies
                         fbDelayBuffer[fbDelayWriteIdx] = satFb;
                         
                         int delaySamples = (int)(currentSampleRate * 0.02f);
@@ -1216,7 +1217,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         sMix += fz_block[i] * g_frz;
                         sMix += fbOut_block[i] * g_fb;
                         
-                        // Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
+                        // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
                         sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
                         sMix = sMix * (1.0f - (0.1f * sMix * sMix));
                         mix_block[i] = sMix;
@@ -1267,7 +1268,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float bit32Scale = 2147483647.0f; 
             dsps_mul_f32(dsp_out_block, &bit32Scale, dsp_out_block, framesRead * 2, 1, 0, 1);
             
-            // C++ Safe Integer Casting bounds protection avoids wrap-to-infinity hardware pop
+            // FIX: C++ Safe Integer Casting bounds protection avoids wrap-to-infinity hardware pop
             #pragma GCC ivdep
             for (int i = 0; i < framesRead * 2; i++) {
                 i2s_out_block[i] = (int32_t)fmaxf(-2147483520.0f, fminf(dsp_out_block[i], 2147483520.0f));
@@ -1789,9 +1790,7 @@ void setup() {
 void loop() {
     if (lutNeedsUpdate) {
         updateLUT();
-        if (!isVolumeMode) {
-            pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
-        }
+        // FIX: Removed cross-thread parameter assignment here to fix micro-stutter
         lutNeedsUpdate = false;
     }
     

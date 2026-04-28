@@ -460,7 +460,7 @@ void updateLUT() {
     
     memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
-    // FIX: Pitch factor assignment explicitly deleted here to prevent cross-thread jitter
+    // FIX: Pitch factor cross-thread assignment removed. Pitch is safely fetched synchronously in loop().
     
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f);
     globalChorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
@@ -717,7 +717,6 @@ struct DebouncedButton {
 };
 
 void DisplayTask(void * pvParameters) {
-    // FIX: metersNeedClear flag permanently fixes the frozen UI visual glitch
     bool metersNeedClear = false;
     for (;;) {
         if (wakeupPending) { 
@@ -833,7 +832,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 globalAudioResetRequested = false;
             }
 
-            // Ensure clearBuffersRequested lock is cached outside loop to prevent mid-block audio tearing pops
             bool blockIsMuted = clearBuffersRequested;
 
             uint32_t start_cycles = xthal_get_ccount(); 
@@ -1107,7 +1105,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
                         float satFb = feedbackFilterVar * (feedbackRamp * feedbackRamp * feedbackRamp) * 0.85f; 
                         
-                        // Direct write/read to FB PSRAM bypasses sluggish residual block memcopies
                         fbDelayBuffer[fbDelayWriteIdx] = satFb;
                         
                         int delaySamples = (int)(currentSampleRate * 0.02f);
@@ -1217,7 +1214,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         sMix += fz_block[i] * g_frz;
                         sMix += fbOut_block[i] * g_fb;
                         
-                        // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
+                        // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion
+                        // Clamping precisely to +/- 1.8f prevents the foldback curve from dropping the volume of extreme peaks
                         sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
                         sMix = sMix * (1.0f - (0.1f * sMix * sMix));
                         mix_block[i] = sMix;
@@ -1268,7 +1266,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float bit32Scale = 2147483647.0f; 
             dsps_mul_f32(dsp_out_block, &bit32Scale, dsp_out_block, framesRead * 2, 1, 0, 1);
             
-            // FIX: C++ Safe Integer Casting bounds protection avoids wrap-to-infinity hardware pop
+            // FIX: C++ Safe Integer Casting bounds protection avoids wrap-to-infinity hardware FPU popping
             #pragma GCC ivdep
             for (int i = 0; i < framesRead * 2; i++) {
                 i2s_out_block[i] = (int32_t)fmaxf(-2147483520.0f, fminf(dsp_out_block[i], 2147483520.0f));

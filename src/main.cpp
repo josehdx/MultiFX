@@ -958,7 +958,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     procSample *= padEnv; 
                 }
                 
-                // Write directly to Freeze PSRAM without memcpy wrappers
                 if (!frzActive) { 
                     if (!blockIsMuted) {
                         freezeBuffer[freezeWriteIdxVar] = procSample;
@@ -985,7 +984,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         phase2 -= 1.0f; 
                     }
                     
-                    // Fetch purely from L1 data cache prediction, ditching legacy memcpy blocks entirely
                     int idx1 = (freezeStartIdxVar + freezePlayCounterVar) % freezeLength;
                     int counter2 = (freezePlayCounterVar + (activeFreezeLength / 2)) % activeFreezeLength;
                     int idx2 = (freezeStartIdxVar + counter2) % freezeLength;
@@ -1064,12 +1062,15 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float spd4 = 1.0f; 
                 float spd5 = 1.0f;
                 
+                float w4 = 0.0f;
+                float w5 = 0.0f;
+                
                 float fbOutNode = 0.0f;
                 if (feedbackActive || feedbackRamp > 0.0f) { 
-                    float w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                               processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
-                    float w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                               processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                    w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                         processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                    w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                         processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                          
                     if (feedbackActive) {
                         if (inputEnvelope > 0.005f) { 
@@ -1119,6 +1120,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 }
                 w3_block[i] = w3; 
                 
+                w4_block[i] = w4; 
+                w5_block[i] = w5; 
+                
                 int32_t step1 = (int32_t)((1.0f - spd1) * 65536.0f); 
                 tap_w1_1 += step1; 
                 tap_w1_2 += step1; 
@@ -1162,7 +1166,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             bool padIsAudible = padActive || (padFilter > 0.001f);
             
             if (!activeGroup && freezeRamp <= 0.0f && feedbackRamp <= 0.0f && !padIsAudible) {
-                // If entire block is clean bypassed, fast memory drop
                 memcpy(mix_block, dry_block, framesRead * sizeof(float));
             } else {
                 
@@ -1199,7 +1202,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     sMix += fz_block[i] * g_frz;
                     sMix += fbOut_block[i] * g_fb;
                     
-                    // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
+                    // Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
                     sMix = fmaxf(-3.0f, fminf(sMix, 3.0f));
                     sMix = sMix * (1.0f - (0.1f * sMix * sMix));
                     mix_block[i] = sMix;
@@ -1236,7 +1239,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             #pragma GCC ivdep
             for (int i = 0; i < framesRead * 2; i++) {
-                i2s_out_block[i] = (int32_t)fmaxf(-2147483647.0f, fminf(dsp_out_block[i], 2147483647.0f));
+                i2s_out_block[i] = (int32_t)fmaxf(-2147483648.0f, fminf(dsp_out_block[i], 2147483647.0f));
             }
             
             if (peakInputVal > ui_audio_level) { 
@@ -1718,6 +1721,7 @@ void setup() {
     memset(pitchShiftLUT_temp, 0, 16384 * sizeof(float));
     memset(hannLUT, 0, 1024 * sizeof(float));           
     
+    // Mathematically perfect Hann Window prevents 3dB volume bump during crossfade
     for (int i = 0; i < 1024; i++) { 
         hannLUT[i] = 0.5f * (1.0f - cosf(TWO_PI * ((float)i / 1023.0f))); 
         lfoLUT[i] = powf(2.0f, (15.0f * sinf(TWO_PI * ((float)i / 1024.0f))) / 1200.0f); 

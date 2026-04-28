@@ -460,9 +460,7 @@ void updateLUT() {
     
     memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
-    if (!isVolumeMode) { 
-        pitchShiftFactor = pitchShiftLUT[constrain(currentPB1, 0, 16383)]; 
-    }
+    // FIX: Pitch factor assignment deleted here to prevent cross-thread jitter before main loop applies lastActivePedal
     
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f);
     globalChorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
@@ -1066,8 +1064,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 float w4 = 0.0f;
                 float w5 = 0.0f;
-                
                 float fbOutNode = 0.0f;
+                
                 if (feedbackActive || feedbackRamp > 0.0f) { 
                     w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
                          processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
@@ -1205,8 +1203,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     sMix += fz_block[i] * g_frz;
                     sMix += fbOut_block[i] * g_fb;
                     
-                    // Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
-                    sMix = fmaxf(-3.0f, fminf(sMix, 3.0f));
+                    // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion
+                    // Clamping precisely to +/- 1.8f prevents the foldback curve from dropping the volume of extreme peaks
+                    sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
                     sMix = sMix * (1.0f - (0.1f * sMix * sMix));
                     mix_block[i] = sMix;
                 }
@@ -1240,9 +1239,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float bit32Scale = 2147483647.0f; 
             dsps_mul_f32(dsp_out_block, &bit32Scale, dsp_out_block, framesRead * 2, 1, 0, 1);
             
+            // FIX: C++ Safe Integer Casting bounds protection avoids wrap-to-infinity hardware pop
             #pragma GCC ivdep
             for (int i = 0; i < framesRead * 2; i++) {
-                i2s_out_block[i] = (int32_t)fmaxf(-2147483648.0f, fminf(dsp_out_block[i], 2147483647.0f));
+                i2s_out_block[i] = (int32_t)fmaxf(-2147483520.0f, fminf(dsp_out_block[i], 2147483520.0f));
             }
             
             if (peakInputVal > ui_audio_level) { 
@@ -1724,7 +1724,6 @@ void setup() {
     memset(pitchShiftLUT_temp, 0, 16384 * sizeof(float));
     memset(hannLUT, 0, 1024 * sizeof(float));           
     
-    // Mathematically perfect Hann Window prevents 3dB volume bump during crossfade
     for (int i = 0; i < 1024; i++) { 
         hannLUT[i] = 0.5f * (1.0f - cosf(TWO_PI * ((float)i / 1023.0f))); 
         lfoLUT[i] = powf(2.0f, (15.0f * sinf(TWO_PI * ((float)i / 1024.0f))) / 1200.0f); 
@@ -1779,6 +1778,7 @@ void setup() {
 void loop() {
     if (lutNeedsUpdate) {
         updateLUT();
+        // The "Phantom Pedal" patch: Safely fetch the exact final pedal position the instant the update finishes
         if (!isVolumeMode) {
             pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
         }

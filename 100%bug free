@@ -31,7 +31,7 @@ void __attribute__((constructor)) pre_boot_kill_switch() {
 i2s_chan_handle_t tx_chan;
 i2s_chan_handle_t rx_chan;
 
-volatile uint32_t currentSampleRate = 96000; 
+volatile uint32_t currentSampleRate = 48000; 
 #define HOP_SIZE 64            
 
 // --- TIME-DOMAIN DSP BUFFERS ---
@@ -84,7 +84,7 @@ uint32_t tap_w5_2 = 256 << 16;
 float currentWindowSize = 512.0f; 
 
 // --- FREEZE STATE & ALL-PASS FILTERS ---
-int freezeLength = 96000; 
+int freezeLength = 48000; 
 bool wasFrozen = false;
 volatile bool apfNeedsClear = false;
 volatile float freezeRamp = 0.0f;
@@ -143,7 +143,7 @@ const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 volatile bool globalAudioResetRequested = false;
 volatile bool clearBuffersRequested = false;
 
-// --- POWER SAVING & UI GLOBALS ---
+// --- POWER SAVING, BATTERY & UI GLOBALS ---
 unsigned long lastActivityTime = 0;       
 unsigned long lastScreenActivityTime = 0;
 const unsigned long LIGHT_SLEEP_TIMEOUT = 600000;
@@ -154,6 +154,10 @@ volatile float core1_load = 0.0f;
 
 volatile bool sleepRequested = false;
 volatile bool isSleeping = false;
+
+const int BATTERY_PIN = 4;
+volatile int currentBatteryPercent = 100;
+volatile bool isBatteryCharging = false;
 
 // --- PIN ASSIGNMENTS ---
 pin_t pinPB = 1;     
@@ -182,7 +186,7 @@ uint16_t PB2_raw_center = 2048;
 uint16_t PB3_raw_min = 1000;
 uint16_t PB3_raw_max = 3000;
 
-int deadzone_size = 400; 
+int deadzone_size = 350; 
 
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB = pinPB;
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
@@ -191,40 +195,46 @@ BluetoothMIDI_Interface btmidi;
 USBMIDI_Interface usbmidi;
 MIDI_PipeFactory<4> pipes;
 
+// --- NON-LINEAR LIPO BATTERY CURVE CALCULATION ---
+int getBatteryPercentage(float voltage) {
+    if (voltage >= 4.15f) return 100;
+    if (voltage >= 4.00f) return 90;
+    if (voltage >= 3.90f) return 80;
+    if (voltage >= 3.80f) return 70;
+    if (voltage >= 3.75f) return 60;
+    if (voltage >= 3.70f) return 50;
+    if (voltage >= 3.65f) return 40;
+    if (voltage >= 3.60f) return 30;
+    if (voltage >= 3.55f) return 20;
+    if (voltage >= 3.50f) return 10;
+    if (voltage <= 3.30f) return 0;
+    return (int)((voltage - 3.3f) / (4.15f - 3.3f) * 100.0f);
+}
+
 // --- DYNAMIC RAW DEADZONE MAPPING (PB1 & PB2) ---
 analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
-    int lockZone = 200; 
-    
-    int lowerLimit = rMin + lockZone;
-    int upperLimit = rMax - lockZone;
     int deadLower = center - dZone;
     int deadUpper = center + dZone;
-
-    if (lowerLimit >= deadLower) {
-        lowerLimit = deadLower - 1;
+    
+    if (raw >= deadLower && raw <= deadUpper) {
+        return 8192; // Dead center
     }
     
-    if (upperLimit <= deadUpper) {
-        upperLimit = deadUpper + 1;
-    }
-
-    if (raw <= lowerLimit) {
-        return 0;
-    }
+    long mappedValue;
     
-    if (raw >= upperLimit) {
-        return 16383; 
-    }
-    
-    if (raw > deadLower && raw < deadUpper) {
-        return 8192;
-    }
-
-    if (raw <= deadLower) {
-        return map(raw, lowerLimit, deadLower, 0, 8191);
+    if (raw < deadLower) {
+        if (rMin >= deadLower) rMin = deadLower - 1; // Safely protect against inverse division
+        mappedValue = map(raw, rMin, deadLower, 0, 8191);
     } else {
-        return map(raw, deadUpper, upperLimit, 8193, 16383);
+        if (rMax <= deadUpper) rMax = deadUpper + 1; // Safely protect against inverse division
+        mappedValue = map(raw, deadUpper, rMax, 8193, 16383);
     }
+    
+    // Soft-clip limiters gracefully eliminate maximum hardware drift without causing sudden jumps
+    if (mappedValue > 16100) return 16383;
+    if (mappedValue < 280) return 0;
+    
+    return constrain(mappedValue, 0, 16383);
 }
 
 // --- DYNAMIC RAW EXPRESSION MAPPING (PB3) ---
@@ -305,11 +315,12 @@ void calibratePBs() {
         PB2_raw_center = 2048;
     }
     
-    PB1_raw_min = PB1_raw_center - 900; 
-    PB1_raw_max = PB1_raw_center + 900;
+    // Initial bounds mapped widely to prevent initial jump during the first full sweep
+    PB1_raw_min = PB1_raw_center - 400; 
+    PB1_raw_max = PB1_raw_center + 400;
     
-    PB2_raw_min = PB2_raw_center - 900; 
-    PB2_raw_max = PB2_raw_center + 900;
+    PB2_raw_min = PB2_raw_center - 400; 
+    PB2_raw_max = PB2_raw_center + 400;
     
     PB3_raw_min = 1000; 
     PB3_raw_max = 3000; 
@@ -320,36 +331,30 @@ void toggleSampleRate() {
     sleepRequested = true; 
     globalAudioResetRequested = true; 
     
-    // SAFETY TIMEOUT HANDSHAKE: Wait up to 200ms to override deadlocks
     int timeoutCounter = 0;
     while (!isSleeping && timeoutCounter < 40) { 
         vTaskDelay(pdMS_TO_TICKS(5)); 
         timeoutCounter++;
     }
     
-    // Safely shut down the hardware
     i2s_channel_disable(tx_chan);
     i2s_channel_disable(rx_chan);
     
     vTaskDelay(pdMS_TO_TICKS(10));
     
-    // Flip the variable
     if (currentSampleRate == 96000) {
         currentSampleRate = 48000;
     } else {
         currentSampleRate = 96000;
     }
     
-    // Reprogram the clocks
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate);
     i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
     i2s_channel_reconfig_std_clock(rx_chan, &clk_cfg);
     
-    // Update DSP Dependencies
     freezeLength = currentSampleRate;
     lutNeedsUpdate = true;
     
-    // Turn hardware back on and wake the DSP task
     i2s_channel_enable(tx_chan);
     i2s_channel_enable(rx_chan);
     
@@ -460,8 +465,6 @@ void updateLUT() {
     
     memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
-    // FIX: Cross-thread pitchShiftFactor assignment safely removed.
-    
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f);
     globalChorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
     
@@ -489,6 +492,24 @@ void updateMeters() {
 
 void updateDisplay() {
     spr.fillSprite(TFT_BLACK); 
+    
+    // UI - Battery Indicator (Top Left)
+    char batStr[16];
+    if (isBatteryCharging) {
+        sprintf(batStr, "CHG %d%%", currentBatteryPercent);
+        spr.setTextColor(TFT_GREEN, TFT_BLACK); 
+    } else {
+        sprintf(batStr, "BAT %d%%", currentBatteryPercent);
+        if (currentBatteryPercent > 20) {
+            spr.setTextColor(TFT_GREEN, TFT_BLACK); 
+        } else {
+            spr.setTextColor(TFT_RED, TFT_BLACK); 
+        }
+    }
+    spr.setTextDatum(TL_DATUM); 
+    spr.drawString(batStr, 5, 5); 
+
+    // Reset text datum for the rest of the UI
     spr.setTextDatum(MC_DATUM); 
     spr.setTextSize(1);
     
@@ -785,7 +806,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static int freezeWriteIdxVar = 0; 
     static int freezePlayCounterVar = 0; 
     static int freezeStartIdxVar = 0;
-    static int activeFreezeLength = 96000;
+    static int activeFreezeLength = 48000;
     
     const float normFactor = 1.0f / 2147483648.0f; 
     const float DC_OFFSET = 1e-9f;
@@ -833,7 +854,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             bool blockIsMuted = clearBuffersRequested;
             uint32_t start_cycles = xthal_get_ccount(); 
 
-            // FIX: Master Bypass perfectly secures the hardware FPU from NaN poisoning during memory wipes
             if (blockIsMuted) {
                 memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
                 ui_audio_level = 0.0f;
@@ -919,7 +939,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float peakInputVal = 0.0f; 
                 float peakOutputVal = 0.0f;
                 
-                // FIX: Buffer volatile RAM variables locally so the compiler can vectorize DSP loops
                 float localSwellGain = swellGain;
                 float localVolGain = volumePedalGain;
                 float localFrzRamp = freezeRamp;
@@ -976,7 +995,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         procSample *= padEnv; 
                     }
                     
-                    // Branchless assignment protects vectorization
                     if (!frzActive) { 
                         freezeBuffer[freezeWriteIdxVar] = procSample;
                         freezeWriteIdxVar++;
@@ -998,7 +1016,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float phase2 = (phaseRead + 0.5f); 
                         if (phase2 >= 1.0f) { phase2 -= 1.0f; }
                         
-                        // FIX: Replaced heavy modulo hardware division with ultra-fast 1-cycle integer subtraction
                         int sum1 = freezeStartIdxVar + freezePlayCounterVar;
                         int idx1 = (sum1 >= freezeLength) ? (sum1 - freezeLength) : sum1;
                         
@@ -1011,7 +1028,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float rFrz = (freezeBuffer[idx1] * hannLUT[(int)(phaseRead * 1023.0f)]) + 
                                      (freezeBuffer[idx2] * hannLUT[(int)(phase2 * 1023.0f)]);
                         
-                        // FIX: Branchless APF protects FPU pipeline from subnormal Float stalling
                         float d1 = apf1Buffer[apf1Idx]; 
                         float next_apf1 = rFrz + 0.6f * d1 + DC_OFFSET; 
                         float a1 = -0.6f * rFrz + d1; 
@@ -1071,7 +1087,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float fbOutNode = 0.0f;
                     
                     if (feedbackActive || localFbRamp > 0.0f) { 
-                        // FIX: Restore analog LFO phase modulation to unfreeze tape pointers
                         feedbackLfoPhase += feedbackPhaseIncr; 
                         if (feedbackLfoPhase >= LFO_LUT_SIZE) { feedbackLfoPhase -= LFO_LUT_SIZE; }
                         float lfoVal = lfoLUT[(int)feedbackLfoPhase]; 
@@ -1166,7 +1181,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     fbOut_block[i] = fbOutNode;
                 }
                 
-                // Store local buffers back to Volatile RAM 
                 swellGain = localSwellGain;
                 freezeRamp = localFrzRamp;
                 feedbackRamp = localFbRamp;
@@ -1199,7 +1213,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float g_whammy = isWhammyActive ? 1.0f : 0.0f;
                     float g_dry = isWhammyActive ? 0.0f : 1.0f;
 
-                    // FIX: __restrict keyword enables 128-bit MAC Hardware Vectorization
                     float* __restrict p_mix = mix_block;
                     const float* __restrict p_dry = dry_block;
                     const float* __restrict p_w1 = w1_block;
@@ -1221,13 +1234,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         sMix += p_fz[i] * g_frz;
                         sMix += p_fb[i] * g_fb;
                         
-                        // FIX: Soft Clipper calculus perfectly clamped to 1.8f limits foldback distortion
                         sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
                         p_mix[i] = sMix * (1.0f - (0.1f * sMix * sMix));
                     }
                 }
                 
-                // FIX: Loop Collapse consolidates tracking, scaling, and FPU clipping into one lightning fast pass
                 float masterScale = 2147483520.0f * localSwellGain * localVolGain;
                 
                 #pragma GCC ivdep
@@ -1238,8 +1249,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     if (fabsf(rawOut) > peakOutputVal) peakOutputVal = fabsf(rawOut); 
                     
                     float scaledOut = mix_block[i] * masterScale;
-                    
-                    // FIX: FPU safely clamps perfectly at limits avoiding integer pop wrapping
                     int32_t finalOut = (int32_t)fmaxf(-2147483520.0f, fminf(scaledOut, 2147483520.0f));
                     
                     i2s_out_block[i * 2] = finalOut; 
@@ -1277,9 +1286,6 @@ void MidiTask(void * pvParameters) {
     static int stableRawB = -1;
     static int stableRawC = -1;
     
-    static bool unpluggedA = false;
-    static bool unpluggedB = false;
-    
     static DebouncedButton carouselBtn(CAROUSEL_BUTTON_PIN); 
     carouselBtn.state = digitalRead(CAROUSEL_BUTTON_PIN); 
     carouselBtn.lastReading = carouselBtn.state; 
@@ -1287,6 +1293,23 @@ void MidiTask(void * pvParameters) {
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
     
     for (;;) {
+        // NON-BLOCKING BATTERY POLLING: Reads ADC once every 5 seconds to prevent Midi jitter
+        static unsigned long lastBatteryTime = 0;
+        if (millis() - lastBatteryTime > 5000) {
+            lastBatteryTime = millis();
+            int rawBat = analogRead(BATTERY_PIN);
+            float voltage = ((float)rawBat / 4095.0f) * 3.3f * 2.0f; 
+            
+            bool charging = (voltage > 4.25f);
+            int newPercent = getBatteryPercentage(voltage);
+            
+            if (newPercent != currentBatteryPercent || charging != isBatteryCharging) {
+                currentBatteryPercent = newPercent;
+                isBatteryCharging = charging;
+                forceUIUpdate = true;
+            }
+        }
+
         Control_Surface.loop(); 
         
         bool currentBtState = btmidi.isConnected();
@@ -1342,78 +1365,65 @@ void MidiTask(void * pvParameters) {
             analog_t rawB = filterPB2.getValue();
             analog_t rawC = filterPB3.getValue();
             
-            if (rawA >= 4094) {
+            // 1. Stable noise filtering
+            if (stableRawA < 0) { stableRawA = rawA; }
+            if (abs((int)rawA - stableRawA) > 6) { stableRawA = rawA; }
+            
+            if (stableRawB < 0) { stableRawB = rawB; }
+            if (abs((int)rawB - stableRawB) > 6) { stableRawB = rawB; }
+            
+            if (stableRawC < 0) { stableRawC = rawC; }
+            if (abs((int)rawC - stableRawC) > 16) { stableRawC = rawC; }
+
+            // 2. Velocity-Based Hardware-Agnostic Unplug Gate (Slew-Rate Detection)
+            static bool unpluggedA = false;
+            static bool unpluggedB = false;
+            static int previousRawA = 2048;
+            static int previousRawB = 2048;
+
+            // An unplug event happens instantly (voltage teleports >1000 in one cycle). 
+            // A human sweeping the pedal up smoothly will NOT trigger this.
+            if ((stableRawA - previousRawA) > 1000 && stableRawA > 4050) {
                 unpluggedA = true;
-            } else if (rawA < 4050) {
+            } else if (stableRawA < 3900) {
                 unpluggedA = false;
             }
-            
-            if (rawB >= 4094) {
+
+            if ((stableRawB - previousRawB) > 1000 && stableRawB > 4050) {
                 unpluggedB = true;
-            } else if (rawB < 4050) {
+            } else if (stableRawB < 3900) {
                 unpluggedB = false;
             }
-            
-            if (stableRawA < 0) {
-                stableRawA = rawA;
-            }
-            if (abs((int)rawA - stableRawA) > 6) {
-                stableRawA = rawA;
-            }
-            
-            if (stableRawB < 0) {
-                stableRawB = rawB;
-            }
-            if (abs((int)rawB - stableRawB) > 6) {
-                stableRawB = rawB;
-            }
-            
-            if (stableRawC < 0) {
-                stableRawC = rawC;
-            }
-            if (abs((int)rawC - stableRawC) > 16) {
-                stableRawC = rawC;
-            }
-            
+
+            previousRawA = stableRawA;
+            previousRawB = stableRawB;
+
+            // 3. Hardware-Agnostic Min/Max Tracking (Protected from unplugged extremes)
             if (!unpluggedA) {
-                if (stableRawA < PB1_raw_min && stableRawA > 100) {
-                    PB1_raw_min = stableRawA;
-                }
-                if (stableRawA > PB1_raw_max && stableRawA < 4050) {
-                    PB1_raw_max = stableRawA;
-                }
+                if (stableRawA < PB1_raw_min) { PB1_raw_min = stableRawA; }
+                if (stableRawA > PB1_raw_max) { PB1_raw_max = stableRawA; }
             }
-            
+
             if (!unpluggedB) {
-                if (stableRawB < PB2_raw_min && stableRawB > 100) {
-                    PB2_raw_min = stableRawB;
-                }
-                if (stableRawB > PB2_raw_max && stableRawB < 4050) {
-                    PB2_raw_max = stableRawB;
-                }
+                if (stableRawB < PB2_raw_min) { PB2_raw_min = stableRawB; }
+                if (stableRawB > PB2_raw_max) { PB2_raw_max = stableRawB; }
             }
             
-            if (stableRawC < PB3_raw_min && stableRawC >= 0) {
-                PB3_raw_min = stableRawC;
-            }
-            if (stableRawC > PB3_raw_max && stableRawC <= 4095) {
-                PB3_raw_max = stableRawC;
-            }
+            if (stableRawC < PB3_raw_min) { PB3_raw_min = stableRawC; }
+            if (stableRawC > PB3_raw_max && stableRawC <= 4095) { PB3_raw_max = stableRawC; }
             
+            // 4. Direct Mapping
             analog_t calA = map_raw_deadzone(stableRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
             analog_t calB = map_raw_deadzone(stableRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
             analog_t calC = map_raw_expression(stableRawC, PB3_raw_min, PB3_raw_max, INVERT_PB3);
             
-            if (unpluggedA) {
-                calA = 8192;
-            }
-            if (unpluggedB) {
-                calB = 8192;
-            }
+            // 5. Hardware-Agnostic Unplugged Center Snapping
+            if (unpluggedA) { calA = 8192; }
+            if (unpluggedB) { calB = 8192; }
             
+            // 6. Movement Calculation
             bool moveA = (abs((int)calA - (int)lastMidiA) > 12) || ((calA == 8192 || calA == 0 || calA == 16383) && calA != lastMidiA);
             bool moveB = (abs((int)calB - (int)lastMidiB) > 12) || ((calB == 8192 || calB == 0 || calB == 16383) && calB != lastMidiB);
-            
             bool moveC = (abs((int)calC - (int)lastMidiC) >= 128) || ((calC == 0 || calC == 16383) && calC != lastMidiC);
             
             if (moveA || moveB || moveC) {
@@ -1669,6 +1679,9 @@ bool channelMessageCallback(ChannelMessage cm) {
 
 void setup() {
     pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP); 
+    
+    // Battery Pin Configuration
+    pinMode(BATTERY_PIN, INPUT);
     
     pinMode(38, OUTPUT); 
     digitalWrite(38, LOW); 

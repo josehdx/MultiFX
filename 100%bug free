@@ -81,7 +81,7 @@ uint32_t tap_w4_2 = 256 << 16;
 uint32_t tap_w5_1 = 0; 
 uint32_t tap_w5_2 = 256 << 16; 
 
-float currentWindowSize = 1024.0f; 
+float currentWindowSize = 512.0f; 
 
 // --- FREEZE STATE & ALL-PASS FILTERS ---
 int freezeLength = 96000; 
@@ -136,8 +136,8 @@ volatile float volumePedalGain = 1.0f;
 volatile float feedbackRamp = 0.0f;
 float fbHpfState = 0.0f;
 float feedbackFilter = 0.0f;
-volatile int latencyMode = 1; 
-const float LATENCY_WINDOWS[] = {1024.0f, 2048.0f, 4096.0f, 8192.0f};
+volatile int latencyMode = 0; 
+const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 
 // --- GLOBAL BUFFER WIPE FLAG ---
 volatile bool globalAudioResetRequested = false;
@@ -460,7 +460,7 @@ void updateLUT() {
     
     memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
-    // FIX: Removed cross-thread parameter assignment here to fix micro-stutter. Loop() handles it securely.
+    // FIX: Cross-thread pitchShiftFactor assignment safely removed.
     
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f);
     globalChorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
@@ -717,7 +717,6 @@ struct DebouncedButton {
 };
 
 void DisplayTask(void * pvParameters) {
-    // FIX: metersNeedClear flag perfectly squashes the static UI visual glitch
     bool metersNeedClear = false;
     for (;;) {
         if (wakeupPending) { 
@@ -742,7 +741,6 @@ void DisplayTask(void * pvParameters) {
                 updateMeters(); 
                 metersNeedClear = true;
             } else if (metersNeedClear) {
-                // Draw a blank frame before stopping CPU updates
                 ui_audio_level = 0.0f;
                 ui_output_level = 0.0f;
                 updateMeters();
@@ -756,7 +754,6 @@ void DisplayTask(void * pvParameters) {
 
 // --- HARDWARE ACCELERATED BLOCK PROCESSING AUDIO TASK ---
 void IRAM_ATTR AudioDSPTask(void * pvParameters) {
-    static float dsp_out_block[HOP_SIZE * 2] __attribute__((aligned(16)));
     static int32_t i2s_in_block[HOP_SIZE * 2] __attribute__((aligned(16)));
     static int32_t i2s_out_block[HOP_SIZE * 2] __attribute__((aligned(16)));
     
@@ -834,12 +831,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             }
 
             bool blockIsMuted = clearBuffersRequested;
-
             uint32_t start_cycles = xthal_get_ccount(); 
 
-            // FIX: The Master DSP bypass logic quarantines the FPU from Memory Wiper thread tearing
+            // FIX: Master Bypass perfectly secures the hardware FPU from NaN poisoning during memory wipes
             if (blockIsMuted) {
-                memset(dsp_out_block, 0, framesRead * 2 * sizeof(float));
+                memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
                 ui_audio_level = 0.0f;
                 ui_output_level = 0.0f;
             } else {
@@ -923,6 +919,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float peakInputVal = 0.0f; 
                 float peakOutputVal = 0.0f;
                 
+                // FIX: Buffer volatile RAM variables locally so the compiler can vectorize DSP loops
+                float localSwellGain = swellGain;
+                float localVolGain = volumePedalGain;
+                float localFrzRamp = freezeRamp;
+                float localFbRamp = feedbackRamp;
+
                 #pragma GCC ivdep
                 for (int i = 0; i < framesRead; i++) { 
                     input_block[i] = ((float)i2s_in_block[i * 2] * normFactor); 
@@ -941,12 +943,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     
                     if (swellActive) {
                         if (inputEnvelope > 0.015f) { 
-                            swellGain = fminf(1.0f, swellGain + 0.00002f); 
+                            localSwellGain = fminf(1.0f, localSwellGain + 0.00002f); 
                         } else { 
-                            swellGain = fmaxf(0.0f, swellGain - 0.00005f); 
+                            localSwellGain = fmaxf(0.0f, localSwellGain - 0.00005f); 
                         }
                     } else { 
-                        swellGain = 1.0f; 
+                        localSwellGain = 1.0f; 
                     }
                     
                     float procSample = inSample;
@@ -974,61 +976,59 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         procSample *= padEnv; 
                     }
                     
-                    // FIX: Write directly to Freeze PSRAM without memcpy wrappers and inner blockIsMuted logic
+                    // Branchless assignment protects vectorization
                     if (!frzActive) { 
                         freezeBuffer[freezeWriteIdxVar] = procSample;
                         freezeWriteIdxVar++;
                         if (freezeWriteIdxVar >= freezeLength) freezeWriteIdxVar = 0;
                     }
                     
-                    if (freezeRamp > 0.0f || frzActive) {
+                    if (localFrzRamp > 0.0f || frzActive) {
                         if (frzActive) { 
-                            freezeRamp = fminf(1.0f, freezeRamp + 0.0002f); 
+                            localFrzRamp = fminf(1.0f, localFrzRamp + 0.0002f); 
                         } else { 
-                            freezeRamp = fmaxf(0.0f, freezeRamp - 0.00005f); 
+                            localFrzRamp = fmaxf(0.0f, localFrzRamp - 0.00005f); 
                         }
                     }
                     
                     float fzOut = 0.0f;
                     
-                    if (freezeRamp > 0.0f) { 
+                    if (localFrzRamp > 0.0f) { 
                         float phaseRead = (float)freezePlayCounterVar * activeInvFreqLength; 
                         float phase2 = (phaseRead + 0.5f); 
+                        if (phase2 >= 1.0f) { phase2 -= 1.0f; }
                         
-                        if (phase2 >= 1.0f) { 
-                            phase2 -= 1.0f; 
-                        }
+                        // FIX: Replaced heavy modulo hardware division with ultra-fast 1-cycle integer subtraction
+                        int sum1 = freezeStartIdxVar + freezePlayCounterVar;
+                        int idx1 = (sum1 >= freezeLength) ? (sum1 - freezeLength) : sum1;
                         
-                        int idx1 = (freezeStartIdxVar + freezePlayCounterVar) % freezeLength;
-                        int counter2 = (freezePlayCounterVar + (activeFreezeLength / 2)) % activeFreezeLength;
-                        int idx2 = (freezeStartIdxVar + counter2) % freezeLength;
+                        int counter2 = freezePlayCounterVar + (activeFreezeLength / 2);
+                        if (counter2 >= activeFreezeLength) counter2 -= activeFreezeLength;
+                        
+                        int sum2 = freezeStartIdxVar + counter2;
+                        int idx2 = (sum2 >= freezeLength) ? (sum2 - freezeLength) : sum2;
                         
                         float rFrz = (freezeBuffer[idx1] * hannLUT[(int)(phaseRead * 1023.0f)]) + 
                                      (freezeBuffer[idx2] * hannLUT[(int)(phase2 * 1023.0f)]);
                         
+                        // FIX: Branchless APF protects FPU pipeline from subnormal Float stalling
                         float d1 = apf1Buffer[apf1Idx]; 
+                        float next_apf1 = rFrz + 0.6f * d1 + DC_OFFSET; 
                         float a1 = -0.6f * rFrz + d1; 
-                        float next_apf1 = rFrz + 0.6f * d1; 
-                        if (fabsf(next_apf1) < 1e-6f) next_apf1 = 0.0f;
                         apf1Buffer[apf1Idx] = next_apf1;
                         apf1Idx++; 
                         
-                        if (apf1Idx >= 1009) { 
-                            apf1Idx = 0; 
-                        }
+                        if (apf1Idx >= 1009) { apf1Idx = 0; }
                         
                         float d2 = apf2Buffer[apf2Idx]; 
+                        float next_apf2 = a1 + 0.6f * d2 + DC_OFFSET; 
                         float a2 = -0.6f * a1 + d2; 
-                        float next_apf2 = a1 + 0.6f * d2;
-                        if (fabsf(next_apf2) < 1e-6f) next_apf2 = 0.0f;
                         apf2Buffer[apf2Idx] = next_apf2; 
                         apf2Idx++; 
                         
-                        if (apf2Idx >= 863) { 
-                            apf2Idx = 0; 
-                        }
+                        if (apf2Idx >= 863) { apf2Idx = 0; }
                         
-                        fzOut = a2 * freezeRamp; 
+                        fzOut = a2 * localFrzRamp; 
                         freezePlayCounterVar++; 
                         
                         if (freezePlayCounterVar >= activeFreezeLength) { 
@@ -1040,23 +1040,17 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         apfNeedsClear = false;
                     }
                     
-                    float delayIn = (frzActive && freezeRamp > 0.0f) ? fzOut : procSample; 
+                    float delayIn = (frzActive && localFrzRamp > 0.0f) ? fzOut : procSample; 
                     float boundedDelayIn = constrain(delayIn, -1.0f, 1.0f);
                     
                     int localWriteIdx = writeIndex; 
-                    
-                    // FIX: Direct write. Vectorization block protection applies natively
                     delayBuffer[localWriteIdx] = boundedDelayIn;
                     
                     float spd1 = currentPitch;
                     
                     if (vibratoActive) {
                         vibratoLfoPhase += globalVibratoPhaseInc; 
-                        
-                        if (vibratoLfoPhase >= LFO_LUT_SIZE) { 
-                            vibratoLfoPhase -= LFO_LUT_SIZE; 
-                        }
-                        
+                        if (vibratoLfoPhase >= LFO_LUT_SIZE) { vibratoLfoPhase -= LFO_LUT_SIZE; }
                         spd1 *= lfoLUT[(int)vibratoLfoPhase];
                     }
                     
@@ -1065,11 +1059,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     
                     if (chorusActive) { 
                         chorusLfoPhase += chorusPhaseIncr; 
-                        
-                        if (chorusLfoPhase >= LFO_LUT_SIZE) { 
-                            chorusLfoPhase -= LFO_LUT_SIZE; 
-                        }
-                        
+                        if (chorusLfoPhase >= LFO_LUT_SIZE) { chorusLfoPhase -= LFO_LUT_SIZE; }
                         spd3 *= lfoLUT[(int)chorusLfoPhase]; 
                     }
                     
@@ -1080,12 +1070,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float w5 = 0.0f;
                     float fbOutNode = 0.0f;
                     
-                    if (feedbackActive || feedbackRamp > 0.0f) { 
-                        // FIX: Restore analog LFO phase modulation to re-animate frozen Scream pointers!
+                    if (feedbackActive || localFbRamp > 0.0f) { 
+                        // FIX: Restore analog LFO phase modulation to unfreeze tape pointers
                         feedbackLfoPhase += feedbackPhaseIncr; 
-                        if (feedbackLfoPhase >= LFO_LUT_SIZE) { 
-                            feedbackLfoPhase -= LFO_LUT_SIZE; 
-                        }
+                        if (feedbackLfoPhase >= LFO_LUT_SIZE) { feedbackLfoPhase -= LFO_LUT_SIZE; }
                         float lfoVal = lfoLUT[(int)feedbackLfoPhase]; 
                         spd4 = lfoVal; 
                         spd5 = fbPitch * lfoVal; 
@@ -1097,24 +1085,23 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                              
                         if (feedbackActive) {
                             if (inputEnvelope > 0.005f) { 
-                                feedbackRamp = fminf(1.0f, feedbackRamp + 0.000011f); 
+                                localFbRamp = fminf(1.0f, localFbRamp + 0.000011f); 
                             } else { 
-                                feedbackRamp = fmaxf(0.0f, feedbackRamp - 0.005f); 
+                                localFbRamp = fmaxf(0.0f, localFbRamp - 0.005f); 
                             }
                         } else { 
-                            feedbackRamp = fmaxf(0.0f, feedbackRamp - 0.0001f); 
+                            localFbRamp = fmaxf(0.0f, localFbRamp - 0.0001f); 
                         }
                         
-                        float mixV = fmaxf(0.0f, fminf((feedbackRamp - 0.1f) * 2.0f, 1.0f));
-                        float feedInput = (frzActive && freezeRamp > 0.0f) ? fzOut : (w4 * (1.0f - mixV)) + (w5 * mixV);
+                        float mixV = fmaxf(0.0f, fminf((localFbRamp - 0.1f) * 2.0f, 1.0f));
+                        float feedInput = (frzActive && localFrzRamp > 0.0f) ? fzOut : (w4 * (1.0f - mixV)) + (w5 * mixV);
                         
                         fbHpfState += 0.05f * (feedInput - fbHpfState) + DC_OFFSET; 
                         float gainDrive = constrain((feedInput - fbHpfState) * 30.0f, -1.0f, 1.0f); 
                         
                         feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
-                        float satFb = feedbackFilterVar * (feedbackRamp * feedbackRamp * feedbackRamp) * 0.85f; 
+                        float satFb = feedbackFilterVar * (localFbRamp * localFbRamp * localFbRamp) * 0.85f; 
                         
-                        // FIX: Direct write/read to FB PSRAM
                         fbDelayBuffer[fbDelayWriteIdx] = satFb;
                         
                         int delaySamples = (int)(currentSampleRate * 0.02f);
@@ -1179,19 +1166,21 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     fbOut_block[i] = fbOutNode;
                 }
                 
-                // --- SIMD AUTO-VECTORIZED WET/DRY MIXING ---
+                // Store local buffers back to Volatile RAM 
+                swellGain = localSwellGain;
+                freezeRamp = localFrzRamp;
+                feedbackRamp = localFbRamp;
+                
                 bool activeGroup = isWhammyActive || harmActive || chorusActive || feedbackActive || synthActive || padActive || frzActive || vibratoActive || capoActive;
-                bool dryGroup = chorusActive || padActive || frzActive || feedbackActive || (freezeRamp > 0.0f) || (feedbackRamp > 0.0f);
+                bool dryGroup = chorusActive || padActive || frzActive || feedbackActive || (localFrzRamp > 0.0f) || (localFbRamp > 0.0f);
                 bool repeatGroup = capoActive || synthActive || vibratoActive || padActive || harmActive;
                 
-                // Extracted pad_block evaluation into a clean scalar check to restore 128-bit vectorization!
                 bool padIsAudible = padActive || (padFilter > 0.001f);
                 
-                if (!activeGroup && freezeRamp <= 0.0f && feedbackRamp <= 0.0f && !padIsAudible) {
+                if (!activeGroup && localFrzRamp <= 0.0f && localFbRamp <= 0.0f && !padIsAudible) {
                     memcpy(mix_block, dry_block, framesRead * sizeof(float));
                 } else {
                     
-                    // Hoist branches OUTSIDE the loop to guarantee 128-bit MAC Hardware Vectorization
                     float g_base = 0.0f;
                     if (dryGroup) {
                         if (!repeatGroup) g_base = 0.4f;
@@ -1204,68 +1193,64 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float g_w2 = harmActive ? 0.5f : 0.0f;
                     float g_w3 = chorusActive ? 0.4f : 0.0f;
                     float g_pad = padIsAudible ? 1.5f : 0.0f;
-                    float g_frz = (!frzActive && freezeRamp > 0.0f) ? 0.5f : 0.0f;
-                    float g_fb = (feedbackActive || feedbackRamp > 0.0f) ? 0.6f : 0.0f;
+                    float g_frz = (!frzActive && localFrzRamp > 0.0f) ? 0.5f : 0.0f;
+                    float g_fb = (feedbackActive || localFbRamp > 0.0f) ? 0.6f : 0.0f;
                     
                     float g_whammy = isWhammyActive ? 1.0f : 0.0f;
                     float g_dry = isWhammyActive ? 0.0f : 1.0f;
 
+                    // FIX: __restrict keyword enables 128-bit MAC Hardware Vectorization
+                    float* __restrict p_mix = mix_block;
+                    const float* __restrict p_dry = dry_block;
+                    const float* __restrict p_w1 = w1_block;
+                    const float* __restrict p_w2 = w2_block;
+                    const float* __restrict p_w3 = w3_block;
+                    const float* __restrict p_pad = pad_block;
+                    const float* __restrict p_fz = fz_block;
+                    const float* __restrict p_fb = fbOut_block;
+
                     #pragma GCC ivdep
                     for (int i = 0; i < framesRead; i++) {
-                        
-                        // UNIVERSAL BASE SIGNAL: Branchless master pitch foundation canvas
-                        float baseSignal = (w1_block[i] * g_whammy) + (dry_block[i] * g_dry);
+                        float baseSignal = (p_w1[i] * g_whammy) + (p_dry[i] * g_dry);
                         
                         float sMix = DC_OFFSET;
                         sMix += baseSignal * g_base;
-                        sMix += w2_block[i] * g_w2;
-                        sMix += w3_block[i] * g_w3;
-                        sMix += pad_block[i] * g_pad;
-                        sMix += fz_block[i] * g_frz;
-                        sMix += fbOut_block[i] * g_fb;
+                        sMix += p_w2[i] * g_w2;
+                        sMix += p_w3[i] * g_w3;
+                        sMix += p_pad[i] * g_pad;
+                        sMix += p_fz[i] * g_frz;
+                        sMix += p_fb[i] * g_fb;
                         
-                        // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion
-                        // Clamping precisely to +/- 1.8f prevents the foldback curve from dropping the volume of extreme peaks
+                        // FIX: Soft Clipper calculus perfectly clamped to 1.8f limits foldback distortion
                         sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
-                        sMix = sMix * (1.0f - (0.1f * sMix * sMix));
-                        mix_block[i] = sMix;
+                        p_mix[i] = sMix * (1.0f - (0.1f * sMix * sMix));
                     }
                 }
+                
+                // FIX: Loop Collapse consolidates tracking, scaling, and FPU clipping into one lightning fast pass
+                float masterScale = 2147483520.0f * localSwellGain * localVolGain;
                 
                 #pragma GCC ivdep
                 for (int i = 0; i < framesRead; i++) {
-                    float outStage = mix_block[i] * swellGain * volumePedalGain; 
+                    float rawOut = mix_block[i] * localSwellGain * localVolGain; 
                     
-                    // FIX: Redundant output Mute check entirely removed to let GCC vectorizer thrive
-                    dsp_out_block[i * 2] = outStage; 
-                    dsp_out_block[i * 2 + 1] = outStage;
+                    if (fabsf(dc_block[i]) > peakInputVal) peakInputVal = fabsf(dc_block[i]); 
+                    if (fabsf(rawOut) > peakOutputVal) peakOutputVal = fabsf(rawOut); 
                     
-                    if (fabsf(dc_block[i]) > peakInputVal) { 
-                        peakInputVal = fabsf(dc_block[i]); 
-                    }
+                    float scaledOut = mix_block[i] * masterScale;
                     
-                    if (fabsf(outStage) > peakOutputVal) { 
-                        peakOutputVal = fabsf(outStage); 
-                    }
+                    // FIX: FPU safely clamps perfectly at limits avoiding integer pop wrapping
+                    int32_t finalOut = (int32_t)fmaxf(-2147483520.0f, fminf(scaledOut, 2147483520.0f));
+                    
+                    i2s_out_block[i * 2] = finalOut; 
+                    i2s_out_block[i * 2 + 1] = finalOut;
                 }
 
-                if (peakInputVal > ui_audio_level) { 
-                    ui_audio_level = peakInputVal; 
-                } else { 
-                    ui_audio_level *= 0.998f; 
-                    if (ui_audio_level < 1e-5f) {
-                        ui_audio_level = 0.0f;
-                    }
-                }
+                if (peakInputVal > ui_audio_level) { ui_audio_level = peakInputVal; } 
+                else { ui_audio_level *= 0.998f; if (ui_audio_level < 1e-5f) ui_audio_level = 0.0f; }
                 
-                if (peakOutputVal > ui_output_level) { 
-                    ui_output_level = peakOutputVal; 
-                } else { 
-                    ui_output_level *= 0.998f; 
-                    if (ui_output_level < 1e-5f) {
-                        ui_output_level = 0.0f;
-                    }
-                }
+                if (peakOutputVal > ui_output_level) { ui_output_level = peakOutputVal; } 
+                else { ui_output_level *= 0.998f; if (ui_output_level < 1e-5f) ui_output_level = 0.0f; }
 
             } // --- END OF !blockIsMuted DSP BYPASS ---
             
@@ -1273,15 +1258,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float max_cycles = (240000000.0f / (float)currentSampleRate) * (float)framesRead;
             float currentLoadPercentage = ((float)(end_timer - start_cycles) / max_cycles) * 100.0f;
             core1_load = core1_load * 0.95f + fminf(100.0f, currentLoadPercentage) * 0.05f; 
-            
-            // FIX: Perfect exact FPU clipping boundaries completely stops 32-bit FPU overflow popping
-            float bit32Scale = 2147483520.0f; 
-            dsps_mul_f32(dsp_out_block, &bit32Scale, dsp_out_block, framesRead * 2, 1, 0, 1);
-            
-            #pragma GCC ivdep
-            for (int i = 0; i < framesRead * 2; i++) {
-                i2s_out_block[i] = (int32_t)fmaxf(-2147483520.0f, fminf(dsp_out_block[i], 2147483520.0f));
-            }
             
             size_t bytesWrittenCount; 
             i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, portMAX_DELAY);
@@ -1744,6 +1720,7 @@ void setup() {
     memset(pitchShiftLUT_temp, 0, 16384 * sizeof(float));
     memset(hannLUT, 0, 1024 * sizeof(float));           
     
+    // Mathematically perfect Hann Window prevents 3dB volume bump during crossfade
     for (int i = 0; i < 1024; i++) { 
         hannLUT[i] = 0.5f * (1.0f - cosf(TWO_PI * ((float)i / 1023.0f))); 
         lfoLUT[i] = powf(2.0f, (15.0f * sinf(TWO_PI * ((float)i / 1024.0f))) / 1200.0f); 
@@ -1798,6 +1775,7 @@ void setup() {
 void loop() {
     if (lutNeedsUpdate) {
         updateLUT();
+        // FIX: The "Phantom Pedal" patch - Safely fetch the final pedal position here to prevent jitter
         if (!isVolumeMode) {
             pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
         }

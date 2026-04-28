@@ -460,7 +460,9 @@ void updateLUT() {
     
     memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
-    // FIX: Pitch factor cross-thread assignment removed. Pitch is safely fetched synchronously in loop().
+    if (!isVolumeMode) { 
+        pitchShiftFactor = pitchShiftLUT[constrain(currentPB1, 0, 16383)]; 
+    }
     
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f);
     globalChorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
@@ -1081,6 +1083,15 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float fbOutNode = 0.0f;
                     
                     if (feedbackActive || feedbackRamp > 0.0f) { 
+                        // FIX: Restore analog LFO phase modulation to prevent frozen pointers!
+                        feedbackLfoPhase += feedbackPhaseIncr; 
+                        if (feedbackLfoPhase >= LFO_LUT_SIZE) { 
+                            feedbackLfoPhase -= LFO_LUT_SIZE; 
+                        }
+                        float lfoVal = lfoLUT[(int)feedbackLfoPhase]; 
+                        spd4 = lfoVal; 
+                        spd5 = fbPitch * lfoVal; 
+                        
                         w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
                              processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                         w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
@@ -1105,6 +1116,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
                         float satFb = feedbackFilterVar * (feedbackRamp * feedbackRamp * feedbackRamp) * 0.85f; 
                         
+                        // Direct write/read to FB PSRAM bypasses sluggish residual block memcopies
                         fbDelayBuffer[fbDelayWriteIdx] = satFb;
                         
                         int delaySamples = (int)(currentSampleRate * 0.02f);
@@ -1214,8 +1226,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         sMix += fz_block[i] * g_frz;
                         sMix += fbOut_block[i] * g_fb;
                         
-                        // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion
-                        // Clamping precisely to +/- 1.8f prevents the foldback curve from dropping the volume of extreme peaks
+                        // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
                         sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
                         sMix = sMix * (1.0f - (0.1f * sMix * sMix));
                         mix_block[i] = sMix;
@@ -1266,7 +1277,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float bit32Scale = 2147483647.0f; 
             dsps_mul_f32(dsp_out_block, &bit32Scale, dsp_out_block, framesRead * 2, 1, 0, 1);
             
-            // FIX: C++ Safe Integer Casting bounds protection avoids wrap-to-infinity hardware FPU popping
+            // C++ Safe Integer Casting bounds protection avoids wrap-to-infinity hardware pop
             #pragma GCC ivdep
             for (int i = 0; i < framesRead * 2; i++) {
                 i2s_out_block[i] = (int32_t)fmaxf(-2147483520.0f, fminf(dsp_out_block[i], 2147483520.0f));
@@ -1788,7 +1799,9 @@ void setup() {
 void loop() {
     if (lutNeedsUpdate) {
         updateLUT();
-        // FIX: Removed cross-thread parameter assignment here to fix micro-stutter
+        if (!isVolumeMode) {
+            pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
+        }
         lutNeedsUpdate = false;
     }
     

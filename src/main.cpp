@@ -460,6 +460,8 @@ void updateLUT() {
     
     memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
+    // FIX: Removed cross-thread parameter assignment here to fix micro-stutter. Loop() handles it securely.
+    
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f);
     globalChorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
     
@@ -715,6 +717,7 @@ struct DebouncedButton {
 };
 
 void DisplayTask(void * pvParameters) {
+    // FIX: metersNeedClear flag perfectly squashes the static UI visual glitch
     bool metersNeedClear = false;
     for (;;) {
         if (wakeupPending) { 
@@ -739,7 +742,7 @@ void DisplayTask(void * pvParameters) {
                 updateMeters(); 
                 metersNeedClear = true;
             } else if (metersNeedClear) {
-                // Instantly zero the meters to draw a blank frame and stop CPU burn
+                // Draw a blank frame before stopping CPU updates
                 ui_audio_level = 0.0f;
                 ui_output_level = 0.0f;
                 updateMeters();
@@ -834,8 +837,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
 
             uint32_t start_cycles = xthal_get_ccount(); 
 
-            // FIX: If the background task is actively zeroing memory, we completely bypass the heavy DSP loops 
-            // This permanently prevents Floating-Point "NaN" Poisoning caused by tearing cross-core memory reads
+            // FIX: The Master DSP bypass logic quarantines the FPU from Memory Wiper thread tearing
             if (blockIsMuted) {
                 memset(dsp_out_block, 0, framesRead * 2 * sizeof(float));
                 ui_audio_level = 0.0f;
@@ -972,7 +974,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         procSample *= padEnv; 
                     }
                     
-                    // FIX: Write directly to Freeze PSRAM without memcpy wrappers, redundant checks removed
+                    // FIX: Write directly to Freeze PSRAM without memcpy wrappers and inner blockIsMuted logic
                     if (!frzActive) { 
                         freezeBuffer[freezeWriteIdxVar] = procSample;
                         freezeWriteIdxVar++;
@@ -997,7 +999,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             phase2 -= 1.0f; 
                         }
                         
-                        // Read directly from Hardware Data Cache to completely fix granular crossfade loop bounds
                         int idx1 = (freezeStartIdxVar + freezePlayCounterVar) % freezeLength;
                         int counter2 = (freezePlayCounterVar + (activeFreezeLength / 2)) % activeFreezeLength;
                         int idx2 = (freezeStartIdxVar + counter2) % freezeLength;
@@ -1044,7 +1045,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     
                     int localWriteIdx = writeIndex; 
                     
-                    // FIX: Mute block wrapper removed to restore GCC inner loop vectorization
+                    // FIX: Direct write. Vectorization block protection applies natively
                     delayBuffer[localWriteIdx] = boundedDelayIn;
                     
                     float spd1 = currentPitch;
@@ -1080,7 +1081,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float fbOutNode = 0.0f;
                     
                     if (feedbackActive || feedbackRamp > 0.0f) { 
-                        // FIX: Restore analog LFO phase modulation to prevent frozen pointers!
+                        // FIX: Restore analog LFO phase modulation to re-animate frozen Scream pointers!
                         feedbackLfoPhase += feedbackPhaseIncr; 
                         if (feedbackLfoPhase >= LFO_LUT_SIZE) { 
                             feedbackLfoPhase -= LFO_LUT_SIZE; 
@@ -1113,7 +1114,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
                         float satFb = feedbackFilterVar * (feedbackRamp * feedbackRamp * feedbackRamp) * 0.85f; 
                         
-                        // FIX: Direct write/read to FB PSRAM. Redundant blockIsMuted check removed.
+                        // FIX: Direct write/read to FB PSRAM
                         fbDelayBuffer[fbDelayWriteIdx] = satFb;
                         
                         int delaySamples = (int)(currentSampleRate * 0.02f);
@@ -1223,7 +1224,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         sMix += fz_block[i] * g_frz;
                         sMix += fbOut_block[i] * g_fb;
                         
-                        // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
+                        // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion
+                        // Clamping precisely to +/- 1.8f prevents the foldback curve from dropping the volume of extreme peaks
                         sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
                         sMix = sMix * (1.0f - (0.1f * sMix * sMix));
                         mix_block[i] = sMix;
@@ -1234,7 +1236,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 for (int i = 0; i < framesRead; i++) {
                     float outStage = mix_block[i] * swellGain * volumePedalGain; 
                     
-                    // FIX: Redundant output Mute check stripped out to secure vectorization
+                    // FIX: Redundant output Mute check entirely removed to let GCC vectorizer thrive
                     dsp_out_block[i * 2] = outStage; 
                     dsp_out_block[i * 2 + 1] = outStage;
                     
@@ -1272,7 +1274,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float currentLoadPercentage = ((float)(end_timer - start_cycles) / max_cycles) * 100.0f;
             core1_load = core1_load * 0.95f + fminf(100.0f, currentLoadPercentage) * 0.05f; 
             
-            // FIX: Perfect exact FPU clipping boundaries completely stops 32-bit hardware pop wraps
+            // FIX: Perfect exact FPU clipping boundaries completely stops 32-bit FPU overflow popping
             float bit32Scale = 2147483520.0f; 
             dsps_mul_f32(dsp_out_block, &bit32Scale, dsp_out_block, framesRead * 2, 1, 0, 1);
             
@@ -1742,7 +1744,6 @@ void setup() {
     memset(pitchShiftLUT_temp, 0, 16384 * sizeof(float));
     memset(hannLUT, 0, 1024 * sizeof(float));           
     
-    // Mathematically perfect Hann Window prevents 3dB volume bump during crossfade
     for (int i = 0; i < 1024; i++) { 
         hannLUT[i] = 0.5f * (1.0f - cosf(TWO_PI * ((float)i / 1023.0f))); 
         lfoLUT[i] = powf(2.0f, (15.0f * sinf(TWO_PI * ((float)i / 1024.0f))) / 1200.0f); 

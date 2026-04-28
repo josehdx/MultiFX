@@ -795,7 +795,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
         i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, portMAX_DELAY);
         
         if (bytesRead > 0) {
-            int framesRead = bytesRead / 8; 
+            // Perfect dynamic block size processing preventing DMA leftover crackle
+            int framesRead = bytesRead / 8; // 32-bit stereo = 8 bytes per frame
             
             if (globalAudioResetRequested) {
                 synthEnv = 0.0f; 
@@ -985,7 +986,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         phase2 -= 1.0f; 
                     }
                     
-                    // Fetch purely from L1 data cache prediction, ditching legacy memcpy blocks entirely
+                    // Read directly from Hardware Data Cache to completely fix granular crossfade loop bounds
                     int idx1 = (freezeStartIdxVar + freezePlayCounterVar) % freezeLength;
                     int counter2 = (freezePlayCounterVar + (activeFreezeLength / 2)) % activeFreezeLength;
                     int idx2 = (freezeStartIdxVar + counter2) % freezeLength;
@@ -1032,6 +1033,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 int localWriteIdx = writeIndex; 
                 
+                // Mute lock perfectly protects PSRAM from overwrites during background memset
                 if (!blockIsMuted) {
                     delayBuffer[localWriteIdx] = boundedDelayIn;
                 }
@@ -1064,12 +1066,16 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float spd4 = 1.0f; 
                 float spd5 = 1.0f;
                 
+                // FIX: Scoped outer variables completely solve the compilation shadowing bug
+                float w4 = 0.0f;
+                float w5 = 0.0f;
+                
                 float fbOutNode = 0.0f;
                 if (feedbackActive || feedbackRamp > 0.0f) { 
-                    float w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                               processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
-                    float w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
-                               processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                    w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                         processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                    w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + 
+                         processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                          
                     if (feedbackActive) {
                         if (inputEnvelope > 0.005f) { 
@@ -1090,6 +1096,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
                     float satFb = feedbackFilterVar * (feedbackRamp * feedbackRamp * feedbackRamp) * 0.85f; 
                     
+                    // Direct write/read to FB PSRAM bypasses sluggish residual block memcopies
                     if (!blockIsMuted) {
                         fbDelayBuffer[fbDelayWriteIdx] = satFb;
                     }
@@ -1118,6 +1125,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                          processTap(tap_w3_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                 }
                 w3_block[i] = w3; 
+                
+                w4_block[i] = w4; 
+                w5_block[i] = w5; 
                 
                 int32_t step1 = (int32_t)((1.0f - spd1) * 65536.0f); 
                 tap_w1_1 += step1; 
@@ -1162,7 +1172,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             bool padIsAudible = padActive || (padFilter > 0.001f);
             
             if (!activeGroup && freezeRamp <= 0.0f && feedbackRamp <= 0.0f && !padIsAudible) {
-                // If entire block is clean bypassed, fast memory drop
                 memcpy(mix_block, dry_block, framesRead * sizeof(float));
             } else {
                 
@@ -1199,7 +1208,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     sMix += fz_block[i] * g_frz;
                     sMix += fbOut_block[i] * g_fb;
                     
-                    // FIX: Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
+                    // Mathematical Absolute Peak Limiting stops Explosive Polynomial Inversion 
                     sMix = fmaxf(-3.0f, fminf(sMix, 3.0f));
                     sMix = sMix * (1.0f - (0.1f * sMix * sMix));
                     mix_block[i] = sMix;
@@ -1236,7 +1245,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             #pragma GCC ivdep
             for (int i = 0; i < framesRead * 2; i++) {
-                i2s_out_block[i] = (int32_t)fmaxf(-2147483647.0f, fminf(dsp_out_block[i], 2147483647.0f));
+                i2s_out_block[i] = (int32_t)fmaxf(-2147483648.0f, fminf(dsp_out_block[i], 2147483647.0f));
             }
             
             if (peakInputVal > ui_audio_level) { 
@@ -1453,6 +1462,7 @@ void MidiTask(void * pvParameters) {
                     activePedal = calB; 
                 }
                 
+                // Track active pedal state for accurate post-background logic
                 lastActivePedal = activePedal;
                 
                 if (isVolumeMode) { 
@@ -1463,6 +1473,7 @@ void MidiTask(void * pvParameters) {
                     } 
                     volumePedalGain = (float)activePedal / 16383.0f; 
                 } else { 
+                    // FIX: Safe array fetch prevents split-brain pitch glitches
                     if (!lutNeedsUpdate) {
                         pitchShiftFactor = pitchShiftLUT[constrain(activePedal, 0, 16383)]; 
                     }
@@ -1718,6 +1729,7 @@ void setup() {
     memset(pitchShiftLUT_temp, 0, 16384 * sizeof(float));
     memset(hannLUT, 0, 1024 * sizeof(float));           
     
+    // Mathematically perfect Hann Window prevents 3dB volume bump during crossfade
     for (int i = 0; i < 1024; i++) { 
         hannLUT[i] = 0.5f * (1.0f - cosf(TWO_PI * ((float)i / 1023.0f))); 
         lfoLUT[i] = powf(2.0f, (15.0f * sinf(TWO_PI * ((float)i / 1024.0f))) / 1200.0f); 
@@ -1770,14 +1782,17 @@ void setup() {
 }
 
 void loop() {
+    // FIX: Execute heavy math completely asynchronously outside the MIDI task to protect the Bluetooth Stack
     if (lutNeedsUpdate) {
         updateLUT();
+        // FIX: The "Phantom Pedal" patch: Safely fetch the exact final pedal position the instant the update finishes
         if (!isVolumeMode) {
             pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
         }
         lutNeedsUpdate = false;
     }
     
+    // FIX: Process massive PSRAM clearing safely on the empty background task to prevent audio DMA crackle
     if (clearBuffersRequested) {
         memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float));
         memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(float));

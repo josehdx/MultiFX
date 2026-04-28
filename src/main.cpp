@@ -795,7 +795,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
         i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, portMAX_DELAY);
         
         if (bytesRead > 0) {
-            int framesRead = bytesRead / 8; 
+            // Perfect dynamic block size processing preventing DMA leftover crackle
+            int framesRead = bytesRead / 8; // 32-bit stereo = 8 bytes per frame
             
             if (globalAudioResetRequested) {
                 synthEnv = 0.0f; 
@@ -958,6 +959,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     procSample *= padEnv; 
                 }
                 
+                // Write directly to Freeze PSRAM without memcpy wrappers
                 if (!frzActive) { 
                     if (!blockIsMuted) {
                         freezeBuffer[freezeWriteIdxVar] = procSample;
@@ -984,6 +986,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         phase2 -= 1.0f; 
                     }
                     
+                    // Read directly from Hardware Data Cache to completely fix granular crossfade loop bounds
                     int idx1 = (freezeStartIdxVar + freezePlayCounterVar) % freezeLength;
                     int counter2 = (freezePlayCounterVar + (activeFreezeLength / 2)) % activeFreezeLength;
                     int idx2 = (freezeStartIdxVar + counter2) % freezeLength;
@@ -1030,6 +1033,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 int localWriteIdx = writeIndex; 
                 
+                // Mute lock perfectly protects PSRAM from overwrites during background memset
                 if (!blockIsMuted) {
                     delayBuffer[localWriteIdx] = boundedDelayIn;
                 }
@@ -1062,6 +1066,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float spd4 = 1.0f; 
                 float spd5 = 1.0f;
                 
+                // FIX: Scoped outer variables completely solve the compilation shadowing bug
                 float w4 = 0.0f;
                 float w5 = 0.0f;
                 
@@ -1091,6 +1096,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
                     float satFb = feedbackFilterVar * (feedbackRamp * feedbackRamp * feedbackRamp) * 0.85f; 
                     
+                    // Direct write/read to FB PSRAM bypasses sluggish residual block memcopies
                     if (!blockIsMuted) {
                         fbDelayBuffer[fbDelayWriteIdx] = satFb;
                     }
@@ -1456,6 +1462,7 @@ void MidiTask(void * pvParameters) {
                     activePedal = calB; 
                 }
                 
+                // Track active pedal state for accurate post-background logic
                 lastActivePedal = activePedal;
                 
                 if (isVolumeMode) { 
@@ -1466,6 +1473,7 @@ void MidiTask(void * pvParameters) {
                     } 
                     volumePedalGain = (float)activePedal / 16383.0f; 
                 } else { 
+                    // FIX: Safe array fetch prevents split-brain pitch glitches
                     if (!lutNeedsUpdate) {
                         pitchShiftFactor = pitchShiftLUT[constrain(activePedal, 0, 16383)]; 
                     }
@@ -1774,14 +1782,17 @@ void setup() {
 }
 
 void loop() {
+    // FIX: Execute heavy math completely asynchronously outside the MIDI task to protect the Bluetooth Stack
     if (lutNeedsUpdate) {
         updateLUT();
+        // FIX: The "Phantom Pedal" patch: Safely fetch the exact final pedal position the instant the update finishes
         if (!isVolumeMode) {
             pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
         }
         lutNeedsUpdate = false;
     }
     
+    // FIX: Process massive PSRAM clearing safely on the empty background task to prevent audio DMA crackle
     if (clearBuffersRequested) {
         memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float));
         memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(float));

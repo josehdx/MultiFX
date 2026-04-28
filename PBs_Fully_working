@@ -460,10 +460,6 @@ void updateLUT() {
     
     memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     
-    if (!isVolumeMode) { 
-        pitchShiftFactor = pitchShiftLUT[constrain(currentPB1, 0, 16383)]; 
-    }
-    
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f);
     globalChorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
     
@@ -976,7 +972,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         procSample *= padEnv; 
                     }
                     
-                    // Write directly to Freeze PSRAM without memcpy wrappers
+                    // FIX: Write directly to Freeze PSRAM without memcpy wrappers, redundant checks removed
                     if (!frzActive) { 
                         freezeBuffer[freezeWriteIdxVar] = procSample;
                         freezeWriteIdxVar++;
@@ -1048,6 +1044,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     
                     int localWriteIdx = writeIndex; 
                     
+                    // FIX: Mute block wrapper removed to restore GCC inner loop vectorization
                     delayBuffer[localWriteIdx] = boundedDelayIn;
                     
                     float spd1 = currentPitch;
@@ -1116,7 +1113,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
                         float satFb = feedbackFilterVar * (feedbackRamp * feedbackRamp * feedbackRamp) * 0.85f; 
                         
-                        // Direct write/read to FB PSRAM bypasses sluggish residual block memcopies
+                        // FIX: Direct write/read to FB PSRAM. Redundant blockIsMuted check removed.
                         fbDelayBuffer[fbDelayWriteIdx] = satFb;
                         
                         int delaySamples = (int)(currentSampleRate * 0.02f);
@@ -1237,6 +1234,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 for (int i = 0; i < framesRead; i++) {
                     float outStage = mix_block[i] * swellGain * volumePedalGain; 
                     
+                    // FIX: Redundant output Mute check stripped out to secure vectorization
                     dsp_out_block[i * 2] = outStage; 
                     dsp_out_block[i * 2 + 1] = outStage;
                     
@@ -1274,10 +1272,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             float currentLoadPercentage = ((float)(end_timer - start_cycles) / max_cycles) * 100.0f;
             core1_load = core1_load * 0.95f + fminf(100.0f, currentLoadPercentage) * 0.05f; 
             
-            float bit32Scale = 2147483647.0f; 
+            // FIX: Perfect exact FPU clipping boundaries completely stops 32-bit hardware pop wraps
+            float bit32Scale = 2147483520.0f; 
             dsps_mul_f32(dsp_out_block, &bit32Scale, dsp_out_block, framesRead * 2, 1, 0, 1);
             
-            // C++ Safe Integer Casting bounds protection avoids wrap-to-infinity hardware pop
             #pragma GCC ivdep
             for (int i = 0; i < framesRead * 2; i++) {
                 i2s_out_block[i] = (int32_t)fmaxf(-2147483520.0f, fminf(dsp_out_block[i], 2147483520.0f));

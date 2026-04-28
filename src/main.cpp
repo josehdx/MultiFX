@@ -780,8 +780,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static int freezeStartIdxVar = 0;
     static int activeFreezeLength = 96000;
     
-    static int muteCounter = 0;
-    
     const float normFactor = 1.0f / 2147483648.0f; 
     const float DC_OFFSET = 1e-9f;
     
@@ -822,7 +820,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 ui_output_level = 0.0f; 
                 
                 clearBuffersRequested = true;
-                muteCounter = (int)(0.02f * currentSampleRate); 
                 globalAudioResetRequested = false;
             }
 
@@ -988,7 +985,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         phase2 -= 1.0f; 
                     }
                     
-                    // Read directly from Hardware Data Cache to completely fix granular crossfade loop bounds
+                    // Fetch purely from L1 data cache prediction, ditching legacy memcpy blocks entirely
                     int idx1 = (freezeStartIdxVar + freezePlayCounterVar) % freezeLength;
                     int counter2 = (freezePlayCounterVar + (activeFreezeLength / 2)) % activeFreezeLength;
                     int idx2 = (freezeStartIdxVar + counter2) % freezeLength;
@@ -1093,7 +1090,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
                     float satFb = feedbackFilterVar * (feedbackRamp * feedbackRamp * feedbackRamp) * 0.85f; 
                     
-                    // Direct write/read to FB PSRAM bypasses sluggish residual block memcopies
                     if (!blockIsMuted) {
                         fbDelayBuffer[fbDelayWriteIdx] = satFb;
                     }
@@ -1166,10 +1162,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             bool padIsAudible = padActive || (padFilter > 0.001f);
             
             if (!activeGroup && freezeRamp <= 0.0f && feedbackRamp <= 0.0f && !padIsAudible) {
+                // If entire block is clean bypassed, fast memory drop
                 memcpy(mix_block, dry_block, framesRead * sizeof(float));
             } else {
                 
-                // Hoist branches OUTSIDE the loop to restore 128-bit MAC Vectorization
+                // Hoist branches OUTSIDE the loop to guarantee 128-bit MAC Hardware Vectorization
                 float g_base = 0.0f;
                 if (dryGroup) {
                     if (!repeatGroup) g_base = 0.4f;
@@ -1239,7 +1236,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             #pragma GCC ivdep
             for (int i = 0; i < framesRead * 2; i++) {
-                i2s_out_block[i] = (int32_t)fmaxf(-2147483648.0f, fminf(dsp_out_block[i], 2147483647.0f));
+                i2s_out_block[i] = (int32_t)fmaxf(-2147483647.0f, fminf(dsp_out_block[i], 2147483647.0f));
             }
             
             if (peakInputVal > ui_audio_level) { 

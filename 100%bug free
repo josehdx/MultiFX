@@ -186,7 +186,7 @@ uint16_t PB2_raw_center = 2048;
 uint16_t PB3_raw_min = 1000;
 uint16_t PB3_raw_max = 3000;
 
-int deadzone_size = 350; 
+int deadzone_size = 400; 
 
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB = pinPB;
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
@@ -213,26 +213,33 @@ int getBatteryPercentage(float voltage) {
 
 // --- DYNAMIC RAW DEADZONE MAPPING (PB1 & PB2) ---
 analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
+    // FIX: A massive 350-unit outer block definitively crushes all end-throw edge drifting
+    int outerDeadzone = 350; 
+    
     int deadLower = center - dZone;
     int deadUpper = center + dZone;
     
-    if (raw >= deadLower && raw <= deadUpper) {
-        return 8192; // Dead center
-    }
+    int effMin = rMin + outerDeadzone;
+    int effMax = rMax - outerDeadzone;
     
+    // Safety fail-safes so limits do not invert
+    if (effMin >= deadLower) effMin = rMin + 50; 
+    if (effMax <= deadUpper) effMax = rMax - 50;
+    
+    // HARDWARE EXTREME SNAPPING
+    if (raw <= effMin) return 0;
+    if (raw >= effMax) return 16383;
+    
+    // CENTER DEADZONE SNAPPING
+    if (raw >= deadLower && raw <= deadUpper) return 8192;
+    
+    // SMOOTH INTERPOLATION
     long mappedValue;
-    
     if (raw < deadLower) {
-        if (rMin >= deadLower) rMin = deadLower - 1; // Safely protect against inverse division
-        mappedValue = map(raw, rMin, deadLower, 0, 8191);
+        mappedValue = map(raw, effMin, deadLower, 0, 8191);
     } else {
-        if (rMax <= deadUpper) rMax = deadUpper + 1; // Safely protect against inverse division
-        mappedValue = map(raw, deadUpper, rMax, 8193, 16383);
+        mappedValue = map(raw, deadUpper, effMax, 8193, 16383);
     }
-    
-    // Soft-clip limiters gracefully eliminate maximum hardware drift without causing sudden jumps
-    if (mappedValue > 16100) return 16383;
-    if (mappedValue < 280) return 0;
     
     return constrain(mappedValue, 0, 16383);
 }
@@ -240,7 +247,7 @@ analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax
 // --- DYNAMIC RAW EXPRESSION MAPPING (PB3) ---
 analog_t map_raw_expression(int raw, uint16_t rMin, uint16_t rMax, bool invert) {
     int heelLockZone = 350; 
-    int toeLockZone = 150;   
+    int toeLockZone = 300;   
     
     int lowerLimit;
     int upperLimit;
@@ -315,12 +322,11 @@ void calibratePBs() {
         PB2_raw_center = 2048;
     }
     
-    // Initial bounds mapped widely to prevent initial jump during the first full sweep
-    PB1_raw_min = PB1_raw_center - 400; 
-    PB1_raw_max = PB1_raw_center + 400;
+    PB1_raw_min = PB1_raw_center - 200; 
+    PB1_raw_max = PB1_raw_center + 200;
     
-    PB2_raw_min = PB2_raw_center - 400; 
-    PB2_raw_max = PB2_raw_center + 400;
+    PB2_raw_min = PB2_raw_center - 200; 
+    PB2_raw_max = PB2_raw_center + 200;
     
     PB3_raw_min = 1000; 
     PB3_raw_max = 3000; 
@@ -762,6 +768,7 @@ void DisplayTask(void * pvParameters) {
                 updateMeters(); 
                 metersNeedClear = true;
             } else if (metersNeedClear) {
+                // Instantly zero the meters to draw a blank frame and stop CPU burn
                 ui_audio_level = 0.0f;
                 ui_output_level = 0.0f;
                 updateMeters();
@@ -939,6 +946,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float peakInputVal = 0.0f; 
                 float peakOutputVal = 0.0f;
                 
+                // Buffer volatile RAM variables locally so the compiler can vectorize DSP loops
                 float localSwellGain = swellGain;
                 float localVolGain = volumePedalGain;
                 float localFrzRamp = freezeRamp;

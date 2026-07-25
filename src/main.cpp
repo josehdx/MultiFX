@@ -1772,7 +1772,7 @@ void setup() {
     
     i2s_std_config_t stdConfig = { 
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate), 
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = { 
             .mclk = GPIO_NUM_43, 
             .bclk = GPIO_NUM_44, 

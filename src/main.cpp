@@ -1,6 +1,7 @@
 #pragma GCC optimize ("O3, tree-vectorize")
 #include <Arduino.h>
 #include <Control_Surface.h>
+#include <WiFi.h>
 #include <TFT_eSPI.h>
 #include <driver/i2s_std.h> 
 #include "driver/gpio.h" 
@@ -1532,6 +1533,9 @@ bool channelMessageCallback(ChannelMessage cm) {
 }
 
 void setup() {
+    // Completely disable Wi-Fi radio to eliminate 2.4 GHz RF coexistence interrupts
+    WiFi.mode(WIFI_OFF);
+
     pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP); 
     pinMode(BATTERY_PIN, INPUT);
     

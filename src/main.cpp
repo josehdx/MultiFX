@@ -847,7 +847,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 ui_output_level = 0.0f;
             } else {
 
-                float targetWindow = LATENCY_WINDOWS[latencyMode];
+                float targetWindow = LATENCY_WINDOWS[latencyMode] * (currentSampleRate == 96000 ? 2.0f : 1.0f);
                 
                 if (currentWindowSize != targetWindow) { 
                     currentWindowSize = targetWindow; 
@@ -1413,82 +1413,107 @@ void MidiTask(void * pvParameters) {
     }
 }
 
+// --- UPDATED INTERNAL TOGGLE LOGIC ---
 bool channelMessageCallback(ChannelMessage cm) {
     if (cm.header == 0xB0) {
-        if (cm.data1 == 5) { 
-            isVolumeMode = (cm.data2 >= 64); 
+        
+        // VOLUME MODE TOGGLE
+        if (cm.data1 == 5 && cm.data2 >= 64) { 
+            isVolumeMode = !isVolumeMode; 
             if (!isVolumeMode) { volumePedalGain = 1.0f; } 
             forceUIUpdate = true; 
         }
+        // EFFECT MENU DOWN
         else if (cm.data1 == 0 && cm.data2 >= 64) { 
             if (activeEffectMode == 0) { activeEffectMode = 9; } 
             else { activeEffectMode = activeEffectMode - 1; }
             lutNeedsUpdate = true; forceUIUpdate = true; 
         }
+        // EFFECT MENU UP
         else if (cm.data1 == 1 && cm.data2 >= 64) { 
             activeEffectMode = (activeEffectMode + 1) % 10; 
             lutNeedsUpdate = true; forceUIUpdate = true; 
         }
+        // LATENCY MENU
         else if (cm.data1 == 2 && cm.data2 >= 64) { 
             latencyMode = (latencyMode + 1) % 4; 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 3) {
+        // GLOBAL BYPASS / SMART RESET TOGGLE
+        else if (cm.data1 == 3 && cm.data2 >= 64) {
             globalAudioResetRequested = true; 
-            isWhammyActive = (cm.data2 < 64); 
-            isFrozen = false; isFeedbackActive = false; isHarmonizerMode = false;
-            isCapoMode = false; isSynthMode = false; isPadMode = false; 
-            isChorusMode = false; isSwellMode = false; isVibratoMode = false; 
-            isVolumeMode = false;
             
-            volumePedalGain = 1.0f; lutNeedsUpdate = true; forceUIUpdate = true;
+            // Check if ANY effect or mode is currently active
+            bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || 
+                               isHarmonizerMode || isCapoMode || isSynthMode || 
+                               isPadMode || isChorusMode || isSwellMode || 
+                               isVibratoMode || isVolumeMode;
+
+            if (anyEffectOn) {
+                // If anything is on, KILL EVERYTHING (True Dry Bypass)
+                isWhammyActive = false; 
+                isFrozen = false; isFeedbackActive = false; isHarmonizerMode = false;
+                isCapoMode = false; isSynthMode = false; isPadMode = false; 
+                isChorusMode = false; isSwellMode = false; isVibratoMode = false; 
+                isVolumeMode = false;
+                volumePedalGain = 1.0f; 
+            } else {
+                // If everything is completely off, turn the base Whammy back ON
+                isWhammyActive = true;
+            }
+            
+            lutNeedsUpdate = true; forceUIUpdate = true;
         }
+        // SAMPLE RATE TOGGLE
         else if (cm.data1 == 4 && cm.data2 >= 64) { toggleSampleRate(); }
-        else if (cm.data1 == 8) { 
-            isFrozen = (cm.data2 >= 64); 
+        
+        // EFFECT SPECIFIC TOGGLES
+        else if (cm.data1 == 8 && cm.data2 >= 64) { 
+            isFrozen = !isFrozen; 
             if (activeEffectMode == 1) { isWhammyActive = isFrozen; } 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 9) { 
-            isFeedbackActive = (cm.data2 >= 64); 
+        else if (cm.data1 == 9 && cm.data2 >= 64) { 
+            isFeedbackActive = !isFeedbackActive; 
             if (activeEffectMode == 2) { isWhammyActive = isFeedbackActive; } 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 10) { 
-            isHarmonizerMode = (cm.data2 >= 64); 
+        else if (cm.data1 == 10 && cm.data2 >= 64) { 
+            isHarmonizerMode = !isHarmonizerMode; 
             if (activeEffectMode == 3) { isWhammyActive = isHarmonizerMode; } 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 12) { 
-            isCapoMode = (cm.data2 >= 64); 
+        else if (cm.data1 == 12 && cm.data2 >= 64) { 
+            isCapoMode = !isCapoMode; 
             if (activeEffectMode == 4) { isWhammyActive = isCapoMode; } 
             lutNeedsUpdate = true; forceUIUpdate = true; 
         }
-        else if (cm.data1 == 13) { 
-            isSynthMode = (cm.data2 >= 64); 
+        else if (cm.data1 == 13 && cm.data2 >= 64) { 
+            isSynthMode = !isSynthMode; 
             if (activeEffectMode == 5) { isWhammyActive = isSynthMode; } 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 14) { 
-            isPadMode = (cm.data2 >= 64); 
+        else if (cm.data1 == 14 && cm.data2 >= 64) { 
+            isPadMode = !isPadMode; 
             if (activeEffectMode == 6) { isWhammyActive = isPadMode; } 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 15) { 
-            isChorusMode = (cm.data2 >= 64); 
+        else if (cm.data1 == 15 && cm.data2 >= 64) { 
+            isChorusMode = !isChorusMode; 
             if (activeEffectMode == 7) { isWhammyActive = isChorusMode; } 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 16) { 
-            isSwellMode = (cm.data2 >= 64); 
+        else if (cm.data1 == 16 && cm.data2 >= 64) { 
+            isSwellMode = !isSwellMode; 
             if (activeEffectMode == 8) { isWhammyActive = isSwellMode; } 
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 7) { 
-            isVibratoMode = (cm.data2 >= 64); 
+        else if (cm.data1 == 7 && cm.data2 >= 64) { 
+            isVibratoMode = !isVibratoMode; 
             if (activeEffectMode == 9) { isWhammyActive = isVibratoMode; } 
             forceUIUpdate = true; 
         }
+        // PARAMETER TWEAKS (Pitch intervals, etc)
         else if (cm.data1 == 18 || cm.data1 == 17) {
             float direction = (cm.data2 < 64) ? 1.0f : -1.0f;
             
@@ -1519,7 +1544,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             
             if (isVolumeMode) {
                 volumePedalGain = (float)mappedCC / 16383.0f;
-                // CC11 will also actively broadcast CC19 if Volume Mode is toggled on!
                 Control_Surface.sendControlChange({19, Channel_1}, cm.data2); 
             } else {
                 if (!lutNeedsUpdate) {
@@ -1639,8 +1663,6 @@ void setup() {
 void loop() {
     if (lutNeedsUpdate) {
         updateLUT();
-        // FIX: Always safely fetch the final pedal position here to prevent jitter
-        // Since lastActivePedal is now completely isolated from Volume Mode, this is 100% safe.
         pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
         lutNeedsUpdate = false;
     }

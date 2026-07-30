@@ -213,7 +213,6 @@ int getBatteryPercentage(float voltage) {
 
 // --- DYNAMIC RAW DEADZONE MAPPING (PB1 & PB2) ---
 analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
-    // FIX: A massive 350-unit outer block definitively crushes all end-throw edge drifting
     int outerDeadzone = 350; 
     
     int deadLower = center - dZone;
@@ -222,18 +221,14 @@ analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax
     int effMin = rMin + outerDeadzone;
     int effMax = rMax - outerDeadzone;
     
-    // Safety fail-safes so limits do not invert
     if (effMin >= deadLower) effMin = rMin + 50; 
     if (effMax <= deadUpper) effMax = rMax - 50;
     
-    // HARDWARE EXTREME SNAPPING
     if (raw <= effMin) return 0;
     if (raw >= effMax) return 16383;
     
-    // CENTER DEADZONE SNAPPING
     if (raw >= deadLower && raw <= deadUpper) return 8192;
     
-    // SMOOTH INTERPOLATION
     long mappedValue;
     if (raw < deadLower) {
         mappedValue = map(raw, effMin, deadLower, 0, 8191);
@@ -515,7 +510,6 @@ void updateDisplay() {
     spr.setTextDatum(TL_DATUM); 
     spr.drawString(batStr, 5, 5); 
 
-    // Reset text datum for the rest of the UI
     spr.setTextDatum(MC_DATUM); 
     spr.setTextSize(1);
     
@@ -604,7 +598,14 @@ void updateDisplay() {
     spr.setTextSize(1); 
     spr.drawString("PB1", xPB1, gaugeBottomY + 15); 
     spr.drawString("PB2", xPB2, gaugeBottomY + 15); 
-    spr.drawString("PB3", xPB3, gaugeBottomY + 15); 
+    
+    // Dynamic PB3 Label based on Volume Mode status
+    if (isVolumeMode) {
+        spr.drawString("Vol", xPB3, gaugeBottomY + 15);
+    } else {
+        spr.drawString("PB3", xPB3, gaugeBottomY + 15); 
+    }
+    
     spr.drawString("CC11", xCC11, gaugeBottomY + 15);
     
     for (int yStep = gaugeTopY; yStep <= gaugeBottomY; yStep += 5) { 
@@ -671,36 +672,16 @@ void updateDisplay() {
         bannerCount++;
     };
     
-    if (isFrozen == true && activeEffectMode != 1) { 
-        drawActiveEffectBanner("FRZ", TFT_CYAN); 
-    } 
-    if (isFeedbackActive == true && activeEffectMode != 2) { 
-        drawActiveEffectBanner("SCM", TFT_RED); 
-    }
-    if (isHarmonizerMode == true && activeEffectMode != 3) { 
-        drawActiveEffectBanner("HRM", TFT_MAGENTA); 
-    } 
-    if (isCapoMode == true && activeEffectMode != 4) { 
-        drawActiveEffectBanner("CAP", TFT_GREEN); 
-    }
-    if (isSynthMode == true && activeEffectMode != 5) { 
-        drawActiveEffectBanner("SYN", TFT_YELLOW); 
-    } 
-    if (isPadMode == true && activeEffectMode != 6) { 
-        drawActiveEffectBanner("PAD", TFT_PINK); 
-    }
-    if (isChorusMode == true && activeEffectMode != 7) { 
-        drawActiveEffectBanner("CHO", TFT_SKYBLUE); 
-    } 
-    if (isSwellMode == true && activeEffectMode != 8) { 
-        drawActiveEffectBanner("SWL", TFT_WHITE); 
-    }
-    if (isVibratoMode == true && activeEffectMode != 9) { 
-        drawActiveEffectBanner("VIB", TFT_PURPLE); 
-    } 
-    if (isVolumeMode == true) { 
-        drawActiveEffectBanner("VOL", TFT_DARKGREY); 
-    }
+    if (isFrozen == true && activeEffectMode != 1) { drawActiveEffectBanner("FRZ", TFT_CYAN); } 
+    if (isFeedbackActive == true && activeEffectMode != 2) { drawActiveEffectBanner("SCM", TFT_RED); }
+    if (isHarmonizerMode == true && activeEffectMode != 3) { drawActiveEffectBanner("HRM", TFT_MAGENTA); } 
+    if (isCapoMode == true && activeEffectMode != 4) { drawActiveEffectBanner("CAP", TFT_GREEN); }
+    if (isSynthMode == true && activeEffectMode != 5) { drawActiveEffectBanner("SYN", TFT_YELLOW); } 
+    if (isPadMode == true && activeEffectMode != 6) { drawActiveEffectBanner("PAD", TFT_PINK); }
+    if (isChorusMode == true && activeEffectMode != 7) { drawActiveEffectBanner("CHO", TFT_SKYBLUE); } 
+    if (isSwellMode == true && activeEffectMode != 8) { drawActiveEffectBanner("SWL", TFT_WHITE); }
+    if (isVibratoMode == true && activeEffectMode != 9) { drawActiveEffectBanner("VIB", TFT_PURPLE); } 
+    if (isVolumeMode == true) { drawActiveEffectBanner("VOL", TFT_DARKGREY); }
 
     spr.pushSprite(0, 0); 
     updateMeters();
@@ -768,7 +749,6 @@ void DisplayTask(void * pvParameters) {
                 updateMeters(); 
                 metersNeedClear = true;
             } else if (metersNeedClear) {
-                // Instantly zero the meters to draw a blank frame and stop CPU burn
                 ui_audio_level = 0.0f;
                 ui_output_level = 0.0f;
                 updateMeters();
@@ -789,7 +769,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float dc_block[HOP_SIZE] __attribute__((aligned(16)));
     static float mix_block[HOP_SIZE] __attribute__((aligned(16)));
     
-    // Memory aligned arrays perfectly formatted for the ESP32 SIMD Instruction set
     static float w1_block[HOP_SIZE] __attribute__((aligned(16)));
     static float w2_block[HOP_SIZE] __attribute__((aligned(16)));
     static float w3_block[HOP_SIZE] __attribute__((aligned(16)));
@@ -873,20 +852,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     currentWindowSize = targetWindow; 
                     uint32_t halfWindowFixed = ((uint32_t)targetWindow / 2) << 16;
                     
-                    tap_w1_1 = 0; 
-                    tap_w1_2 = halfWindowFixed; 
-                    
-                    tap_w2_1 = 0; 
-                    tap_w2_2 = halfWindowFixed;
-                    
-                    tap_w3_1 = 0; 
-                    tap_w3_2 = halfWindowFixed; 
-                    
-                    tap_w4_1 = 0; 
-                    tap_w4_2 = halfWindowFixed; 
-                    
-                    tap_w5_1 = 0; 
-                    tap_w5_2 = halfWindowFixed;
+                    tap_w1_1 = 0; tap_w1_2 = halfWindowFixed; 
+                    tap_w2_1 = 0; tap_w2_2 = halfWindowFixed;
+                    tap_w3_1 = 0; tap_w3_2 = halfWindowFixed; 
+                    tap_w4_1 = 0; tap_w4_2 = halfWindowFixed; 
+                    tap_w5_1 = 0; tap_w5_2 = halfWindowFixed;
                 }
                 
                 uint32_t hannIntMult = (1024U << 16) / (uint32_t)currentWindowSize; 
@@ -946,7 +916,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float peakInputVal = 0.0f; 
                 float peakOutputVal = 0.0f;
                 
-                // Buffer volatile RAM variables locally so the compiler can vectorize DSP loops
                 float localSwellGain = swellGain;
                 float localVolGain = volumePedalGain;
                 float localFrzRamp = freezeRamp;
@@ -969,23 +938,15 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     inputEnvelope = inputEnvelope * 0.99f + fabsf(inSample) * 0.01f + DC_OFFSET;
                     
                     if (swellActive) {
-                        if (inputEnvelope > 0.015f) { 
-                            localSwellGain = fminf(1.0f, localSwellGain + 0.00002f); 
-                        } else { 
-                            localSwellGain = fmaxf(0.0f, localSwellGain - 0.00005f); 
-                        }
-                    } else { 
-                        localSwellGain = 1.0f; 
-                    }
+                        if (inputEnvelope > 0.015f) { localSwellGain = fminf(1.0f, localSwellGain + 0.00002f); } 
+                        else { localSwellGain = fmaxf(0.0f, localSwellGain - 0.00005f); }
+                    } else { localSwellGain = 1.0f; }
                     
                     float procSample = inSample;
                     
                     if (synthActive) { 
-                        if (inputEnvelope > 0.005f) { 
-                            synthEnv = fminf(1.0f, synthEnv + 0.1f); 
-                        } else { 
-                            synthEnv = fmaxf(0.0f, synthEnv - 0.005f); 
-                        }
+                        if (inputEnvelope > 0.005f) { synthEnv = fminf(1.0f, synthEnv + 0.1f); } 
+                        else { synthEnv = fmaxf(0.0f, synthEnv - 0.005f); }
                         
                         int waveIdx = constrain((int)((procSample + 1.0f) * 1023.5f), 0, WAVE_LUT_SIZE - 1);
                         procSample = synthLUT[waveIdx]; 
@@ -995,11 +956,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     } 
                     
                     if (padActive) { 
-                        if (inputEnvelope > 0.005f) { 
-                            padEnv = fminf(1.0f, padEnv + 0.00002f); 
-                        } else { 
-                            padEnv = fmaxf(0.0f, padEnv - 0.000005f); 
-                        }
+                        if (inputEnvelope > 0.005f) { padEnv = fminf(1.0f, padEnv + 0.00002f); } 
+                        else { padEnv = fmaxf(0.0f, padEnv - 0.000005f); }
                         procSample *= padEnv; 
                     }
                     
@@ -1010,11 +968,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     }
                     
                     if (localFrzRamp > 0.0f || frzActive) {
-                        if (frzActive) { 
-                            localFrzRamp = fminf(1.0f, localFrzRamp + 0.0002f); 
-                        } else { 
-                            localFrzRamp = fmaxf(0.0f, localFrzRamp - 0.00005f); 
-                        }
+                        if (frzActive) { localFrzRamp = fminf(1.0f, localFrzRamp + 0.0002f); } 
+                        else { localFrzRamp = fmaxf(0.0f, localFrzRamp - 0.00005f); }
                     }
                     
                     float fzOut = 0.0f;
@@ -1040,24 +995,17 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float next_apf1 = rFrz + 0.6f * d1 + DC_OFFSET; 
                         float a1 = -0.6f * rFrz + d1; 
                         apf1Buffer[apf1Idx] = next_apf1;
-                        apf1Idx++; 
-                        
-                        if (apf1Idx >= 1009) { apf1Idx = 0; }
+                        apf1Idx++; if (apf1Idx >= 1009) { apf1Idx = 0; }
                         
                         float d2 = apf2Buffer[apf2Idx]; 
                         float next_apf2 = a1 + 0.6f * d2 + DC_OFFSET; 
                         float a2 = -0.6f * a1 + d2; 
                         apf2Buffer[apf2Idx] = next_apf2; 
-                        apf2Idx++; 
-                        
-                        if (apf2Idx >= 863) { apf2Idx = 0; }
+                        apf2Idx++; if (apf2Idx >= 863) { apf2Idx = 0; }
                         
                         fzOut = a2 * localFrzRamp; 
                         freezePlayCounterVar++; 
-                        
-                        if (freezePlayCounterVar >= activeFreezeLength) { 
-                            freezePlayCounterVar = 0; 
-                        }
+                        if (freezePlayCounterVar >= activeFreezeLength) { freezePlayCounterVar = 0; }
                     } else if (apfNeedsClear) {
                         memset(apf1Buffer, 0, sizeof(apf1Buffer));
                         memset(apf2Buffer, 0, sizeof(apf2Buffer));
@@ -1107,14 +1055,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                              processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                              
                         if (feedbackActive) {
-                            if (inputEnvelope > 0.005f) { 
-                                localFbRamp = fminf(1.0f, localFbRamp + 0.000011f); 
-                            } else { 
-                                localFbRamp = fmaxf(0.0f, localFbRamp - 0.005f); 
-                            }
-                        } else { 
-                            localFbRamp = fmaxf(0.0f, localFbRamp - 0.0001f); 
-                        }
+                            if (inputEnvelope > 0.005f) { localFbRamp = fminf(1.0f, localFbRamp + 0.000011f); } 
+                            else { localFbRamp = fmaxf(0.0f, localFbRamp - 0.005f); }
+                        } else { localFbRamp = fmaxf(0.0f, localFbRamp - 0.0001f); }
                         
                         float mixV = fmaxf(0.0f, fminf((localFbRamp - 0.1f) * 2.0f, 1.0f));
                         float feedInput = (frzActive && localFrzRamp > 0.0f) ? fzOut : (w4 * (1.0f - mixV)) + (w5 * mixV);
@@ -1155,33 +1098,16 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     w4_block[i] = w4; 
                     w5_block[i] = w5; 
                     
-                    int32_t step1 = (int32_t)((1.0f - spd1) * 65536.0f); 
-                    tap_w1_1 += step1; 
-                    tap_w1_2 += step1; 
-                    
-                    int32_t step2 = (int32_t)((1.0f - spd2) * 65536.0f); 
-                    tap_w2_1 += step2; 
-                    tap_w2_2 += step2; 
-                    
-                    int32_t step3 = (int32_t)((1.0f - spd3) * 65536.0f); 
-                    tap_w3_1 += step3; 
-                    tap_w3_2 += step3; 
-                    
-                    int32_t step4 = (int32_t)((1.0f - spd4) * 65536.0f); 
-                    tap_w4_1 += step4; 
-                    tap_w4_2 += step4; 
-                    
-                    int32_t step5 = (int32_t)((1.0f - spd5) * 65536.0f); 
-                    tap_w5_1 += step5; 
-                    tap_w5_2 += step5; 
+                    int32_t step1 = (int32_t)((1.0f - spd1) * 65536.0f); tap_w1_1 += step1; tap_w1_2 += step1; 
+                    int32_t step2 = (int32_t)((1.0f - spd2) * 65536.0f); tap_w2_1 += step2; tap_w2_2 += step2; 
+                    int32_t step3 = (int32_t)((1.0f - spd3) * 65536.0f); tap_w3_1 += step3; tap_w3_2 += step3; 
+                    int32_t step4 = (int32_t)((1.0f - spd4) * 65536.0f); tap_w4_1 += step4; tap_w4_2 += step4; 
+                    int32_t step5 = (int32_t)((1.0f - spd5) * 65536.0f); tap_w5_1 += step5; tap_w5_2 += step5; 
                     
                     writeIndex = (writeIndex + 1) & BUFFER_MASK;
                     
-                    if (padActive) { 
-                        padFilter = padFilter * 0.95f + w1 * 0.05f + DC_OFFSET; 
-                    } else { 
-                        padFilter = padFilter * 0.95f + DC_OFFSET; 
-                    }
+                    if (padActive) { padFilter = padFilter * 0.95f + w1 * 0.05f + DC_OFFSET; } 
+                    else { padFilter = padFilter * 0.95f + DC_OFFSET; }
                     
                     dry_block[i] = inSample;
                     fz_block[i] = fzOut;
@@ -1196,13 +1122,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 bool activeGroup = isWhammyActive || harmActive || chorusActive || feedbackActive || synthActive || padActive || frzActive || vibratoActive || capoActive;
                 bool dryGroup = chorusActive || padActive || frzActive || feedbackActive || (localFrzRamp > 0.0f) || (localFbRamp > 0.0f);
                 bool repeatGroup = capoActive || synthActive || vibratoActive || padActive || harmActive;
-                
                 bool padIsAudible = padActive || (padFilter > 0.001f);
                 
                 if (!activeGroup && localFrzRamp <= 0.0f && localFbRamp <= 0.0f && !padIsAudible) {
                     memcpy(mix_block, dry_block, framesRead * sizeof(float));
                 } else {
-                    
                     float g_base = 0.0f;
                     if (dryGroup) {
                         if (!repeatGroup) g_base = 0.4f;
@@ -1269,7 +1193,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 if (peakOutputVal > ui_output_level) { ui_output_level = peakOutputVal; } 
                 else { ui_output_level *= 0.998f; if (ui_output_level < 1e-5f) ui_output_level = 0.0f; }
 
-            } // --- END OF !blockIsMuted DSP BYPASS ---
+            }
             
             uint32_t end_timer = xthal_get_ccount(); 
             float max_cycles = (240000000.0f / (float)currentSampleRate) * (float)framesRead;
@@ -1301,7 +1225,6 @@ void MidiTask(void * pvParameters) {
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
     
     for (;;) {
-        // NON-BLOCKING BATTERY POLLING: Reads ADC once every 5 seconds to prevent Midi jitter
         static unsigned long lastBatteryTime = 0;
         if (millis() - lastBatteryTime > 5000) {
             lastBatteryTime = millis();
@@ -1325,25 +1248,14 @@ void MidiTask(void * pvParameters) {
         if (currentBtState != lastBtState) { 
             lastBtState = currentBtState; 
             forceUIUpdate = true; 
-            
-            if (isScreenOff) { 
-                turnScreenOn(); 
-            }
-            
+            if (isScreenOff) { turnScreenOn(); }
             lastActivityTime = millis(); 
         }
         
-        if (currentBtState) { 
-            lastActivityTime = millis(); 
-        }
+        if (currentBtState) { lastActivityTime = millis(); }
         
-        if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) { 
-            goToLightSleep(); 
-        }
-        
-        if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) { 
-            turnScreenOff(); 
-        }
+        if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) { goToLightSleep(); }
+        if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) { turnScreenOff(); }
         
         if (carouselBtn.update(100)) {
             if (carouselBtn.state == LOW) { 
@@ -1373,7 +1285,6 @@ void MidiTask(void * pvParameters) {
             analog_t rawB = filterPB2.getValue();
             analog_t rawC = filterPB3.getValue();
             
-            // 1. Stable noise filtering
             if (stableRawA < 0) { stableRawA = rawA; }
             if (abs((int)rawA - stableRawA) > 6) { stableRawA = rawA; }
             
@@ -1383,30 +1294,20 @@ void MidiTask(void * pvParameters) {
             if (stableRawC < 0) { stableRawC = rawC; }
             if (abs((int)rawC - stableRawC) > 16) { stableRawC = rawC; }
 
-            // 2. Velocity-Based Hardware-Agnostic Unplug Gate (Slew-Rate Detection)
             static bool unpluggedA = false;
             static bool unpluggedB = false;
             static int previousRawA = 2048;
             static int previousRawB = 2048;
 
-            // An unplug event happens instantly (voltage teleports >1000 in one cycle). 
-            // A human sweeping the pedal up smoothly will NOT trigger this.
-            if ((stableRawA - previousRawA) > 1000 && stableRawA > 4050) {
-                unpluggedA = true;
-            } else if (stableRawA < 3900) {
-                unpluggedA = false;
-            }
+            if ((stableRawA - previousRawA) > 1000 && stableRawA > 4050) { unpluggedA = true; } 
+            else if (stableRawA < 3900) { unpluggedA = false; }
 
-            if ((stableRawB - previousRawB) > 1000 && stableRawB > 4050) {
-                unpluggedB = true;
-            } else if (stableRawB < 3900) {
-                unpluggedB = false;
-            }
+            if ((stableRawB - previousRawB) > 1000 && stableRawB > 4050) { unpluggedB = true; } 
+            else if (stableRawB < 3900) { unpluggedB = false; }
 
             previousRawA = stableRawA;
             previousRawB = stableRawB;
 
-            // 3. Hardware-Agnostic Min/Max Tracking (Protected from unplugged extremes)
             if (!unpluggedA) {
                 if (stableRawA < PB1_raw_min) { PB1_raw_min = stableRawA; }
                 if (stableRawA > PB1_raw_max) { PB1_raw_max = stableRawA; }
@@ -1420,72 +1321,60 @@ void MidiTask(void * pvParameters) {
             if (stableRawC < PB3_raw_min) { PB3_raw_min = stableRawC; }
             if (stableRawC > PB3_raw_max && stableRawC <= 4095) { PB3_raw_max = stableRawC; }
             
-            // 4. Direct Mapping
             analog_t calA = map_raw_deadzone(stableRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
             analog_t calB = map_raw_deadzone(stableRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
             analog_t calC = map_raw_expression(stableRawC, PB3_raw_min, PB3_raw_max, INVERT_PB3);
             
-            // 5. Hardware-Agnostic Unplugged Center Snapping
             if (unpluggedA) { calA = 8192; }
             if (unpluggedB) { calB = 8192; }
             
-            // 6. Movement Calculation
             bool moveA = (abs((int)calA - (int)lastMidiA) > 12) || ((calA == 8192 || calA == 0 || calA == 16383) && calA != lastMidiA);
             bool moveB = (abs((int)calB - (int)lastMidiB) > 12) || ((calB == 8192 || calB == 0 || calB == 16383) && calB != lastMidiB);
             bool moveC = (abs((int)calC - (int)lastMidiC) >= 128) || ((calC == 0 || calC == 16383) && calC != lastMidiC);
             
             if (moveA || moveB || moveC) {
-                if (isScreenOff) { 
-                    turnScreenOn(); 
-                }
-                
+                if (isScreenOff) { turnScreenOn(); }
                 lastScreenActivityTime = millis();
                 
+                // PB1 and PB2 ALWAYS control Pitch Bend and related pitch FX, completely ignoring Volume Mode
                 if (moveA) { 
-                    if (!isVolumeMode) { 
-                        Control_Surface.sendPitchBend(Channel_1, calA); 
-                    }
+                    Control_Surface.sendPitchBend(Channel_1, calA); 
                     lastMidiA = calA; 
                     currentPB1 = calA; 
                 }
                 
                 if (moveB) { 
-                    if (!isVolumeMode) { 
-                        Control_Surface.sendPitchBend(Channel_2, calB); 
-                    }
+                    Control_Surface.sendPitchBend(Channel_2, calB); 
                     lastMidiB = calB; 
                     currentPB2 = calB; 
                 }
                 
-                if (moveC) { 
-                    if (!isVolumeMode) { 
-                        Control_Surface.sendPitchBend(Channel_3, calC); 
+                if (moveC) {
+                    if (!isVolumeMode) {
+                        Control_Surface.sendPitchBend(Channel_3, calC);
                     }
                     lastMidiC = calC; 
                     currentPB3 = calC; 
                 }
-                
-                analog_t activePedal = calA;
-                
-                if (moveC) { 
-                    activePedal = calC; 
-                } else if (moveB) { 
-                    activePedal = calB; 
+
+                // Determine which pedal is driving the pitch shift FX safely
+                bool pitchChanged = false;
+                if (moveA) { lastActivePedal = calA; pitchChanged = true; }
+                if (moveB) { lastActivePedal = calB; pitchChanged = true; }
+                if (moveC && !isVolumeMode) { lastActivePedal = calC; pitchChanged = true; }
+
+                if (pitchChanged && !lutNeedsUpdate) {
+                    pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)];
                 }
-                
-                lastActivePedal = activePedal;
-                
-                if (isVolumeMode) { 
-                    uint8_t vCC = map(activePedal, 0, 16383, 0, 127); 
+
+                // If Volume Mode is on, only PB3 triggers the CC19 broadcast and internal volume adjustment
+                if (moveC && isVolumeMode) {
+                    uint8_t vCC = map(calC, 0, 16383, 0, 127); 
                     if (vCC != lastVolumeCC) { 
                         Control_Surface.sendControlChange({19, Channel_1}, vCC); 
                         lastVolumeCC = vCC; 
                     } 
-                    volumePedalGain = (float)activePedal / 16383.0f; 
-                } else { 
-                    if (!lutNeedsUpdate) {
-                        pitchShiftFactor = pitchShiftLUT[constrain(activePedal, 0, 16383)]; 
-                    }
+                    volumePedalGain = (float)calC / 16383.0f; 
                 }
                 
                 forceUIUpdate = true;
@@ -1506,11 +1395,11 @@ void MidiTask(void * pvParameters) {
                 
                 lastActivePedal = 8192;
                 
-                if (!isVolumeMode) { 
-                    if (!lutNeedsUpdate) {
-                        pitchShiftFactor = pitchShiftLUT[8192]; 
-                    }
-                } else { 
+                if (!lutNeedsUpdate) {
+                    pitchShiftFactor = pitchShiftLUT[8192]; 
+                }
+                
+                if (isVolumeMode) { 
                     volumePedalGain = 8192.0f / 16383.0f; 
                 }
                 
@@ -1527,24 +1416,17 @@ bool channelMessageCallback(ChannelMessage cm) {
     if (cm.header == 0xB0) {
         if (cm.data1 == 5) { 
             isVolumeMode = (cm.data2 >= 64); 
-            if (!isVolumeMode) { 
-                volumePedalGain = 1.0f; 
-            } 
+            if (!isVolumeMode) { volumePedalGain = 1.0f; } 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 0 && cm.data2 >= 64) { 
-            if (activeEffectMode == 0) { 
-                activeEffectMode = 9; 
-            } else { 
-                activeEffectMode = activeEffectMode - 1; 
-            }
-            lutNeedsUpdate = true; 
-            forceUIUpdate = true; 
+            if (activeEffectMode == 0) { activeEffectMode = 9; } 
+            else { activeEffectMode = activeEffectMode - 1; }
+            lutNeedsUpdate = true; forceUIUpdate = true; 
         }
         else if (cm.data1 == 1 && cm.data2 >= 64) { 
             activeEffectMode = (activeEffectMode + 1) % 10; 
-            lutNeedsUpdate = true; 
-            forceUIUpdate = true; 
+            lutNeedsUpdate = true; forceUIUpdate = true; 
         }
         else if (cm.data1 == 2 && cm.data2 >= 64) { 
             latencyMode = (latencyMode + 1) % 4; 
@@ -1553,131 +1435,95 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 3) {
             globalAudioResetRequested = true; 
             isWhammyActive = (cm.data2 < 64); 
-            isFrozen = false; 
-            isFeedbackActive = false; 
-            isHarmonizerMode = false;
-            isCapoMode = false; 
-            isSynthMode = false; 
-            isPadMode = false; 
-            isChorusMode = false; 
-            isSwellMode = false;
-            isVibratoMode = false; 
+            isFrozen = false; isFeedbackActive = false; isHarmonizerMode = false;
+            isCapoMode = false; isSynthMode = false; isPadMode = false; 
+            isChorusMode = false; isSwellMode = false; isVibratoMode = false; 
             isVolumeMode = false;
             
-            volumePedalGain = 1.0f; 
-            lutNeedsUpdate = true; 
-            forceUIUpdate = true;
+            volumePedalGain = 1.0f; lutNeedsUpdate = true; forceUIUpdate = true;
         }
-        else if (cm.data1 == 4 && cm.data2 >= 64) { 
-            toggleSampleRate();
-        }
+        else if (cm.data1 == 4 && cm.data2 >= 64) { toggleSampleRate(); }
         else if (cm.data1 == 8) { 
             isFrozen = (cm.data2 >= 64); 
-            if (activeEffectMode == 1) { 
-                isWhammyActive = isFrozen; 
-            } 
+            if (activeEffectMode == 1) { isWhammyActive = isFrozen; } 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 9) { 
             isFeedbackActive = (cm.data2 >= 64); 
-            if (activeEffectMode == 2) { 
-                isWhammyActive = isFeedbackActive; 
-            } 
+            if (activeEffectMode == 2) { isWhammyActive = isFeedbackActive; } 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 10) { 
             isHarmonizerMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 3) { 
-                isWhammyActive = isHarmonizerMode; 
-            } 
+            if (activeEffectMode == 3) { isWhammyActive = isHarmonizerMode; } 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 12) { 
             isCapoMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 4) { 
-                isWhammyActive = isCapoMode; 
-            } 
-            lutNeedsUpdate = true; 
-            forceUIUpdate = true; 
+            if (activeEffectMode == 4) { isWhammyActive = isCapoMode; } 
+            lutNeedsUpdate = true; forceUIUpdate = true; 
         }
         else if (cm.data1 == 13) { 
             isSynthMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 5) { 
-                isWhammyActive = isSynthMode; 
-            } 
+            if (activeEffectMode == 5) { isWhammyActive = isSynthMode; } 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 14) { 
             isPadMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 6) { 
-                isWhammyActive = isPadMode; 
-            } 
+            if (activeEffectMode == 6) { isWhammyActive = isPadMode; } 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 15) { 
             isChorusMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 7) { 
-                isWhammyActive = isChorusMode; 
-            } 
+            if (activeEffectMode == 7) { isWhammyActive = isChorusMode; } 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 16) { 
             isSwellMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 8) { 
-                isWhammyActive = isSwellMode; 
-            } 
+            if (activeEffectMode == 8) { isWhammyActive = isSwellMode; } 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 7) { 
             isVibratoMode = (cm.data2 >= 64); 
-            if (activeEffectMode == 9) { 
-                isWhammyActive = isVibratoMode; 
-            } 
+            if (activeEffectMode == 9) { isWhammyActive = isVibratoMode; } 
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 18 || cm.data1 == 17) {
             float direction = (cm.data2 < 64) ? 1.0f : -1.0f;
             
             if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
-                if (cm.data1 == 18) { 
-                    effectMemory[0] = constrain(effectMemory[0] + direction, -24.0f, 24.0f); 
-                } else { 
-                    effectMemory[5] = constrain(effectMemory[5] + direction, -24.0f, 24.0f); 
-                }
+                if (cm.data1 == 18) { effectMemory[0] = constrain(effectMemory[0] + direction, -24.0f, 24.0f); } 
+                else { effectMemory[5] = constrain(effectMemory[5] + direction, -24.0f, 24.0f); }
             } else if (activeEffectMode == 4) {
                 float change = (cm.data1 == 18) ? 1.0f : 0.01f;
                 effectMemory[4] = constrain(effectMemory[4] + change * direction, -24.0f, 24.0f);
             } else if (activeEffectMode == 2) { 
-                if (direction > 0) { 
-                    feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5; 
-                } else { 
-                    feedbackIntervalIdx = (feedbackIntervalIdx + 4) % 5; 
-                }
+                if (direction > 0) { feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5; } 
+                else { feedbackIntervalIdx = (feedbackIntervalIdx + 4) % 5; }
             } else { 
                 int memIndex = activeEffectMode; 
-                
-                if (memIndex == 5) { 
-                    memIndex = 6; 
-                } else if (memIndex == 6) { 
-                    memIndex = 7; 
-                } else if (memIndex == 7) { 
-                    memIndex = 8; 
-                } else if (memIndex == 9) { 
-                    memIndex = 9; 
-                }
-                
+                if (memIndex == 5) { memIndex = 6; } 
+                else if (memIndex == 6) { memIndex = 7; } 
+                else if (memIndex == 7) { memIndex = 8; } 
+                else if (memIndex == 9) { memIndex = 9; }
                 effectMemory[memIndex] = constrain(effectMemory[memIndex] + direction, -24.0f, 24.0f); 
             }
             
-            lutNeedsUpdate = true; 
-            forceUIUpdate = true;
+            lutNeedsUpdate = true; forceUIUpdate = true;
         }
         else if (cm.data1 == 11) { 
             uint16_t mappedCC = map(cm.data2, 0, 127, 0, 16383); 
             currentCC11 = mappedCC; 
             currentPB3 = mappedCC; 
-            if (!lutNeedsUpdate) {
-                pitchShiftFactor = pitchShiftLUT[mappedCC]; 
+            
+            if (isVolumeMode) {
+                volumePedalGain = (float)mappedCC / 16383.0f;
+                // CC11 will also actively broadcast CC19 if Volume Mode is toggled on!
+                Control_Surface.sendControlChange({19, Channel_1}, cm.data2); 
+            } else {
+                if (!lutNeedsUpdate) {
+                    pitchShiftFactor = pitchShiftLUT[mappedCC]; 
+                }
             }
             forceUIUpdate = true; 
         }
@@ -1687,8 +1533,6 @@ bool channelMessageCallback(ChannelMessage cm) {
 
 void setup() {
     pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP); 
-    
-    // Battery Pin Configuration
     pinMode(BATTERY_PIN, INPUT);
     
     pinMode(38, OUTPUT); 
@@ -1728,10 +1572,7 @@ void setup() {
         tft.fillScreen(TFT_RED); 
         tft.setTextColor(TFT_WHITE, TFT_RED); 
         tft.drawString("MEMORY ERROR", 160, 85);
-        
-        while(1) { 
-            delay(100); 
-        }
+        while(1) { delay(100); }
     }
     
     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float)); 
@@ -1741,15 +1582,12 @@ void setup() {
     memset(pitchShiftLUT_temp, 0, 16384 * sizeof(float));
     memset(hannLUT, 0, 1024 * sizeof(float));           
     
-    // Mathematically perfect Hann Window prevents 3dB volume bump during crossfade
     for (int i = 0; i < 1024; i++) { 
         hannLUT[i] = 0.5f * (1.0f - cosf(TWO_PI * ((float)i / 1023.0f))); 
         lfoLUT[i] = powf(2.0f, (15.0f * sinf(TWO_PI * ((float)i / 1024.0f))) / 1200.0f); 
     }
     
-    for (int i = 0; i < 2048; i++) { 
-        synthLUT[i] = sinf((((float)i - 1024.0f) / 1024.0f) * 45.0f); 
-    }
+    for (int i = 0; i < 2048; i++) { synthLUT[i] = sinf((((float)i - 1024.0f) / 1024.0f) * 45.0f); }
     
     FilteredAnalog<>::setupADC(); 
     calibratePBs(); 
@@ -1772,7 +1610,8 @@ void setup() {
     
     i2s_std_config_t stdConfig = { 
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate), 
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+        // Retained the standard Philips format from our earlier fix
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
         .gpio_cfg = { 
             .mclk = GPIO_NUM_43, 
             .bclk = GPIO_NUM_44, 
@@ -1796,10 +1635,9 @@ void setup() {
 void loop() {
     if (lutNeedsUpdate) {
         updateLUT();
-        // FIX: The "Phantom Pedal" patch - Safely fetch the final pedal position here to prevent jitter
-        if (!isVolumeMode) {
-            pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
-        }
+        // FIX: Always safely fetch the final pedal position here to prevent jitter
+        // Since lastActivePedal is now completely isolated from Volume Mode, this is 100% safe.
+        pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
         lutNeedsUpdate = false;
     }
     

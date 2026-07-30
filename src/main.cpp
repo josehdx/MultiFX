@@ -846,7 +846,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 ui_output_level = 0.0f;
             } else {
 
-                float targetWindow = LATENCY_WINDOWS[latencyMode] * (currentSampleRate == 96000 ? 2.0f : 1.0f);
+                float targetWindow = LATENCY_WINDOWS[latencyMode];
                 
                 if (currentWindowSize != targetWindow) { 
                     currentWindowSize = targetWindow; 

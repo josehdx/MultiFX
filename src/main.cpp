@@ -15,7 +15,7 @@
 #include <math.h>
 
 // --- PEDAL CONFIGURATION ---
-// Set to 'true' if your pedal is inverted (Max Toe = 0, Heel = 16383)
+// Set to 'false' to map the expression pedal linearly (Heel = 0, Toe = 16383)
 const bool INVERT_PB3 = false; 
 
 // --- BARE-METAL PRE-BOOT ASSASSIN ---
@@ -148,7 +148,7 @@ const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 // --- GLOBAL BUFFER WIPE FLAG ---
 volatile bool globalAudioResetRequested = false;
 volatile bool clearBuffersRequested = false;
-volatile int hardwareSyncMuteFrames = 0; // ADDED: Global mute timer for hardware clock changes
+volatile int hardwareSyncMuteFrames = 0; 
 
 // --- POWER SAVING, BATTERY & UI GLOBALS ---
 unsigned long lastActivityTime = 0;       
@@ -366,7 +366,6 @@ void toggleSampleRate() {
     i2s_channel_enable(tx_chan);
     i2s_channel_enable(rx_chan);
     
-    // FIX: Set hardware mute timer for ~150ms to swallow ADC sync garbage on clock changes
     hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
     
     sleepRequested = false;
@@ -1493,13 +1492,18 @@ bool channelMessageCallback(ChannelMessage cm) {
                                isVibratoMode || isVolumeMode;
 
             if (anyEffectOn) {
+                // FIRST PRESS: Panic Mute & Reset Variables
                 isWhammyActive = false; 
                 isFrozen = false; isFeedbackActive = false; isHarmonizerMode = false;
                 isCapoMode = false; isSynthMode = false; isPadMode = false; 
                 isChorusMode = false; isSwellMode = false; isVibratoMode = false; 
                 isVolumeMode = false;
                 volumePedalGain = 1.0f; 
+                
+                // Yanks the user back to the default Whammy screen
+                activeEffectMode = 0; 
             } else {
+                // SECOND PRESS: Because activeEffectMode is now 0, this purely turns on the Whammy
                 isWhammyActive = true;
             }
             

@@ -16,7 +16,7 @@
 
 // --- PEDAL CONFIGURATION ---
 // Set to 'true' if your pedal is inverted (Max Toe = 0, Heel = 16383)
-const bool INVERT_PB3 = true; 
+const bool INVERT_PB3 = false; 
 
 // --- BARE-METAL PRE-BOOT ASSASSIN ---
 void __attribute__((constructor)) pre_boot_kill_switch() {

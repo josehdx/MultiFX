@@ -148,6 +148,7 @@ const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 // --- GLOBAL BUFFER WIPE FLAG ---
 volatile bool globalAudioResetRequested = false;
 volatile bool clearBuffersRequested = false;
+volatile int hardwareSyncMuteFrames = 0; // ADDED: Global mute timer for hardware clock changes
 
 // --- POWER SAVING, BATTERY & UI GLOBALS ---
 unsigned long lastActivityTime = 0;       
@@ -364,6 +365,9 @@ void toggleSampleRate() {
     
     i2s_channel_enable(tx_chan);
     i2s_channel_enable(rx_chan);
+    
+    // FIX: Set hardware mute timer for ~150ms to swallow ADC sync garbage on clock changes
+    hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
     
     sleepRequested = false;
     forceUIUpdate = true;
@@ -823,6 +827,22 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
         
         if (bytesRead > 0) {
             int framesRead = bytesRead / 8; 
+            
+            // FIX: Hardware Sync Mute Block
+            // Intercepts and throws away I2S blocks while the ADC PLL is locking onto the new clock
+            if (hardwareSyncMuteFrames > 0) {
+                hardwareSyncMuteFrames--;
+                memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
+                ui_audio_level = 0.0f;
+                ui_output_level = 0.0f;
+                
+                // Flush the DC blocker state so it doesn't remember the transient spike
+                for(int j = 0; j < 4; j++) { dc_state[j] = 0.0f; }
+                
+                size_t bytesWrittenCount; 
+                i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, portMAX_DELAY);
+                continue; // Skip all DSP processing for this block
+            }
             
             if (globalAudioResetRequested) {
                 synthEnv = 0.0f; 
@@ -1659,7 +1679,7 @@ void setup() {
     Control_Surface.begin();
 
     // --- BOOST BLUETOOTH TX POWER TO +9dBm (MAXIMUM) ---
-    // This dramatically improves range and prevents packet loss on the floor
+    // Safely applied AFTER the BLE stack is fully initialized by Control_Surface
     esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
     esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
     esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);

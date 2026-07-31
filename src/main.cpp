@@ -11,6 +11,7 @@
 #include "dsps_add.h"
 #include "dsps_biquad.h"
 #include "driver/rtc_io.h"
+#include "esp_bt.h"
 #include <math.h>
 
 // --- PEDAL CONFIGURATION ---
@@ -754,6 +755,7 @@ void DisplayTask(void * pvParameters) {
                 updateMeters(); 
                 metersNeedClear = true;
             } else if (metersNeedClear) {
+                // Instantly zero the meters to draw a blank frame and stop CPU burn
                 ui_audio_level = 0.0f;
                 ui_output_level = 0.0f;
                 updateMeters();
@@ -776,6 +778,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float dc_block[HOP_SIZE] __attribute__((aligned(16)));
     static float mix_block[HOP_SIZE] __attribute__((aligned(16)));
     
+    // Memory aligned arrays perfectly formatted for the ESP32 SIMD Instruction set
     static float w1_block[HOP_SIZE] __attribute__((aligned(16)));
     static float w2_block[HOP_SIZE] __attribute__((aligned(16)));
     static float w3_block[HOP_SIZE] __attribute__((aligned(16)));
@@ -795,6 +798,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float padEnv = 0.0f;
     static float inputEnvelope = 0.0f; 
     static float feedbackFilterVar = 0.0f;
+    
+    // ADDED: Static variable for LPF per-sample volume smoothing
+    static float smoothedVolGain = 1.0f;
     
     static int freezeWriteIdxVar = 0; 
     static int freezePlayCounterVar = 0; 
@@ -825,6 +831,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 padEnv = 0.0f;
                 inputEnvelope = 0.0f; 
                 feedbackFilterVar = 0.0f;
+                smoothedVolGain = 1.0f; // Reset smoothing safely on bypass
                 
                 freezeWriteIdxVar = 0; 
                 freezePlayCounterVar = 0; 
@@ -855,7 +862,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 // SAFE BUFFER LOCK: Non-blocking zero-tick lock prevents audio clicks during UI-triggered resets
                 if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, 0) == pdTRUE) {
-
                     float targetWindow = LATENCY_WINDOWS[latencyMode];
                     
                     if (currentWindowSize != targetWindow) { 
@@ -926,6 +932,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float peakInputVal = 0.0f; 
                     float peakOutputVal = 0.0f;
                     
+                    // Buffer volatile RAM variables locally so the compiler can vectorize DSP loops
                     float localSwellGain = swellGain;
                     float localVolGain = volumePedalGain;
                     float localFrzRamp = freezeRamp;
@@ -1156,7 +1163,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         
                         float g_whammy = isWhammyActive ? 1.0f : 0.0f;
                         float g_dry = isWhammyActive ? 0.0f : 1.0f;
-
                         float* __restrict p_mix = mix_block;
                         const float* __restrict p_dry = dry_block;
                         const float* __restrict p_w1 = w1_block;
@@ -1165,7 +1171,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         const float* __restrict p_pad = pad_block;
                         const float* __restrict p_fz = fz_block;
                         const float* __restrict p_fb = fbOut_block;
-
                         #pragma GCC ivdep
                         for (int i = 0; i < framesRead; i++) {
                             float baseSignal = (p_w1[i] * g_whammy) + (p_dry[i] * g_dry);
@@ -1183,21 +1188,22 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         }
                     }
                     
-                    float masterScale = 2147483520.0f * localSwellGain * localVolGain;
-                    
                     #pragma GCC ivdep
                     for (int i = 0; i < framesRead; i++) {
-                        float rawOut = mix_block[i] * localSwellGain * localVolGain; 
+                        // FIX: Smooth the discrete CC MIDI volume changes seamlessly per-sample
+                        smoothedVolGain = smoothedVolGain * 0.99f + localVolGain * 0.01f;
+
+                        float rawOut = mix_block[i] * localSwellGain * smoothedVolGain; 
                         
                         if (fabsf(dc_block[i]) > peakInputVal) peakInputVal = fabsf(dc_block[i]); 
                         if (fabsf(rawOut) > peakOutputVal) peakOutputVal = fabsf(rawOut); 
                         
-                        float scaledOut = mix_block[i] * masterScale;
+                        float currentMasterScale = 2147483520.0f * localSwellGain * smoothedVolGain;
+                        float scaledOut = mix_block[i] * currentMasterScale;
                         int32_t finalOut = (int32_t)fmaxf(-2147483520.0f, fminf(scaledOut, 2147483520.0f));
                         
                         // FIX: Bit-Mask out the bottom 8 bits for perfect 24-bit alignment to the DAC
                         finalOut &= 0xFFFFFF00;
-
                         i2s_out_block[i * 2] = finalOut; 
                         i2s_out_block[i * 2 + 1] = finalOut;
                     }
@@ -1207,7 +1213,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     
                     if (peakOutputVal > ui_output_level) { ui_output_level = peakOutputVal; } 
                     else { ui_output_level *= 0.998f; if (ui_output_level < 1e-5f) ui_output_level = 0.0f; }
-
+                    
                     xSemaphoreGive(audioBufferMutex);
                 } else {
                     // MUTEX FALLBACK: If loop() is busy clearing buffers via CC3, output silence gracefully
@@ -1651,6 +1657,12 @@ void setup() {
     
     Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); 
     Control_Surface.begin();
+
+    // --- BOOST BLUETOOTH TX POWER TO +9dBm (MAXIMUM) ---
+    // This dramatically improves range and prevents packet loss on the floor
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
     
     i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
     i2sConfig.dma_desc_num = 8; 

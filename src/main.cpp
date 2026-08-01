@@ -121,7 +121,7 @@ volatile int latencyMode = 0; const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 
 volatile bool globalAudioResetRequested = false; volatile bool clearBuffersRequested = false; volatile int hardwareSyncMuteFrames = 0; 
 
 unsigned long lastActivityTime = 0; unsigned long lastScreenActivityTime = 0;
-const unsigned long LIGHT_SLEEP_TIMEOUT = 600000; const unsigned long SCREEN_OFF_TIMEOUT = 1200000;  
+const unsigned long LIGHT_SLEEP_TIMEOUT = 300000; const unsigned long SCREEN_OFF_TIMEOUT = 60000;  
 bool isScreenOff = false; volatile bool wakeupPending = false; volatile float core1_load = 0.0f; 
 volatile bool sleepRequested = false; volatile bool isSleeping = false;
 const int BATTERY_PIN = 4; 
@@ -130,7 +130,7 @@ volatile float currentBatteryVoltage = 4.00f;
 volatile bool isBatteryCharging = false;
 
 pin_t pinPB = 1; pin_t pinPB2 = 2; pin_t pinPB3 = 10;    
-const int BOOT_SENSE_PIN = 0; const int CAROUSEL_BUTTON_PIN = 21; 
+const int BOOT_SENSE_PIN = 0; 
 
 pin_t pinPar1 = 3; pin_t pinPar2 = 11; pin_t pinPar3 = 12; pin_t pinPar4 = 13; pin_t pinPar5 = 14; 
 
@@ -204,7 +204,7 @@ int getBatteryPercentage(float voltage) {
     if (voltage >= 3.75f) return 60 + (int)((voltage - 3.75f) / 0.05f * 10.0f);
     if (voltage >= 3.70f) return 50 + (int)((voltage - 3.70f) / 0.05f * 10.0f);
     if (voltage >= 3.65f) return 40 + (int)((voltage - 3.65f) / 0.05f * 10.0f);
-    if (voltage >= 3.60f) return 30 + (int)((voltage - 3.60f) / 0.05f * 10.0f);
+    if (voltage >= 3.60f) return 30 + (int)((voltage - 3.60f) / 0.10f * 10.0f);
     if (voltage >= 3.55f) return 20 + (int)((voltage - 3.55f) / 0.05f * 10.0f);
     if (voltage >= 3.50f) return 10 + (int)((voltage - 3.50f) / 0.05f * 10.0f);
     return (int)((voltage - 3.30f) / 0.20f * 10.0f);
@@ -278,17 +278,18 @@ void goToLightSleep() {
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
 
     i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
-    rtc_gpio_init(GPIO_NUM_21); rtc_gpio_set_direction(GPIO_NUM_21, RTC_GPIO_MODE_INPUT_ONLY); rtc_gpio_pullup_en(GPIO_NUM_21); 
-    esp_sleep_enable_ext1_wakeup(1ULL << 21, ESP_EXT1_WAKEUP_ANY_LOW);
+    
     delay(50); esp_light_sleep_start();
-    rtc_gpio_deinit(GPIO_NUM_21); pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP);
     i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); 
 
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 
     sleepRequested = false; timeoutCounter = 0;
     while (isSleeping && timeoutCounter < 10) { vTaskDelay(pdMS_TO_TICKS(10)); timeoutCounter++; }
-    vTaskDelay(pdMS_TO_TICKS(200)); turnScreenOn(); 
+    vTaskDelay(pdMS_TO_TICKS(200)); 
+    
+    lastActivityTime = millis();
+    lastScreenActivityTime = millis(); 
 }
 
 inline float IRAM_ATTR processTap(uint32_t tapPhase, const float* buffer, int currentWriteIdx, uint32_t windowMask, uint32_t hannIntMult) {
@@ -518,25 +519,6 @@ void updateDisplay() {
     spr.pushSprite(0, 0); updateMeters();
 }
 
-struct DebouncedButton {
-    uint8_t pin; bool state; bool lastReading; bool isActive; 
-    unsigned long lastDebounceTime; unsigned long pressedTime;
-    
-    DebouncedButton(uint8_t p) { 
-        pin = p; state = HIGH; lastReading = HIGH; 
-        lastDebounceTime = 0; pressedTime = 0; isActive = false; 
-    }
-    
-    bool update(unsigned long delay = 50) {
-        bool current = digitalRead(pin); bool changed = false;
-        if (current != lastReading) { lastDebounceTime = millis(); }
-        if ((millis() - lastDebounceTime) > delay) { 
-            if (current != state) { state = current; changed = true; } 
-        }
-        lastReading = current; return changed;
-    }
-};
-
 void DisplayTask(void * pvParameters) {
     bool metersNeedClear = false;
     for (;;) {
@@ -713,7 +695,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             
                             int waveIdx = constrain((int)((procSample + 1.0f) * 1023.5f), 0, WAVE_LUT_SIZE - 1);
                             procSample = synthLUT[waveIdx]; 
-                            // BUG FIX #2: Scaled Synth filter coefficient by srScale for uniform cutoff across sample rates
                             float fltCoeff = fmaxf(0.001f, fminf(0.99f, (p_sy_flt + 0.6f * synthEnv) * srScale));
                             synthFilter = synthFilter + fltCoeff * (procSample - synthFilter) + DC_OFFSET; 
                             procSample = synthFilter * p_sy_mix;
@@ -814,7 +795,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             float satFb = feedbackFilterVar * (localFbRamp * localFbRamp * localFbRamp) * 0.85f; 
                             fbDelayBuffer[fbDelayWriteIdx] = satFb;
                             
-                            // BUG FIX #3: Constrain delay offset index to valid buffer bounds
                             int delaySamples = constrain((int)(currentSampleRate * p_fb_off), 0, FB_BUFFER_SIZE - 1);
                             int fbReadIdx = (fbDelayWriteIdx - delaySamples + FB_BUFFER_SIZE) & FB_BUFFER_MASK;
                             fbOutNode = fbDelayBuffer[fbReadIdx];
@@ -841,7 +821,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         int32_t step5 = (int32_t)((1.0f - spd5) * 65536.0f); tap_w5_1 += step5; tap_w5_2 += step5; 
                         writeIndex = (writeIndex + 1) & BUFFER_MASK;
                         
-                        // Scale Pad filter decay factor by sample rate
                         float pdSmCoeff = powf(p_pd_sm, srScale);
                         if (padActive) { padFilter = padFilter * pdSmCoeff + w1 * (1.0f - pdSmCoeff) + DC_OFFSET; } 
                         else { padFilter = padFilter * pdSmCoeff + DC_OFFSET; }
@@ -1012,10 +991,6 @@ void MidiTask(void * pvParameters) {
     
     static int lastCcOut[5] = {-1, -1, -1, -1, -1};
     
-    static DebouncedButton carouselBtn(CAROUSEL_BUTTON_PIN); 
-    carouselBtn.state = digitalRead(CAROUSEL_BUTTON_PIN); 
-    carouselBtn.lastReading = carouselBtn.state; 
-    
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
     
     for (;;) {
@@ -1048,8 +1023,9 @@ void MidiTask(void * pvParameters) {
             
             static bool wasCharging = false;
             
+            // BUG FIX #2: Dynamically update battery percentage while charging
             if (charging) {
-                newPercent = currentBatteryPercent; 
+                newPercent = calculatedPercent; 
             } else {
                 if (wasCharging || currentBatteryPercent == 100) {
                     newPercent = calculatedPercent;
@@ -1080,18 +1056,6 @@ void MidiTask(void * pvParameters) {
         if (currentBtState) lastActivityTime = millis();
         if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) goToLightSleep(); 
         if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) turnScreenOff(); 
-        
-        if (carouselBtn.update(100)) {
-            if (carouselBtn.state == LOW) { 
-                carouselBtn.pressedTime = millis(); carouselBtn.isActive = true; 
-            } else if (carouselBtn.state == HIGH && carouselBtn.isActive) {
-                carouselBtn.isActive = false; 
-                if (millis() - carouselBtn.pressedTime < 400) { 
-                    switchEffectMode(activeEffectMode + 1);
-                } 
-                forceUIUpdate = true;
-            }
-        }
         
         #if ENABLE_PAR_KNOBS
             if (filterPar1.update()) {
@@ -1149,7 +1113,6 @@ void MidiTask(void * pvParameters) {
             if (stableRawB < 0) stableRawB = rawB; if (abs((int)rawB - stableRawB) > 6) stableRawB = rawB;
             if (stableRawC < 0) stableRawC = rawC; if (abs((int)rawC - stableRawC) > 16) stableRawC = rawC;
 
-            // BUG FIX #1: Power-up state determines unplugged mode; fast movements during play never trigger reset
             bool unpluggedA = PB1_unplugged_at_boot;
             bool unpluggedB = PB2_unplugged_at_boot;
 
@@ -1180,6 +1143,7 @@ void MidiTask(void * pvParameters) {
             if (moveA || moveB || moveC) {
                 if (isScreenOff) turnScreenOn();
                 lastScreenActivityTime = millis();
+                lastActivityTime = millis();
                 
                 if (moveA) { Control_Surface.sendPitchBend(Channel_1, calA); lastMidiA = calA; currentPB1 = calA; }
                 if (moveB) { Control_Surface.sendPitchBend(Channel_2, calB); lastMidiB = calB; currentPB2 = calB; }
@@ -1220,6 +1184,11 @@ void MidiTask(void * pvParameters) {
 }
 
 bool channelMessageCallback(ChannelMessage cm) {
+    // BUG FIX #3: Reset activity timers when receiving remote MIDI channel messages
+    if (isScreenOff) turnScreenOn();
+    lastActivityTime = millis();
+    lastScreenActivityTime = millis();
+
     if (cm.header == 0xB0) {
         
         if (cm.data1 == 11) { 
@@ -1330,7 +1299,7 @@ void setup() {
     }
     preferences.end();
 
-    pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP); pinMode(BATTERY_PIN, INPUT);
+    pinMode(BATTERY_PIN, INPUT);
     pinMode(38, OUTPUT); digitalWrite(38, LOW); pinMode(15, OUTPUT); digitalWrite(15, HIGH);
     
     Serial.begin(115200); tft.init(); tft.setRotation(1); 

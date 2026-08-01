@@ -966,9 +966,6 @@ void MidiTask(void * pvParameters) {
     static bool lastBtState = false; static uint8_t lastVolumeCC = 127;
     static int stableRawA = -1; static int stableRawB = -1; static int stableRawC = -1;
     
-    static int lastPar1 = -1; static int lastPar2 = -1; static int lastPar3 = -1;
-    static int lastPar4 = -1; static int lastPar5 = -1;
-    
     static int lastCcOut[5] = {-1, -1, -1, -1, -1};
     
     static DebouncedButton carouselBtn(CAROUSEL_BUTTON_PIN); 
@@ -982,7 +979,7 @@ void MidiTask(void * pvParameters) {
         static float smoothedVoltage = -1.0f;
 
         // --- ACCURATE ACCUMULATED & SMOOTHED BATTERY MONITORING ---
-        if (millis() - lastBatteryTime > 5000) {
+        if (millis() - lastBatteryTime > 1000) {
             lastBatteryTime = millis();
             
             uint32_t rawSum = 0;
@@ -994,20 +991,20 @@ void MidiTask(void * pvParameters) {
             const float CALIBRATION_MULTIPLIER = 1.04571f; 
             float instantVoltage = (rawAvg / 4095.0f) * 3.3f * 2.0f * CALIBRATION_MULTIPLIER;
             
+            bool charging = (instantVoltage > 4.20f);
+            
             if (smoothedVoltage < 0.1f) {
                 smoothedVoltage = instantVoltage; 
             } else {
-                smoothedVoltage = (smoothedVoltage * 0.8f) + (instantVoltage * 0.2f);
+                smoothedVoltage = (smoothedVoltage * 0.9f) + (instantVoltage * 0.1f);
             }
             
             currentBatteryVoltage = smoothedVoltage;
-            bool charging = (smoothedVoltage > 4.25f);
             int calculatedPercent = getBatteryPercentage(smoothedVoltage);
             int newPercent = currentBatteryPercent;
             
             static bool wasCharging = false;
             
-            // Smart Discharge Hysteresis
             if (charging) {
                 newPercent = currentBatteryPercent; // Freeze percentage while charging
             } else {
@@ -1056,8 +1053,6 @@ void MidiTask(void * pvParameters) {
             }
         }
         
-        // --- PHYSICAL POTENTIOMETER READINGS ---
-        // Safely bypassed if ENABLE_PAR_KNOBS is set to false (unplugged pots)
         #if ENABLE_PAR_KNOBS
             if (filterPar1.update()) {
                 int cc1 = map(filterPar1.getValue(), 0, 4095, 0, 127);
@@ -1191,13 +1186,11 @@ void MidiTask(void * pvParameters) {
 bool channelMessageCallback(ChannelMessage cm) {
     if (cm.header == 0xB0) {
         
-        // DELEGATE CC 24-28 DSP PARAMETERS TO HELPER FUNCTION
         if (cm.data1 >= 24 && cm.data1 <= 28) {
             updateParameterFromCC(cm.data1, cm.data2);
             return false;
         }
 
-        // Restored Hardware Snapshot Tool for PB2
         if (cm.data1 == 5 && cm.data2 >= 64) {
             isPB2WiperMode = !isPB2WiperMode; 
             int newCenter = filterPB2.getValue();
@@ -1209,7 +1202,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();
         }
-        // Reset pitch shift factor when engaging volume mode on PB3
         else if (cm.data1 == 6 && cm.data2 >= 64) { 
             isVolumeMode = !isVolumeMode; 
             if (!isVolumeMode) {
@@ -1247,7 +1239,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             float step = (cm.data2 >= 64) ? -1.0f : 1.0f; // Value 127 = Decrease, 0 = Increase
 
             if (cm.data1 == 17) {
-                // CC 17 controls HEEL on Mode 0, 1, 8... and the PRIMARY pitch parameter for all other modes.
                 if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
                     effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f); // HEEL
                 } else if (activeEffectMode == 4) {
@@ -1256,12 +1247,10 @@ bool channelMessageCallback(ChannelMessage cm) {
                     if (step > 0) feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5; 
                     else feedbackIntervalIdx = (feedbackIntervalIdx + 4) % 5;           // FEEDBACK (OVT)
                 } else { 
-                    // Directly steps primary pitch memory for current mode (INT, OSC, SHFT, BASE)
                     effectMemory[activeEffectMode] = constrain(effectMemory[activeEffectMode] + step, -24.0f, 24.0f); 
                 }
             } 
             else if (cm.data1 == 18) {
-                // CC 18 exclusively controls TOE on Mode 0, 1, 8, and CENT on Mode 4.
                 if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
                     effectMemory[0] = constrain(effectMemory[0] + step, -24.0f, 24.0f); // TOE
                 } else if (activeEffectMode == 4) {

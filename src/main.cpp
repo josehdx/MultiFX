@@ -167,14 +167,14 @@ const int BATTERY_PIN = 4;
 volatile int currentBatteryPercent = 100;
 volatile bool isBatteryCharging = false;
 
-// --- HARDWARE PIN ASSIGNMENTS (OPTION 1 UPDATE) ---
+// --- HARDWARE PIN ASSIGNMENTS ---
 pin_t pinPB = 1;     
 pin_t pinPB2 = 2;
 pin_t pinPB3 = 10;    
 const int BOOT_SENSE_PIN = 0; 
-const int CAROUSEL_BUTTON_PIN = 21; // MOVED FROM 14 TO 21
+const int CAROUSEL_BUTTON_PIN = 21; // Swapped to GPIO 21
 
-// 5 New Analog Knobs (ADC)
+// 5 Analog Knobs (ADC)
 pin_t pinPar1 = 3;
 pin_t pinPar2 = 11;
 pin_t pinPar3 = 12;
@@ -342,7 +342,7 @@ void goToLightSleep() {
     i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan);      
     esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
     
-    rtc_gpio_init(GPIO_NUM_21); // MOVED EXT WAKEUP TO GPIO 21
+    rtc_gpio_init(GPIO_NUM_21); 
     rtc_gpio_set_direction(GPIO_NUM_21, RTC_GPIO_MODE_INPUT_ONLY);
     rtc_gpio_pullup_en(GPIO_NUM_21); 
     esp_sleep_enable_ext1_wakeup(1ULL << 21, ESP_EXT1_WAKEUP_ANY_LOW);
@@ -633,7 +633,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     uint32_t windowMask = (uint32_t)currentWindowSize - 1;
                     
                     // --- DYNAMIC FX PARAMETERS FETCH ---
-                    // By fetching the array values into fast local float variables, we keep the heavy loop highly optimized.
                     float p_w_dry = fxParams[0][0]; float p_w_wet = fxParams[0][1];
                     float p_fz_apf = fxParams[1][0]; float p_fz_att = fxParams[1][1]; float p_fz_rel = fxParams[1][2];
                     float p_fb_spd = fxParams[2][0]; float p_fb_drv = fxParams[2][1]; float p_fb_off = fxParams[2][2];
@@ -771,7 +770,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         if (vibratoActive) {
                             vibratoLfoPhase += globalVibratoPhaseInc; 
                             if (vibratoLfoPhase >= LFO_LUT_SIZE) { vibratoLfoPhase -= LFO_LUT_SIZE; }
-                            // Dynamic depth scalar applied to LUT
                             spd1 *= 1.0f + ((lfoLUT[(int)vibratoLfoPhase] - 1.0f) * p_vb_dep);
                         }
                         
@@ -861,7 +859,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float g_frz = (!frzActive && localFrzRamp > 0.0f) ? 0.5f : 0.0f;
                         float g_fb = (feedbackActive || localFbRamp > 0.0f) ? 0.6f : 0.0f;
                         
-                        // User-Mapped Whammy Routing
                         float g_whammy = isWhammyActive ? p_w_wet : 0.0f;
                         float g_dry = isWhammyActive ? p_w_dry : 1.0f;
                         
@@ -1110,6 +1107,20 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (activeEffectMode == 0) { // Whammy
                 if (pIdx == 0) fxParams[0][0] = norm; // Dry Mix (0.0 to 1.0)
                 if (pIdx == 1) fxParams[0][1] = norm; // Wet Mix (0.0 to 1.0)
+                
+                // PAR 3 (CC 26) -> Toe Pitch Bend Interval
+                if (pIdx == 2) { 
+                    effectMemory[0] = roundf((norm * 48.0f) - 24.0f); 
+                    lutNeedsUpdate = true; 
+                    forceUIUpdate = true; 
+                }
+                
+                // PAR 4 (CC 27) -> Heel Pitch Bend Interval
+                if (pIdx == 3) { 
+                    effectMemory[5] = roundf((norm * 48.0f) - 24.0f); 
+                    lutNeedsUpdate = true; 
+                    forceUIUpdate = true; 
+                }
             } 
             else if (activeEffectMode == 1) { // Freeze
                 if (pIdx == 0) fxParams[1][0] = 0.0f + (norm * 0.95f); // APF Reverb Coeff

@@ -157,7 +157,6 @@ FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar5 = pinPar5;
 
 BluetoothMIDI_Interface btmidi; USBMIDI_Interface usbmidi; MIDI_PipeFactory<4> pipes;
 
-// BUG FIX #2: Helper function unifies mode switching for both button and MIDI triggers
 void switchEffectMode(int newMode) {
     activeEffectMode = (newMode % 10 + 10) % 10;
     chorusLfoPhase = 0.0f; 
@@ -714,7 +713,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             
                             int waveIdx = constrain((int)((procSample + 1.0f) * 1023.5f), 0, WAVE_LUT_SIZE - 1);
                             procSample = synthLUT[waveIdx]; 
-                            synthFilter = synthFilter + (p_sy_flt + 0.6f * synthEnv) * (procSample - synthFilter) + DC_OFFSET; 
+                            // BUG FIX #2: Correctly scale Synth Filter frequency so it stays uniform between 48kHz and 96kHz modes
+                            float fltCoeff = fmaxf(0.001f, fminf(0.99f, (p_sy_flt + 0.6f * synthEnv) * srScale));
+                            synthFilter = synthFilter + fltCoeff * (procSample - synthFilter) + DC_OFFSET; 
                             procSample = synthFilter * p_sy_mix;
                         } 
                         
@@ -967,8 +968,6 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
             effectMemory[4] = constrain((float)semi + c, -24.0f, 24.0f);
             lutNeedsUpdate = true; forceUIUpdate = true; 
         }
-        if (pIdx == 2) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
-        if (pIdx == 3) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
     }
     else if (activeEffectMode == 5) { 
         if (pIdx == 0) { effectMemory[5] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
@@ -1085,7 +1084,6 @@ void MidiTask(void * pvParameters) {
             } else if (carouselBtn.state == HIGH && carouselBtn.isActive) {
                 carouselBtn.isActive = false; 
                 if (millis() - carouselBtn.pressedTime < 400) { 
-                    // BUG FIX #2: Unified switchEffectMode helper handles state resets
                     switchEffectMode(activeEffectMode + 1);
                 } 
                 forceUIUpdate = true;
@@ -1149,28 +1147,31 @@ void MidiTask(void * pvParameters) {
             if (stableRawC < 0) stableRawC = rawC; if (abs((int)rawC - stableRawC) > 16) stableRawC = rawC;
 
             static bool unpluggedA = false; static bool unpluggedB = false;
+            static int previousRawA = 2048; static int previousRawB = 2048;
 
-            // BUG FIX #1: Replaced flawed single-frame delta check with boot status + range checks
-            if (PB1_unplugged_at_boot || (stableRawA > 4050 && PB1_raw_max < 3800)) {
+            // BUG FIX #1: Delta + Voltage check catches cable yank without limiting PB upper maximums
+            if (PB1_unplugged_at_boot || (stableRawA >= 4050 && (stableRawA - previousRawA) > 400)) {
                 unpluggedA = true;
             } else if (stableRawA < 3900) {
                 unpluggedA = false; PB1_unplugged_at_boot = false;
             }
 
-            if (PB2_unplugged_at_boot || (stableRawB > 4050 && PB2_raw_max < 3800)) {
+            if (PB2_unplugged_at_boot || (stableRawB >= 4050 && (stableRawB - previousRawB) > 400)) {
                 unpluggedB = true;
             } else if (stableRawB < 3900) {
                 unpluggedB = false; PB2_unplugged_at_boot = false;
             }
 
+            previousRawA = stableRawA; previousRawB = stableRawB;
+
             if (!unpluggedA) {
                 if (stableRawA < PB1_raw_min && stableRawA > 200) PB1_raw_min = stableRawA;
-                if (stableRawA > PB1_raw_max && stableRawA < 4095) PB1_raw_max = stableRawA;
+                if (stableRawA > PB1_raw_max && stableRawA <= 4095) PB1_raw_max = stableRawA;
             }
 
             if (!unpluggedB) {
                 if (stableRawB < PB2_raw_min && stableRawB > 200) PB2_raw_min = stableRawB;
-                if (stableRawB > PB2_raw_max && stableRawB < 4095) PB2_raw_max = stableRawB;
+                if (stableRawB > PB2_raw_max && stableRawB <= 4095) PB2_raw_max = stableRawB;
             }
             
             if (stableRawC < PB3_raw_min) PB3_raw_min = stableRawC;
@@ -1203,7 +1204,6 @@ void MidiTask(void * pvParameters) {
                 if (moveB) { lastActivePedal = calB; pitchChanged = true; }
                 if (moveC && !isVolumeMode) { lastActivePedal = calC; pitchChanged = true; }
 
-                // BUG FIX #3: Always record lastActivePedal and update pitchShiftFactor immediately
                 if (pitchChanged) pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)];
 
                 if (moveC && isVolumeMode) {
@@ -1267,7 +1267,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             }
             forceUIUpdate = true; 
         }
-        // BUG FIX #2: Unified switchEffectMode helper ensures MIDI mode changes perform state resets
         else if (cm.data1 == 0 && cm.data2 >= 64) { switchEffectMode(activeEffectMode - 1); }
         else if (cm.data1 == 1 && cm.data2 >= 64) { switchEffectMode(activeEffectMode + 1); }
         else if (cm.data1 == 2 && cm.data2 >= 64) { latencyMode = (latencyMode + 1) % 4; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); }
@@ -1294,6 +1293,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 17 || cm.data1 == 18) {
             float step = (cm.data2 >= 64) ? -1.0f : 1.0f; 
 
+            // DISREGARDED BUG FIX #3: Kept original CC 17/18 functionality for Capo mode
             if (cm.data1 == 17) {
                 if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
                     effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f); 

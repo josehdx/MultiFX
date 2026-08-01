@@ -142,6 +142,9 @@ uint16_t PB1_raw_min = 1000; uint16_t PB1_raw_max = 3000; uint16_t PB1_raw_cente
 uint16_t PB2_raw_min = 1000; uint16_t PB2_raw_max = 3000; uint16_t PB2_raw_center = 2048;
 uint16_t PB3_raw_min = 1000; uint16_t PB3_raw_max = 3000; int deadzone_size = 400; 
 
+bool PB1_unplugged_at_boot = false;
+bool PB2_unplugged_at_boot = false;
+
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB = pinPB;
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB3 = pinPB3;
@@ -222,7 +225,12 @@ void calibratePBs() {
     long sum1 = 0; long sum2 = 0;
     for (int i = 1; i <= 250; i++) { filterPB.update(); filterPB2.update(); filterPB3.update(); sum1 += filterPB.getValue(); sum2 += filterPB2.getValue(); delay(1); }
     PB1_raw_center = sum1 / 250; PB2_raw_center = sum2 / 250;
-    if (PB1_raw_center > 4000 || PB1_raw_center < 100) PB1_raw_center = 2048; if (PB2_raw_center > 4000 || PB2_raw_center < 100) PB2_raw_center = 2048;
+    
+    if (PB1_raw_center > 4000) PB1_unplugged_at_boot = true;
+    if (PB2_raw_center > 4000) PB2_unplugged_at_boot = true;
+
+    if (PB1_raw_center > 4000 || PB1_raw_center < 100) PB1_raw_center = 2048; 
+    if (PB2_raw_center > 4000 || PB2_raw_center < 100) PB2_raw_center = 2048;
     
     PB1_raw_min = 1000; PB1_raw_max = 3000; 
     PB2_raw_min = 1000; PB2_raw_max = 3000; 
@@ -752,7 +760,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         if (vibratoActive) {
                             vibratoLfoPhase += globalVibratoPhaseInc; 
                             if (vibratoLfoPhase >= LFO_LUT_SIZE) { vibratoLfoPhase -= LFO_LUT_SIZE; }
-                            // BUG FIX #3: Mask LFO LUT index with & 1023
                             spd1 *= 1.0f + ((lfoLUT[(int)vibratoLfoPhase & 1023] - 1.0f) * p_vb_dep);
                         }
                         
@@ -760,7 +767,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         if (chorusActive) { 
                             chorusLfoPhase += chorusPhaseIncr; 
                             if (chorusLfoPhase >= LFO_LUT_SIZE) { chorusLfoPhase -= LFO_LUT_SIZE; }
-                            // BUG FIX #3: Mask LFO LUT index with & 1023
                             spd3 *= lfoLUT[(int)chorusLfoPhase & 1023]; 
                         }
                         
@@ -770,7 +776,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         if (feedbackActive || localFbRamp > 0.0f) { 
                             feedbackLfoPhase += feedbackPhaseIncr; 
                             if (feedbackLfoPhase >= LFO_LUT_SIZE) { feedbackLfoPhase -= LFO_LUT_SIZE; }
-                            // BUG FIX #3: Mask LFO LUT index with & 1023
                             float lfoVal = lfoLUT[(int)feedbackLfoPhase & 1023]; spd4 = lfoVal; spd5 = fbPitch * lfoVal; 
                             
                             w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
@@ -948,7 +953,6 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
             effectMemory[4] = constrain((float)semi + c, -24.0f, 24.0f);
             lutNeedsUpdate = true; forceUIUpdate = true; 
         }
-        // BUG FIX #2: Add missing HEEL (pIdx 2) and TOE (pIdx 3) controls in Capo Mode
         if (pIdx == 2) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
         if (pIdx == 3) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
     }
@@ -1133,10 +1137,16 @@ void MidiTask(void * pvParameters) {
             if (stableRawC < 0) stableRawC = rawC; if (abs((int)rawC - stableRawC) > 16) stableRawC = rawC;
 
             static bool unpluggedA = false; static bool unpluggedB = false;
+            static int previousRawA = 2048; static int previousRawB = 2048;
 
-            // BUG FIX #1: Absolute threshold check prevents pedal from jumping to Max Pitch Bend when unplugged
-            if (stableRawA > 4000) unpluggedA = true; else if (stableRawA < 3900) unpluggedA = false;
-            if (stableRawB > 4000) unpluggedB = true; else if (stableRawB < 3900) unpluggedB = false;
+            // BUG FIX #1: Delta + Voltage check prevents false unplugged triggers during smooth pedal movement
+            if (PB1_unplugged_at_boot || (stableRawA > 4080 && (stableRawA - previousRawA) > 800)) unpluggedA = true;
+            else if (stableRawA < 3900) { unpluggedA = false; PB1_unplugged_at_boot = false; }
+
+            if (PB2_unplugged_at_boot || (stableRawB > 4080 && (stableRawB - previousRawB) > 800)) unpluggedB = true;
+            else if (stableRawB < 3900) { unpluggedB = false; PB2_unplugged_at_boot = false; }
+
+            previousRawA = stableRawA; previousRawB = stableRawB;
 
             if (!unpluggedA) {
                 if (stableRawA < PB1_raw_min && stableRawA > 200) PB1_raw_min = stableRawA;

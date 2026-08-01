@@ -358,11 +358,13 @@ void updateDisplay() {
         float val = fbi[feedbackIntervalIdx % 5];
         bGauges[numG++] = {2, val/28.0f, "OVT", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", val);
     } else if (activeEffectMode == 4) {
-        // Capo split into Semi (PAR 1, left) and Cent (PAR 2, right)
+        // Capo split into Semi (PAR 1), Cent (PAR 2), and read-only HEEL (3) & TOE (4) visual clues
         int semi = (int)effectMemory[4]; 
         int cents = (int)roundf((effectMemory[4] - semi) * 100.0f);
         bGauges[numG++] = {1, semi/24.0f, "SEMI", ""}; sprintf(bGauges[numG-1].valStr, "%+d", semi);
         bGauges[numG++] = {1, cents/50.0f, "CENT", ""}; sprintf(bGauges[numG-1].valStr, "%+d", cents);
+        bGauges[numG++] = {1, effectMemory[1]/24.0f, "HEEL", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", effectMemory[1]);
+        bGauges[numG++] = {1, effectMemory[0]/24.0f, "TOE", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", effectMemory[0]);
     } else {
         // Single pitch parameter on PAR 1 for Modes 3, 5, 6, 7, 9
         float val = effectMemory[activeEffectMode];

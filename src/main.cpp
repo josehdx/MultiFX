@@ -104,6 +104,7 @@ TFT_eSprite meterSpr = TFT_eSprite(&tft);
 volatile bool forceUIUpdate = true; 
 
 volatile int activeEffectMode = 0; 
+// 0: TOE(+12), 1: HEEL(-12), 2: unused, 3: Harmony(+5), 4: Capo(-2), 5: Synth(-12), 6: Pad(-12), 7: Chorus(+12), 8: Swell unused, 9: Vibrato(0)
 volatile float effectMemory[10] = { 12.0f, -12.0f, 0.0f, 5.0f, -2.0f, -12.0f, -12.0f, 12.0f, 0.0f, 0.0f };
 volatile float pitchShiftFactor = 1.0f;
 
@@ -297,7 +298,6 @@ void updateLUT() {
     globalChorusRatio = powf(2.0f, effectMemory[7] / 12.0f); 
     float fbIntervals[5] = {0.0f, 12.0f, 19.0f, 24.0f, 28.0f}; 
     
-    // BUG FIX #2: Safe array index guarding against negative underruns
     globalFbRatio = powf(2.0f, fbIntervals[constrain((int)feedbackIntervalIdx, 0, 4)] / 12.0f);
     
     float vibHz = (effectMemory[9] != 0.0f) ? fabsf(effectMemory[9]) : 2.0f; 
@@ -406,7 +406,8 @@ void updateDisplay() {
         float val = fbi[constrain((int)feedbackIntervalIdx, 0, 4)];
         bGauges[numG++] = {2, val/28.0f, "OVT", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", val);
     } else if (activeEffectMode == 4) {
-        int semi = (int)truncf(effectMemory[4]); 
+        // BUG FIX #3: Reverted to roundf() to prevent musical anchor deadzones when tuning Capo
+        int semi = (int)roundf(effectMemory[4]); 
         int cents = (int)roundf((effectMemory[4] - (float)semi) * 100.0f);
         bGauges[numG++] = {1, semi/24.0f, "SEMI", ""}; sprintf(bGauges[numG-1].valStr, "%+d", semi);
         bGauges[numG++] = {1, cents/50.0f, "CENT", ""}; sprintf(bGauges[numG-1].valStr, "%+d", cents);
@@ -593,6 +594,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
 
             bool blockIsMuted = clearBuffersRequested;
             uint32_t start_cycles = xthal_get_ccount(); 
+            
+            // BUG FIX #1: Dynamically scaling envelopes ensures FX speed stays perfectly uniform at 48k or 96k
+            float srScale = 48000.0f / (float)currentSampleRate;
 
             if (blockIsMuted) {
                 memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
@@ -676,15 +680,15 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         inputEnvelope = inputEnvelope * 0.99f + fabsf(inSample) * 0.01f + DC_OFFSET;
                         
                         if (swellActive) {
-                            if (inputEnvelope > p_sw_thr) { localSwellGain = fminf(1.0f, localSwellGain + p_sw_att); } 
-                            else { localSwellGain = fmaxf(0.0f, localSwellGain - p_sw_rel); }
+                            if (inputEnvelope > p_sw_thr) { localSwellGain = fminf(1.0f, localSwellGain + (p_sw_att * srScale)); } 
+                            else { localSwellGain = fmaxf(0.0f, localSwellGain - (p_sw_rel * srScale)); }
                         } else { localSwellGain = 1.0f; }
                         
                         float procSample = inSample;
                         
                         if (synthActive) { 
-                            if (inputEnvelope > 0.005f) { synthEnv = fminf(1.0f, synthEnv + p_sy_att); } 
-                            else { synthEnv = fmaxf(0.0f, synthEnv - p_sy_rel); }
+                            if (inputEnvelope > 0.005f) { synthEnv = fminf(1.0f, synthEnv + (p_sy_att * srScale)); } 
+                            else { synthEnv = fmaxf(0.0f, synthEnv - (p_sy_rel * srScale)); }
                             
                             int waveIdx = constrain((int)((procSample + 1.0f) * 1023.5f), 0, WAVE_LUT_SIZE - 1);
                             procSample = synthLUT[waveIdx]; 
@@ -693,8 +697,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         } 
                         
                         if (padActive) { 
-                            if (inputEnvelope > 0.005f) { padEnv = fminf(1.0f, padEnv + 0.00002f); } 
-                            else { padEnv = fmaxf(0.0f, padEnv - 0.000005f); }
+                            if (inputEnvelope > 0.005f) { padEnv = fminf(1.0f, padEnv + (0.00002f * srScale)); } 
+                            else { padEnv = fmaxf(0.0f, padEnv - (0.000005f * srScale)); }
                             procSample *= padEnv; 
                         }
                         
@@ -704,8 +708,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         }
                         
                         if (localFrzRamp > 0.0f || frzActive) {
-                            if (frzActive) { localFrzRamp = fminf(1.0f, localFrzRamp + p_fz_att); } 
-                            else { localFrzRamp = fmaxf(0.0f, localFrzRamp - p_fz_rel); }
+                            if (frzActive) { localFrzRamp = fminf(1.0f, localFrzRamp + (p_fz_att * srScale)); } 
+                            else { localFrzRamp = fmaxf(0.0f, localFrzRamp - (p_fz_rel * srScale)); }
                         }
                         
                         float fzOut = 0.0f;
@@ -714,7 +718,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             float phase2 = (phaseRead + 0.5f); if (phase2 >= 1.0f) { phase2 -= 1.0f; }
                             
                             int sum1 = freezeStartIdxVar + freezePlayCounterVar;
-                            // BUG FIX #1: Guaranteed modulo array indexing prevents PSRAM boundary overrun
                             int idx1 = sum1 % freezeLength;
                             
                             int counter2 = freezePlayCounterVar + (activeFreezeLength / 2);
@@ -771,9 +774,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                                 
                             if (feedbackActive) {
-                                if (inputEnvelope > 0.005f) { localFbRamp = fminf(1.0f, localFbRamp + 0.000011f); } 
-                                else { localFbRamp = fmaxf(0.0f, localFbRamp - 0.005f); }
-                            } else { localFbRamp = fmaxf(0.0f, localFbRamp - 0.0001f); }
+                                if (inputEnvelope > 0.005f) { localFbRamp = fminf(1.0f, localFbRamp + (0.000011f * srScale)); } 
+                                else { localFbRamp = fmaxf(0.0f, localFbRamp - (0.005f * srScale)); }
+                            } else { localFbRamp = fmaxf(0.0f, localFbRamp - (0.0001f * srScale)); }
                             
                             float mixV = fmaxf(0.0f, fminf((localFbRamp - 0.1f) * 2.0f, 1.0f));
                             float feedInput = (frzActive && localFrzRamp > 0.0f) ? fzOut : (w4 * (1.0f - mixV)) + (w5 * mixV);
@@ -931,14 +934,14 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
         if (pIdx == 1) fxParams[3][0] = norm;                                
     }
     else if (activeEffectMode == 4) { 
-        // BUG FIX #3: Truncating fractional semitones preserves correct negative cents
+        // BUG FIX #3: Roundf perfectly captures integer semitones and correctly signed musical cents
         if (pIdx == 0) { 
-            int cents = (int)roundf((effectMemory[4] - (float)truncf(effectMemory[4])) * 100.0f); 
+            int cents = (int)roundf((effectMemory[4] - (float)roundf(effectMemory[4])) * 100.0f); 
             effectMemory[4] = constrain(roundf((norm * 48.0f) - 24.0f) + ((float)cents / 100.0f), -24.0f, 24.0f);
             lutNeedsUpdate = true; forceUIUpdate = true; 
         }
         if (pIdx == 1) { 
-            int semi = (int)truncf(effectMemory[4]); 
+            int semi = (int)roundf(effectMemory[4]); 
             float c = roundf((norm * 100.0f) - 50.0f) / 100.0f; 
             effectMemory[4] = constrain((float)semi + c, -24.0f, 24.0f);
             lutNeedsUpdate = true; forceUIUpdate = true; 
@@ -1201,6 +1204,15 @@ void MidiTask(void * pvParameters) {
 bool channelMessageCallback(ChannelMessage cm) {
     if (cm.header == 0xB0) {
         
+        // BUG FIX #2: Prevents Expression Pedal (CC11) from constantly resetting the Flash Auto-Save timer
+        if (cm.data1 == 11) { 
+            uint16_t mappedCC = map(cm.data2, 0, 127, 0, 16383); currentCC11 = mappedCC; currentPB3 = mappedCC; 
+            if (isVolumeMode) { volumePedalGain = (float)mappedCC / 16383.0f; Control_Surface.sendControlChange({19, Channel_1}, cm.data2); } 
+            else { if (!lutNeedsUpdate) pitchShiftFactor = pitchShiftLUT[mappedCC]; }
+            forceUIUpdate = true; 
+            return false; 
+        }
+
         if (cm.data1 >= 24 && cm.data1 <= 28) {
             updateParameterFromCC(cm.data1, cm.data2);
             return false;
@@ -1275,12 +1287,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             }
             
             lutNeedsUpdate = true; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
-        }
-        else if (cm.data1 == 11) { 
-            uint16_t mappedCC = map(cm.data2, 0, 127, 0, 16383); currentCC11 = mappedCC; currentPB3 = mappedCC; 
-            if (isVolumeMode) { volumePedalGain = (float)mappedCC / 16383.0f; Control_Surface.sendControlChange({19, Channel_1}, cm.data2); } 
-            else { if (!lutNeedsUpdate) pitchShiftFactor = pitchShiftLUT[mappedCC]; }
-            forceUIUpdate = true; 
         }
     }
     return false;

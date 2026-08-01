@@ -13,6 +13,12 @@
 #include "driver/rtc_io.h"
 #include "esp_bt.h"
 #include <math.h>
+#include <Preferences.h>
+
+// --- MEMORY PREFERENCES ---
+Preferences preferences;
+volatile bool settingsNeedSaving = false;
+unsigned long lastParameterChangeTime = 0;
 
 // --- PEDAL CONFIGURATION ---
 // Set to 'false' to map the expression pedal linearly (Heel = 0, Toe = 16383)
@@ -132,6 +138,7 @@ volatile bool isChorusMode = false;
 volatile bool isSwellMode = false; 
 volatile bool isVibratoMode = false; 
 volatile bool isVolumeMode = false; 
+volatile bool isPB2LinearMode = false; // False = Hall/Spring, True = Wiper
 
 volatile float chorusLfoPhase = 0.0f;
 volatile float feedbackLfoPhase = 0.0f;
@@ -201,6 +208,24 @@ FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB3 = pinPB3;
 BluetoothMIDI_Interface btmidi;
 USBMIDI_Interface usbmidi;
 MIDI_PipeFactory<4> pipes;
+
+// --- FLASH MEMORY SAVER FUNCTION ---
+void saveSettings() {
+    preferences.begin("whammy_cfg", false); 
+    
+    preferences.putInt("activeMode", activeEffectMode);
+    preferences.putInt("latMode", latencyMode);
+    preferences.putBool("pb2Linear", isPB2LinearMode);
+    preferences.putUInt("sampleRate", currentSampleRate);
+    
+    for(int i = 0; i < 10; i++) {
+        char key[8];
+        sprintf(key, "fxMem%d", i);
+        preferences.putFloat(key, effectMemory[i]);
+    }
+    
+    preferences.end();
+}
 
 // --- NON-LINEAR LIPO BATTERY CURVE CALCULATION ---
 int getBatteryPercentage(float voltage) {
@@ -370,6 +395,9 @@ void toggleSampleRate() {
     
     sleepRequested = false;
     forceUIUpdate = true;
+    
+    settingsNeedSaving = true;
+    lastParameterChangeTime = millis();
 }
 
 // --- LCD & SLEEP CONTROL ---
@@ -606,7 +634,13 @@ void updateDisplay() {
     
     spr.setTextSize(1); 
     spr.drawString("PB1", xPB1, gaugeBottomY + 15); 
-    spr.drawString("PB2", xPB2, gaugeBottomY + 15); 
+    
+    // Dynamic PB2 Hardware Label
+    if (isPB2LinearMode) {
+        spr.drawString("PB2 W", xPB2, gaugeBottomY + 15); 
+    } else {
+        spr.drawString("PB2 H", xPB2, gaugeBottomY + 15); 
+    }
     
     // Dynamic PB3 Label based on Volume Mode status
     if (isVolumeMode) {
@@ -1318,6 +1352,9 @@ void MidiTask(void * pvParameters) {
                     swellGain = 0.0f; 
                     isWhammyActive = true; 
                     lutNeedsUpdate = true; 
+                    
+                    settingsNeedSaving = true;
+                    lastParameterChangeTime = millis();
                 } 
                 forceUIUpdate = true;
             }
@@ -1369,7 +1406,17 @@ void MidiTask(void * pvParameters) {
             if (stableRawC > PB3_raw_max && stableRawC <= 4095) { PB3_raw_max = stableRawC; }
             
             analog_t calA = map_raw_deadzone(stableRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
-            analog_t calB = map_raw_deadzone(stableRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
+            
+            // NEW: Route PB2 dynamically based on the CC toggle
+            analog_t calB;
+            if (isPB2LinearMode) {
+                // PB2 W (Wiper) - Uses PB1 Spring-Loaded Logic
+                calB = map_raw_deadzone(stableRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
+            } else {
+                // PB2 H (Hall Effect) - Uses PB1 Spring-Loaded Logic
+                calB = map_raw_deadzone(stableRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
+            }
+            
             analog_t calC = map_raw_expression(stableRawC, PB3_raw_min, PB3_raw_max, INVERT_PB3);
             
             if (unpluggedA) { calA = 8192; }
@@ -1460,8 +1507,30 @@ void MidiTask(void * pvParameters) {
 bool channelMessageCallback(ChannelMessage cm) {
     if (cm.header == 0xB0) {
         
+        // PB2 HARDWARE MODE TOGGLE (Hall vs Wiper)
+        if (cm.data1 == 5 && cm.data2 >= 64) {
+            isPB2LinearMode = !isPB2LinearMode;
+            
+            // Instantly take a new reading to establish a fresh center point
+            int newCenter = filterPB2.getValue();
+            if (newCenter < 4000 && newCenter > 100) {
+                PB2_raw_center = newCenter;
+            } else {
+                PB2_raw_center = 2048; // Fallback to safe digital center
+            }
+            
+            // FIX: Safely set initial tight bounds around the new center. 
+            // This allows the auto-calibration in MidiTask to correctly expand outward.
+            PB2_raw_min = PB2_raw_center - 200;
+            PB2_raw_max = PB2_raw_center + 200;
+            
+            forceUIUpdate = true;
+            
+            settingsNeedSaving = true;
+            lastParameterChangeTime = millis();
+        }
         // VOLUME MODE TOGGLE
-        if (cm.data1 == 5 && cm.data2 >= 64) { 
+        else if (cm.data1 == 6 && cm.data2 >= 64) { 
             isVolumeMode = !isVolumeMode; 
             if (!isVolumeMode) { volumePedalGain = 1.0f; } 
             forceUIUpdate = true; 
@@ -1471,16 +1540,25 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (activeEffectMode == 0) { activeEffectMode = 9; } 
             else { activeEffectMode = activeEffectMode - 1; }
             lutNeedsUpdate = true; forceUIUpdate = true; 
+            
+            settingsNeedSaving = true;
+            lastParameterChangeTime = millis();
         }
         // EFFECT MENU UP
         else if (cm.data1 == 1 && cm.data2 >= 64) { 
             activeEffectMode = (activeEffectMode + 1) % 10; 
             lutNeedsUpdate = true; forceUIUpdate = true; 
+            
+            settingsNeedSaving = true;
+            lastParameterChangeTime = millis();
         }
         // LATENCY MENU
         else if (cm.data1 == 2 && cm.data2 >= 64) { 
             latencyMode = (latencyMode + 1) % 4; 
             forceUIUpdate = true; 
+            
+            settingsNeedSaving = true;
+            lastParameterChangeTime = millis();
         }
         // GLOBAL BYPASS / SMART RESET TOGGLE
         else if (cm.data1 == 3 && cm.data2 >= 64) {
@@ -1581,6 +1659,9 @@ bool channelMessageCallback(ChannelMessage cm) {
             }
             
             lutNeedsUpdate = true; forceUIUpdate = true;
+            
+            settingsNeedSaving = true;
+            lastParameterChangeTime = millis();
         }
         else if (cm.data1 == 11) { 
             uint16_t mappedCC = map(cm.data2, 0, 127, 0, 16383); 
@@ -1607,6 +1688,22 @@ void setup() {
 
     // Completely disable Wi-Fi radio to eliminate 2.4 GHz RF coexistence interrupts
     WiFi.mode(WIFI_OFF);
+
+    // --- LOAD SAVED SETTINGS FROM FLASH ---
+    preferences.begin("whammy_cfg", true); // true = Read Only mode
+    
+    activeEffectMode = preferences.getInt("activeMode", 0);
+    latencyMode = preferences.getInt("latMode", 0);
+    isPB2LinearMode = preferences.getBool("pb2Linear", false);
+    currentSampleRate = preferences.getUInt("sampleRate", 48000);
+    
+    for(int i = 0; i < 10; i++) {
+        char key[8];
+        sprintf(key, "fxMem%d", i);
+        effectMemory[i] = preferences.getFloat(key, effectMemory[i]); 
+    }
+    preferences.end();
+    // --------------------------------------
 
     pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP); 
     pinMode(BATTERY_PIN, INPUT);
@@ -1735,6 +1832,12 @@ void loop() {
             clearBuffersRequested = false;
             xSemaphoreGive(audioBufferMutex);
         }
+    }
+    
+    // NEW: Safe Delayed Save Execution
+    if (settingsNeedSaving && (millis() - lastParameterChangeTime > 3000)) {
+        saveSettings();
+        settingsNeedSaving = false;
     }
     
     vTaskDelay(pdMS_TO_TICKS(10));

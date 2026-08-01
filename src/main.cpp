@@ -103,7 +103,7 @@ volatile float pitchShiftFactor = 1.0f;
 volatile bool isWhammyActive = true;  volatile bool isFrozen = false; volatile bool isFeedbackActive = false;
 volatile bool isHarmonizerMode = false; volatile bool isSynthMode = false; volatile bool isPadMode = false;
 volatile bool isCapoMode = false; volatile bool isChorusMode = false; volatile bool isSwellMode = false; 
-volatile bool isVibratoMode = false; volatile bool isVolumeMode = false; volatile bool isPB2LinearMode = false; 
+volatile bool isVibratoMode = false; volatile bool isVolumeMode = false; volatile bool isPB2WiperMode = false; 
 
 volatile float chorusLfoPhase = 0.0f; volatile float feedbackLfoPhase = 0.0f; volatile float vibratoLfoPhase = 0.0f;
 volatile float swellGain = 0.0f; volatile float volumePedalGain = 1.0f; 
@@ -146,7 +146,8 @@ BluetoothMIDI_Interface btmidi; USBMIDI_Interface usbmidi; MIDI_PipeFactory<4> p
 void saveSettings() {
     preferences.begin("whammy_cfg", false); 
     preferences.putInt("activeMode", activeEffectMode); preferences.putInt("latMode", latencyMode);
-    preferences.putBool("pb2Linear", isPB2LinearMode); preferences.putUInt("sampleRate", currentSampleRate);
+    preferences.putBool("pb2Wiper", isPB2WiperMode);
+    preferences.putUInt("sampleRate", currentSampleRate);
     for(int i = 0; i < 10; i++) {
         char key[8]; sprintf(key, "fxMem%d", i); preferences.putFloat(key, effectMemory[i]);
         for (int p = 0; p < 5; p++) { char pKey[12]; sprintf(pKey, "fxP%d_%d", i, p); preferences.putFloat(pKey, fxParams[i][p]); }
@@ -198,12 +199,19 @@ void calibratePBs() {
 void toggleSampleRate() {
     sleepRequested = true; globalAudioResetRequested = true; int timeoutCounter = 0;
     while (!isSleeping && timeoutCounter < 40) { vTaskDelay(pdMS_TO_TICKS(5)); timeoutCounter++; }
+
+    // BUG FIX #4: Lock audioBufferMutex before disabling I2S channels to prevent race condition
+    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+
     i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); vTaskDelay(pdMS_TO_TICKS(10));
     if (currentSampleRate == 96000) currentSampleRate = 48000; else currentSampleRate = 96000;
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate);
     i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg); i2s_channel_reconfig_std_clock(rx_chan, &clk_cfg);
     freezeLength = currentSampleRate; lutNeedsUpdate = true;
     i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
+
+    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+
     sleepRequested = false; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
 }
 
@@ -213,12 +221,20 @@ void turnScreenOn() { if (isScreenOff && !wakeupPending) wakeupPending = true; }
 void goToLightSleep() {
     turnScreenOff(); sleepRequested = true; int timeoutCounter = 0;
     while (!isSleeping && timeoutCounter < 10) { vTaskDelay(pdMS_TO_TICKS(10)); timeoutCounter++; }
+
+    // BUG FIX #4: Lock audioBufferMutex before disabling I2S channels
+    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+
     i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
     rtc_gpio_init(GPIO_NUM_21); rtc_gpio_set_direction(GPIO_NUM_21, RTC_GPIO_MODE_INPUT_ONLY); rtc_gpio_pullup_en(GPIO_NUM_21); 
     esp_sleep_enable_ext1_wakeup(1ULL << 21, ESP_EXT1_WAKEUP_ANY_LOW);
     delay(50); esp_light_sleep_start();
     rtc_gpio_deinit(GPIO_NUM_21); pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP);
-    i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); sleepRequested = false; timeoutCounter = 0;
+    i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); 
+
+    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+
+    sleepRequested = false; timeoutCounter = 0;
     while (isSleeping && timeoutCounter < 10) { vTaskDelay(pdMS_TO_TICKS(10)); timeoutCounter++; }
     vTaskDelay(pdMS_TO_TICKS(200)); turnScreenOn(); 
 }
@@ -246,7 +262,7 @@ void updateLUT() {
     }
     memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f); 
-    globalChorusRatio = powf(2.0f, effectMemory[7] / 12.0f); // Fixed: Mode 7 is Chorus
+    globalChorusRatio = powf(2.0f, effectMemory[7] / 12.0f); 
     float fbIntervals[5] = {0.0f, 12.0f, 19.0f, 24.0f, 28.0f}; 
     globalFbRatio = powf(2.0f, fbIntervals[feedbackIntervalIdx % 5] / 12.0f);
     float vibHz = (effectMemory[9] != 0.0f) ? fabsf(effectMemory[9]) : 2.0f; 
@@ -336,7 +352,7 @@ void updateDisplay() {
     drawCircularGauge(spr, 65, topY, topR, pb1Val, "PB1", valBuf, TFT_CYAN, 1);
 
     float pb2Val = (currentPB2 - 8192) / 8192.0f; sprintf(valBuf, "%d%%", (int)(pb2Val * 100));
-    drawCircularGauge(spr, 125, topY, topR, pb2Val, isPB2LinearMode ? "PB2 W" : "PB2 H", valBuf, TFT_MAGENTA, 1);
+    drawCircularGauge(spr, 125, topY, topR, pb2Val, isPB2WiperMode ? "PB2 W" : "PB2 H", valBuf, TFT_MAGENTA, 1);
 
     float pb3Val = currentPB3 / 16383.0f; sprintf(valBuf, "%d%%", (int)(pb3Val * 100));
     drawCircularGauge(spr, 185, topY, topR, pb3Val, isVolumeMode ? "VOL" : "PB3", valBuf, TFT_YELLOW, 0);
@@ -358,9 +374,9 @@ void updateDisplay() {
         float val = fbi[feedbackIntervalIdx % 5];
         bGauges[numG++] = {2, val/28.0f, "OVT", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", val);
     } else if (activeEffectMode == 4) {
-        // Capo split into Semi (PAR 1), Cent (PAR 2), and read-only HEEL (3) & TOE (4) visual clues
-        int semi = (int)effectMemory[4]; 
-        int cents = (int)roundf((effectMemory[4] - semi) * 100.0f);
+        // BUG FIX #1: Capo split using roundf() to prevent negative truncation jump
+        int semi = (int)roundf(effectMemory[4]); 
+        int cents = (int)roundf((effectMemory[4] - (float)semi) * 100.0f);
         bGauges[numG++] = {1, semi/24.0f, "SEMI", ""}; sprintf(bGauges[numG-1].valStr, "%+d", semi);
         bGauges[numG++] = {1, cents/50.0f, "CENT", ""}; sprintf(bGauges[numG-1].valStr, "%+d", cents);
         bGauges[numG++] = {1, effectMemory[1]/24.0f, "HEEL", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", effectMemory[1]);
@@ -971,9 +987,9 @@ void MidiTask(void * pvParameters) {
             if (stableRawC > PB3_raw_max && stableRawC <= 4095) PB3_raw_max = stableRawC;
             
             analog_t calA = map_raw_deadzone(stableRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
-            analog_t calB;
-            if (isPB2LinearMode) calB = map_raw_deadzone(stableRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
-            else calB = map_raw_deadzone(stableRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
+            
+            // Applies identical math mapping to PB2, regardless of UI label state
+            analog_t calB = map_raw_deadzone(stableRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
             
             analog_t calC = map_raw_expression(stableRawC, PB3_raw_min, PB3_raw_max, INVERT_PB3);
             
@@ -1064,15 +1080,16 @@ bool channelMessageCallback(ChannelMessage cm) {
                 if (pIdx == 1) fxParams[3][0] = norm;                                // MIX (PAR 2)
             }
             else if (activeEffectMode == 4) { // CAPO
+                // BUG FIX #1: Correct float-to-int rounding to avoid truncation anchor jump
                 if (pIdx == 0) { // PAR 1 -> SEMI
-                    int c = (int)roundf((effectMemory[4] - (int)effectMemory[4]) * 100.0f); 
-                    effectMemory[4] = constrain(roundf((norm * 48.0f) - 24.0f) + (c / 100.0f), -24.0f, 24.0f);
+                    int cents = (int)roundf((effectMemory[4] - (float)roundf(effectMemory[4])) * 100.0f); 
+                    effectMemory[4] = constrain(roundf((norm * 48.0f) - 24.0f) + ((float)cents / 100.0f), -24.0f, 24.0f);
                     lutNeedsUpdate = true; forceUIUpdate = true; 
                 }
                 if (pIdx == 1) { // PAR 2 -> CENT
-                    int s = (int)effectMemory[4]; 
+                    int semi = (int)roundf(effectMemory[4]); 
                     float c = roundf((norm * 100.0f) - 50.0f) / 100.0f; 
-                    effectMemory[4] = constrain(s + c, -24.0f, 24.0f);
+                    effectMemory[4] = constrain((float)semi + c, -24.0f, 24.0f);
                     lutNeedsUpdate = true; forceUIUpdate = true; 
                 }
             }
@@ -1109,13 +1126,29 @@ bool channelMessageCallback(ChannelMessage cm) {
             return false;
         }
 
+        // Restored Hardware Snapshot Tool for PB2
         if (cm.data1 == 5 && cm.data2 >= 64) {
-            isPB2LinearMode = !isPB2LinearMode; int newCenter = filterPB2.getValue();
-            if (newCenter < 4000 && newCenter > 100) PB2_raw_center = newCenter; else PB2_raw_center = 2048;
-            PB2_raw_min = PB2_raw_center - 200; PB2_raw_max = PB2_raw_center + 200;
-            forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
+            isPB2WiperMode = !isPB2WiperMode; 
+            int newCenter = filterPB2.getValue();
+            if (newCenter < 4000 && newCenter > 100) PB2_raw_center = newCenter; 
+            else PB2_raw_center = 2048;
+            PB2_raw_min = PB2_raw_center - 200; 
+            PB2_raw_max = PB2_raw_center + 200;
+            forceUIUpdate = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
         }
-        else if (cm.data1 == 6 && cm.data2 >= 64) { isVolumeMode = !isVolumeMode; if (!isVolumeMode) volumePedalGain = 1.0f; forceUIUpdate = true; }
+        // BUG FIX #3: Reset pitch shift factor when engaging volume mode on PB3
+        else if (cm.data1 == 6 && cm.data2 >= 64) { 
+            isVolumeMode = !isVolumeMode; 
+            if (!isVolumeMode) {
+                volumePedalGain = 1.0f; 
+            } else {
+                lastActivePedal = 8192;
+                if (!lutNeedsUpdate && pitchShiftLUT != nullptr) pitchShiftFactor = pitchShiftLUT[8192];
+            }
+            forceUIUpdate = true; 
+        }
         else if (cm.data1 == 0 && cm.data2 >= 64) { if (activeEffectMode == 0) activeEffectMode = 9; else activeEffectMode = activeEffectMode - 1; lutNeedsUpdate = true; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); }
         else if (cm.data1 == 1 && cm.data2 >= 64) { activeEffectMode = (activeEffectMode + 1) % 10; lutNeedsUpdate = true; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); }
         else if (cm.data1 == 2 && cm.data2 >= 64) { latencyMode = (latencyMode + 1) % 4; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); }
@@ -1182,7 +1215,8 @@ void setup() {
     audioBufferMutex = xSemaphoreCreateMutex(); WiFi.mode(WIFI_OFF);
     preferences.begin("whammy_cfg", true); 
     activeEffectMode = preferences.getInt("activeMode", 0); latencyMode = preferences.getInt("latMode", 0);
-    isPB2LinearMode = preferences.getBool("pb2Linear", false); currentSampleRate = preferences.getUInt("sampleRate", 48000);
+    isPB2WiperMode = preferences.getBool("pb2Wiper", false); 
+    currentSampleRate = preferences.getUInt("sampleRate", 48000);
     for(int i = 0; i < 10; i++) {
         char key[8]; sprintf(key, "fxMem%d", i); effectMemory[i] = preferences.getFloat(key, effectMemory[i]); 
         for (int p = 0; p < 5; p++) { char pKey[12]; sprintf(pKey, "fxP%d_%d", i, p); fxParams[i][p] = preferences.getFloat(pKey, fxParams[i][p]); }

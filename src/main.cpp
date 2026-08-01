@@ -21,9 +21,14 @@
 #define ENABLE_PAR_KNOBS false  
 
 // --- MEMORY PREFERENCES ---
+struct AppSettings {
+    float fxMem[10];
+    float params[10][5];
+};
+
 Preferences preferences;
 volatile bool settingsNeedSaving = false;
-volatile unsigned long lastParameterChangeTime = 0; // BUG FIX #2: Added volatile for Cross-Core safety
+volatile unsigned long lastParameterChangeTime = 0; // Fixed: Cross-Core safe volatile flag
 
 // --- DYNAMIC FX PARAMETERS MATRIX ---
 volatile float fxParams[10][5] = {
@@ -152,17 +157,29 @@ FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar5 = pinPar5;
 BluetoothMIDI_Interface btmidi; USBMIDI_Interface usbmidi; MIDI_PipeFactory<4> pipes;
 
 void saveSettings() {
+    // BUG FIX #1: Protect PSRAM access during Flash write kernel cycle
+    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+
     preferences.begin("whammy_cfg", false); 
     preferences.putInt("activeMode", activeEffectMode); 
     preferences.putInt("latMode", latencyMode);
     preferences.putBool("pb2Wiper", isPB2WiperMode); 
     preferences.putUInt("sampleRate", currentSampleRate);
     preferences.putInt("fbIdx", feedbackIntervalIdx); 
+    
+    // BUG FIX #3: Structural Flash Wear Protection 
+    AppSettings currentSettings;
     for(int i = 0; i < 10; i++) {
-        char key[8]; sprintf(key, "fxMem%d", i); preferences.putFloat(key, effectMemory[i]);
-        for (int p = 0; p < 5; p++) { char pKey[12]; sprintf(pKey, "fxP%d_%d", i, p); preferences.putFloat(pKey, fxParams[i][p]); }
+        currentSettings.fxMem[i] = effectMemory[i];
+        for (int p = 0; p < 5; p++) {
+            currentSettings.params[i][p] = fxParams[i][p];
+        }
     }
+    preferences.putBytes("dspData", &currentSettings, sizeof(AppSettings));
+
     preferences.end();
+    
+    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 }
 
 int getBatteryPercentage(float voltage) {
@@ -269,14 +286,19 @@ inline float IRAM_ATTR processTap(uint32_t tapPhase, const float* buffer, int cu
 void updateLUT() {
     float basePitch = 0.0f; if (isCapoMode || (activeEffectMode == 4 && isWhammyActive)) basePitch += effectMemory[4]; 
     float toeBend = effectMemory[0]; 
-    float heelBend = effectMemory[1]; // HEEL is stored at effectMemory[1]
+    float heelBend = effectMemory[1]; 
     for (int i = 0; i < 16384; i++) {
         float normalizedThrow = (i >= 8192) ? ((float)(i - 8192) / 8191.0f) : ((float)(i - 8192) / 8192.0f);
         float dynamicBend = (normalizedThrow >= 0.0f) ? (toeBend * normalizedThrow) : (heelBend * fabsf(normalizedThrow));
         pitchShiftLUT_temp[i] = powf(2.0f, (basePitch + dynamicBend) / 12.0f);
         if (i % 2048 == 0) { vTaskDelay(pdMS_TO_TICKS(1)); }
     }
-    memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
+    
+    // BUG FIX #2: Atomic Pointer Swap to prevent preemption audio aliasing
+    float* tempPtr = pitchShiftLUT;
+    pitchShiftLUT = pitchShiftLUT_temp;
+    pitchShiftLUT_temp = tempPtr;
+
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f); 
     globalChorusRatio = powf(2.0f, effectMemory[7] / 12.0f); 
     float fbIntervals[5] = {0.0f, 12.0f, 19.0f, 24.0f, 28.0f}; 
@@ -298,19 +320,19 @@ void drawCircularGauge(TFT_eSprite& sprite, int x, int y, int radius, float valu
     int thickness = 3;
     sprite.drawArc(x, y, radius, radius - thickness, 210, 150, TFT_DARKGREY, TFT_BLACK, true);
     
-    if (type == 1) { // Bipolar (Center-Out)
+    if (type == 1) { 
         float clamped = fmaxf(-1.0f, fminf(1.0f, value));
         int sweep = (int)(clamped * 150.0f);
         if (sweep > 0) sprite.drawArc(x, y, radius, radius - thickness, 0, sweep, color, TFT_BLACK, true);
         else if (sweep < 0) sprite.drawArc(x, y, radius, radius - thickness, 360 + sweep, 360, color, TFT_BLACK, true);
-    } else if (type == 2) { // Unipolar Right-to-Left
+    } else if (type == 2) { 
         float clamped = fmaxf(0.0f, fminf(1.0f, value));
         int sweep = (int)(clamped * 300.0f);
         if (sweep > 0) {
             int startAngle = (150 - sweep + 360) % 360;
             sprite.drawArc(x, y, radius, radius - thickness, startAngle, 150, color, TFT_BLACK, true);
         }
-    } else { // 0: Unipolar Left-to-Right
+    } else { 
         float clamped = fmaxf(0.0f, fminf(1.0f, value));
         int sweep = (int)(clamped * 300.0f);
         if (sweep > 0) {
@@ -324,7 +346,7 @@ void drawCircularGauge(TFT_eSprite& sprite, int x, int y, int radius, float valu
 }
 
 struct GaugeDef {
-    int type; // 0=LtoR, 1=Bipolar, 2=RtoL
+    int type; 
     float normVal;
     const char* label;
     char valStr[16];
@@ -333,7 +355,6 @@ struct GaugeDef {
 void updateDisplay() {
     spr.fillSprite(TFT_BLACK); 
     
-    // --- TOP STATUS BAR ---
     char batStr[20];
     if (isBatteryCharging) { 
         sprintf(batStr, "CHG %.2fV %d%%", currentBatteryVoltage, currentBatteryPercent); 
@@ -361,11 +382,9 @@ void updateDisplay() {
     else if (activeEffectMode == 8) effectIsActive = (isWhammyActive || isSwellMode); else if (activeEffectMode == 9) effectIsActive = (isWhammyActive || isVibratoMode);
     spr.fillCircle(240, 15, 6, effectIsActive ? TFT_GREEN : TFT_RED); spr.drawCircle(240, 15, 6, TFT_WHITE);
 
-    // --- METER BORDERS ---
     spr.drawRect(10, 30, 8, 100, TFT_DARKGREY); spr.setTextColor(TFT_WHITE, TFT_BLACK); spr.setTextSize(1); spr.drawString("IN", 14, 140);
     spr.drawRect(spr.width() - 18, 30, 8, 100, TFT_DARKGREY); spr.drawString("OUT", spr.width() - 14, 140);
 
-    // --- TOP GAUGES (Hardware PB & CC11) ---
     int topY = 55; int topR = 17; char valBuf[16];
     
     float pb1Val = (currentPB1 - 8192) / 8192.0f; sprintf(valBuf, "%d%%", (int)(pb1Val * 100));
@@ -380,10 +399,8 @@ void updateDisplay() {
     float cc11Val = currentCC11 / 16383.0f; sprintf(valBuf, "%d%%", (int)(cc11Val * 100));
     drawCircularGauge(spr, 245, topY, topR, cc11Val, "CC11", valBuf, TFT_GREEN, 0);
 
-    // --- BOTTOM GAUGES (Dynamic Effect Parameters) ---
     GaugeDef bGauges[6]; int numG = 0;
     
-    // 1. Add Primary Pitch Gauge(s) First
     if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
         bGauges[numG++] = {1, effectMemory[1]/24.0f, "HEEL", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", effectMemory[1]);
         bGauges[numG++] = {1, effectMemory[0]/24.0f, "TOE", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", effectMemory[0]);
@@ -413,7 +430,6 @@ void updateDisplay() {
         }
     }
     
-    // 2. Add Active DSP Parameters (All Unipolar Right-to-Left = 2)
     if (activeEffectMode == 0) {
         bGauges[numG++] = {2, fxParams[0][0], "D.MIX", ""}; sprintf(bGauges[numG-1].valStr, "%.1f", fxParams[0][0]);
         bGauges[numG++] = {2, fxParams[0][1], "W.MIX", ""}; sprintf(bGauges[numG-1].valStr, "%.1f", fxParams[0][1]);
@@ -452,7 +468,6 @@ void updateDisplay() {
         drawCircularGauge(spr, xPos, bY, bR, bGauges[i].normVal, bGauges[i].label, bGauges[i].valStr, actCol, bGauges[i].type);
     }
 
-    // --- ACTIVE EFFECT BANNERS ---
     spr.setTextDatum(ML_DATUM); spr.setTextSize(1);
     int bannerX = 25;
     auto drawBanner = [&](const char* lbl, uint32_t col) { spr.setTextColor(col, TFT_BLACK); spr.drawString(lbl, bannerX, 150); bannerX += 28; };
@@ -467,7 +482,6 @@ void updateDisplay() {
     if (isVibratoMode && activeEffectMode != 9) drawBanner("VIB", TFT_PURPLE); 
     if (isVolumeMode) drawBanner("VOL", TFT_DARKGREY);
 
-    // --- SYSTEM STATS ---
     int statsRowY = 162; spr.setTextColor(TFT_LIGHTGREY, TFT_BLACK); spr.setTextDatum(ML_DATUM); 
     char cpuUsageBuffer[16]; sprintf(cpuUsageBuffer, "CPU:%2d%%", (int)core1_load); spr.drawString(cpuUsageBuffer, 25, statsRowY);
     char internalSramBuffer[16]; sprintf(internalSramBuffer, "SRM:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024)); spr.drawString(internalSramBuffer, 85, statsRowY);
@@ -520,7 +534,6 @@ void DisplayTask(void * pvParameters) {
     }
 }
 
-// --- HARDWARE ACCELERATED BLOCK PROCESSING AUDIO TASK ---
 void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static int32_t i2s_in_block[HOP_SIZE * 2] __attribute__((aligned(16)));
     static int32_t i2s_out_block[HOP_SIZE * 2] __attribute__((aligned(16)));
@@ -558,7 +571,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
         isSleeping = false; 
         size_t bytesRead; 
         
-        // BUG FIX #1: Added pdMS_TO_TICKS(20) to prevent permanent WDT Deadlock on I2S stall
         i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, pdMS_TO_TICKS(20));
         
         if (bytesRead > 0) {
@@ -769,7 +781,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             
                             fbHpfState += 0.05f * (feedInput - fbHpfState) + DC_OFFSET; 
                             
-                            // BUG FIX #3: Added soft-clipping polynomial to gainDrive to stop aliasing harshness
                             float rawDrive = (feedInput - fbHpfState) * p_fb_drv;
                             float boundedDrive = fmaxf(-1.5f, fminf(rawDrive, 1.5f));
                             float gainDrive = boundedDrive * (1.0f - (0.15f * boundedDrive * boundedDrive));
@@ -886,26 +897,25 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     }
 }
 
-// Helper function to update parameters locally and via external MIDI
 void updateParameterFromCC(uint8_t cc, uint8_t val) {
     float norm = (float)val / 127.0f; 
     int pIdx = cc - 24; 
     
-    if (activeEffectMode == 0) { // WHAMMY
-        if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // HEEL (PAR 1)
-        if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // TOE  (PAR 2)
-        if (pIdx == 2) fxParams[0][0] = norm; // D.MIX (PAR 3)
-        if (pIdx == 3) fxParams[0][1] = norm; // W.MIX (PAR 4)
+    if (activeEffectMode == 0) { 
+        if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
+        if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
+        if (pIdx == 2) fxParams[0][0] = norm; 
+        if (pIdx == 3) fxParams[0][1] = norm; 
     } 
-    else if (activeEffectMode == 1) { // FREEZE
-        if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // HEEL (PAR 1)
-        if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // TOE  (PAR 2)
-        if (pIdx == 2) fxParams[1][0] = 0.0f + (norm * 0.95f);               // RVB (PAR 3)
-        if (pIdx == 3) fxParams[1][1] = 0.00001f + (norm * 0.001f);          // ATK (PAR 4)
-        if (pIdx == 4) fxParams[1][2] = 0.00001f + (norm * 0.0005f);         // REL (PAR 5)
+    else if (activeEffectMode == 1) { 
+        if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
+        if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
+        if (pIdx == 2) fxParams[1][0] = 0.0f + (norm * 0.95f);               
+        if (pIdx == 3) fxParams[1][1] = 0.00001f + (norm * 0.001f);          
+        if (pIdx == 4) fxParams[1][2] = 0.00001f + (norm * 0.0005f);         
     }
-    else if (activeEffectMode == 2) { // FEEDBACK
-        if (pIdx == 0) { // OVT (PAR 1)
+    else if (activeEffectMode == 2) { 
+        if (pIdx == 0) { 
             int newIdx = constrain((int)roundf(norm * 4.0f), 0, 4);
             if (newIdx != feedbackIntervalIdx) {
                 feedbackIntervalIdx = newIdx;
@@ -913,54 +923,54 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
                 forceUIUpdate = true;
             }
         }
-        if (pIdx == 1) fxParams[2][0] = 1000.0f + (norm * 10000.0f);         // SPD (PAR 2)
-        if (pIdx == 2) fxParams[2][1] = 1.0f + (norm * 100.0f);             // DRV (PAR 3)
-        if (pIdx == 3) fxParams[2][2] = 0.005f + (norm * 0.045f);            // DLY (PAR 4)
+        if (pIdx == 1) fxParams[2][0] = 1000.0f + (norm * 10000.0f);         
+        if (pIdx == 2) fxParams[2][1] = 1.0f + (norm * 100.0f);             
+        if (pIdx == 3) fxParams[2][2] = 0.005f + (norm * 0.045f);            
     }
-    else if (activeEffectMode == 3) { // HARMONY
-        if (pIdx == 0) { effectMemory[3] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // INT (PAR 1)
-        if (pIdx == 1) fxParams[3][0] = norm;                                // MIX (PAR 2)
+    else if (activeEffectMode == 3) { 
+        if (pIdx == 0) { effectMemory[3] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
+        if (pIdx == 1) fxParams[3][0] = norm;                                
     }
-    else if (activeEffectMode == 4) { // CAPO
-        if (pIdx == 0) { // PAR 1 -> SEMI
+    else if (activeEffectMode == 4) { 
+        if (pIdx == 0) { 
             int cents = (int)roundf((effectMemory[4] - (float)roundf(effectMemory[4])) * 100.0f); 
             effectMemory[4] = constrain(roundf((norm * 48.0f) - 24.0f) + ((float)cents / 100.0f), -24.0f, 24.0f);
             lutNeedsUpdate = true; forceUIUpdate = true; 
         }
-        if (pIdx == 1) { // PAR 2 -> CENT
+        if (pIdx == 1) { 
             int semi = (int)roundf(effectMemory[4]); 
             float c = roundf((norm * 100.0f) - 50.0f) / 100.0f; 
             effectMemory[4] = constrain((float)semi + c, -24.0f, 24.0f);
             lutNeedsUpdate = true; forceUIUpdate = true; 
         }
     }
-    else if (activeEffectMode == 5) { // SYNTH
-        if (pIdx == 0) { effectMemory[5] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // OSC (PAR 1)
-        if (pIdx == 1) fxParams[5][0] = 0.01f + (norm * 0.5f);               // ATK (PAR 2)
-        if (pIdx == 2) fxParams[5][1] = 0.001f + (norm * 0.05f);             // REL (PAR 3)
-        if (pIdx == 3) fxParams[5][2] = 0.1f + (norm * 0.8f);               // FLT (PAR 4)
-        if (pIdx == 4) fxParams[5][3] = norm;                                // MIX (PAR 5)
+    else if (activeEffectMode == 5) { 
+        if (pIdx == 0) { effectMemory[5] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
+        if (pIdx == 1) fxParams[5][0] = 0.01f + (norm * 0.5f);               
+        if (pIdx == 2) fxParams[5][1] = 0.001f + (norm * 0.05f);             
+        if (pIdx == 3) fxParams[5][2] = 0.1f + (norm * 0.8f);               
+        if (pIdx == 4) fxParams[5][3] = norm;                                
     }
-    else if (activeEffectMode == 6) { // PAD
-        if (pIdx == 0) { effectMemory[6] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // SHFT (PAR 1)
-        if (pIdx == 1) fxParams[6][0] = 0.8f + (norm * 0.199f);              // TON (PAR 2)
-        if (pIdx == 2) fxParams[6][1] = norm * 3.0f;                         // MIX (PAR 3)
+    else if (activeEffectMode == 6) { 
+        if (pIdx == 0) { effectMemory[6] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
+        if (pIdx == 1) fxParams[6][0] = 0.8f + (norm * 0.199f);              
+        if (pIdx == 2) fxParams[6][1] = norm * 3.0f;                         
     }
-    else if (activeEffectMode == 7) { // CHORUS
-        if (pIdx == 0) { effectMemory[7] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // SHFT (PAR 1)
-        if (pIdx == 1) fxParams[7][0] = 500.0f + (norm * 4500.0f);           // SPD (PAR 2)
-        if (pIdx == 2) fxParams[7][1] = norm;                                // MIX (PAR 3)
+    else if (activeEffectMode == 7) { 
+        if (pIdx == 0) { effectMemory[7] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
+        if (pIdx == 1) fxParams[7][0] = 500.0f + (norm * 4500.0f);           
+        if (pIdx == 2) fxParams[7][1] = norm;                                
     }
-    else if (activeEffectMode == 8) { // SWELL
-        if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // HEEL (PAR 1)
-        if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // TOE  (PAR 2)
-        if (pIdx == 2) fxParams[8][0] = 0.001f + (norm * 0.05f);             // THR (PAR 3)
-        if (pIdx == 3) fxParams[8][1] = 0.00001f + (norm * 0.0005f);        // ATK (PAR 4)
-        if (pIdx == 4) fxParams[8][2] = 0.00001f + (norm * 0.0005f);        // REL (PAR 5)
+    else if (activeEffectMode == 8) { 
+        if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
+        if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
+        if (pIdx == 2) fxParams[8][0] = 0.001f + (norm * 0.05f);             
+        if (pIdx == 3) fxParams[8][1] = 0.00001f + (norm * 0.0005f);        
+        if (pIdx == 4) fxParams[8][2] = 0.00001f + (norm * 0.0005f);        
     }
-    else if (activeEffectMode == 9) { // VIBRATO
-        if (pIdx == 0) { effectMemory[9] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // BASE (PAR 1)
-        if (pIdx == 1) fxParams[9][0] = norm * 2.0f;                         // DEP (PAR 2)
+    else if (activeEffectMode == 9) { 
+        if (pIdx == 0) { effectMemory[9] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
+        if (pIdx == 1) fxParams[9][0] = norm * 2.0f;                         
     }
     
     settingsNeedSaving = true; 
@@ -1284,9 +1294,17 @@ void setup() {
     isPB2WiperMode = preferences.getBool("pb2Wiper", false); 
     currentSampleRate = preferences.getUInt("sampleRate", 48000);
     feedbackIntervalIdx = preferences.getInt("fbIdx", 0); 
-    for(int i = 0; i < 10; i++) {
-        char key[8]; sprintf(key, "fxMem%d", i); effectMemory[i] = preferences.getFloat(key, effectMemory[i]); 
-        for (int p = 0; p < 5; p++) { char pKey[12]; sprintf(pKey, "fxP%d_%d", i, p); fxParams[i][p] = preferences.getFloat(pKey, fxParams[i][p]); }
+    
+    // BUG FIX #3: Load entirely from optimized memory struct
+    AppSettings savedSettings;
+    size_t len = preferences.getBytes("dspData", &savedSettings, sizeof(AppSettings));
+    if (len == sizeof(AppSettings)) {
+        for(int i = 0; i < 10; i++) {
+            effectMemory[i] = savedSettings.fxMem[i]; 
+            for (int p = 0; p < 5; p++) { 
+                fxParams[i][p] = savedSettings.params[i][p]; 
+            }
+        }
     }
     preferences.end();
 

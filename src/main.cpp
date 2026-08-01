@@ -20,8 +20,7 @@ Preferences preferences;
 volatile bool settingsNeedSaving = false;
 unsigned long lastParameterChangeTime = 0;
 
-// --- DYNAMIC FX PARAMETERS MATRIX (Replaces Hardcoded DSP Values) ---
-// Structure: fxParams[EffectMode][ParameterIndex (0-4)]
+// --- DYNAMIC FX PARAMETERS MATRIX ---
 volatile float fxParams[10][5] = {
     {0.0f, 1.0f, 0.0f, 0.0f, 0.0f},            // 0: Whammy (Dry Mix, Wet Mix)
     {0.6f, 0.0002f, 0.00005f, 0.0f, 0.0f},     // 1: Freeze (APF Coeff, Attack, Release)
@@ -35,30 +34,20 @@ volatile float fxParams[10][5] = {
     {1.0f, 0.0f, 0.0f, 0.0f, 0.0f}             // 9: Vibrato (Depth Scalar)
 };
 
-// --- PEDAL CONFIGURATION ---
 const bool INVERT_PB3 = false; 
 
-// --- BARE-METAL PRE-BOOT ASSASSIN ---
 void __attribute__((constructor)) pre_boot_kill_switch() {
-    gpio_set_direction(GPIO_NUM_38, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NUM_38, 0); 
-    
-    gpio_set_direction(GPIO_NUM_15, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NUM_15, 0);
-    
-    gpio_set_direction(GPIO_NUM_5, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NUM_5, 0);
+    gpio_set_direction(GPIO_NUM_38, GPIO_MODE_OUTPUT); gpio_set_level(GPIO_NUM_38, 0); 
+    gpio_set_direction(GPIO_NUM_15, GPIO_MODE_OUTPUT); gpio_set_level(GPIO_NUM_15, 0);
+    gpio_set_direction(GPIO_NUM_5, GPIO_MODE_OUTPUT); gpio_set_level(GPIO_NUM_5, 0);
 }
 
-/// --- GLOBALS & I2S HANDLES ---
 i2s_chan_handle_t tx_chan;
 i2s_chan_handle_t rx_chan;
 SemaphoreHandle_t audioBufferMutex = NULL;
 
 volatile uint32_t currentSampleRate = 48000; 
 #define HOP_SIZE 64            
-
-// --- TIME-DOMAIN DSP BUFFERS ---
 #define MAX_BUFFER_SIZE 65536
 #define BUFFER_MASK 0xFFFF 
 #define FB_BUFFER_SIZE 8192
@@ -71,25 +60,18 @@ float* freezeBuffer = nullptr;
 float* pitchShiftLUT = nullptr; 
 float* pitchShiftLUT_temp = nullptr; 
 
-int writeIndex = 0;
-int fbDelayWriteIdx = 0;
+int writeIndex = 0; int fbDelayWriteIdx = 0;
 
-// --- DSP LOOK-UP TABLES ---
 #define HANN_LUT_SIZE 1024
 #define LFO_LUT_SIZE 1024
 #define WAVE_LUT_SIZE 2048
-
 DRAM_ATTR float hannLUT[HANN_LUT_SIZE];
 DRAM_ATTR float lfoLUT[LFO_LUT_SIZE];
 DRAM_ATTR float synthLUT[WAVE_LUT_SIZE];
 
-// --- DSP PRE-CALCULATED RATIOS ---
-volatile float globalHarmRatio = 1.0f;
-volatile float globalChorusRatio = 1.0f;
-volatile float globalFbRatio = 1.0f;
-volatile float globalVibratoPhaseInc = 0.0f;
+volatile float globalHarmRatio = 1.0f; volatile float globalChorusRatio = 1.0f;
+volatile float globalFbRatio = 1.0f; volatile float globalVibratoPhaseInc = 0.0f;
 
-// --- DEDICATED INDEPENDENT TAP STATES ---
 uint32_t tap_w1_1 = 0; uint32_t tap_w1_2 = 256 << 16; 
 uint32_t tap_w2_1 = 0; uint32_t tap_w2_2 = 256 << 16; 
 uint32_t tap_w3_1 = 0; uint32_t tap_w3_2 = 256 << 16; 
@@ -97,11 +79,8 @@ uint32_t tap_w4_1 = 0; uint32_t tap_w4_2 = 256 << 16;
 uint32_t tap_w5_1 = 0; uint32_t tap_w5_2 = 256 << 16; 
 float currentWindowSize = 512.0f; 
 
-// --- FREEZE STATE & ALL-PASS FILTERS ---
-int freezeLength = 48000; 
-bool wasFrozen = false;
-volatile bool apfNeedsClear = false;
-volatile float freezeRamp = 0.0f;
+int freezeLength = 48000; bool wasFrozen = false;
+volatile bool apfNeedsClear = false; volatile float freezeRamp = 0.0f;
 float apf1Buffer[1009] = { 0.0f }; int apf1Idx = 0;
 float apf2Buffer[863] = { 0.0f };  int apf2Idx = 0;
 
@@ -111,275 +90,154 @@ volatile uint16_t lastActivePedal = 8192;
 void updateLUT();
 TaskHandle_t audioTaskHandle = NULL; 
 
-// --- TFT DISPLAY ---
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite spr = TFT_eSprite(&tft); 
 TFT_eSprite meterSpr = TFT_eSprite(&tft); 
 volatile bool forceUIUpdate = true; 
 
-// --- EFFECT STATE ---
 volatile int activeEffectMode = 0; 
-volatile float effectMemory[10] = { 12.0f, 12.0f, 12.0f, 5.0f, -2.0f, -12.0f, -12.0f, 12.0f, 0.0f, 0.0f };
+// 0: TOE(+12), 1: HEEL(-12), 2: unused, 3: Harmony(+5), 4: Capo(-2), 5: Synth(-12), 6: Pad(-12), 7: Chorus(+12), 8: Swell unused, 9: Vibrato(0)
+volatile float effectMemory[10] = { 12.0f, -12.0f, 0.0f, 5.0f, -2.0f, -12.0f, -12.0f, 12.0f, 0.0f, 0.0f };
 volatile float pitchShiftFactor = 1.0f;
 
-volatile bool isWhammyActive = true;  
-volatile bool isFrozen = false;
-volatile bool isFeedbackActive = false;
-volatile bool isHarmonizerMode = false;
-volatile bool isSynthMode = false;
-volatile bool isPadMode = false;
-volatile bool isCapoMode = false; 
-volatile bool isChorusMode = false; 
-volatile bool isSwellMode = false; 
-volatile bool isVibratoMode = false; 
-volatile bool isVolumeMode = false; 
-volatile bool isPB2LinearMode = false; 
+volatile bool isWhammyActive = true;  volatile bool isFrozen = false; volatile bool isFeedbackActive = false;
+volatile bool isHarmonizerMode = false; volatile bool isSynthMode = false; volatile bool isPadMode = false;
+volatile bool isCapoMode = false; volatile bool isChorusMode = false; volatile bool isSwellMode = false; 
+volatile bool isVibratoMode = false; volatile bool isVolumeMode = false; volatile bool isPB2LinearMode = false; 
 
-volatile float chorusLfoPhase = 0.0f;
-volatile float feedbackLfoPhase = 0.0f;
-volatile float vibratoLfoPhase = 0.0f;
-volatile float swellGain = 0.0f; 
-volatile float volumePedalGain = 1.0f; 
+volatile float chorusLfoPhase = 0.0f; volatile float feedbackLfoPhase = 0.0f; volatile float vibratoLfoPhase = 0.0f;
+volatile float swellGain = 0.0f; volatile float volumePedalGain = 1.0f; 
+volatile float feedbackRamp = 0.0f; float fbHpfState = 0.0f; float feedbackFilter = 0.0f;
+volatile int latencyMode = 0; const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 
-volatile float feedbackRamp = 0.0f;
-float fbHpfState = 0.0f;
-float feedbackFilter = 0.0f;
-volatile int latencyMode = 0; 
-const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
+volatile bool globalAudioResetRequested = false; volatile bool clearBuffersRequested = false; volatile int hardwareSyncMuteFrames = 0; 
 
-// --- GLOBAL BUFFER WIPE FLAG ---
-volatile bool globalAudioResetRequested = false;
-volatile bool clearBuffersRequested = false;
-volatile int hardwareSyncMuteFrames = 0; 
+unsigned long lastActivityTime = 0; unsigned long lastScreenActivityTime = 0;
+const unsigned long LIGHT_SLEEP_TIMEOUT = 600000; const unsigned long SCREEN_OFF_TIMEOUT = 1200000;  
+bool isScreenOff = false; volatile bool wakeupPending = false; volatile float core1_load = 0.0f; 
+volatile bool sleepRequested = false; volatile bool isSleeping = false;
+const int BATTERY_PIN = 4; volatile int currentBatteryPercent = 100; volatile bool isBatteryCharging = false;
 
-// --- POWER SAVING, BATTERY & UI GLOBALS ---
-unsigned long lastActivityTime = 0;       
-unsigned long lastScreenActivityTime = 0;
-const unsigned long LIGHT_SLEEP_TIMEOUT = 600000;
-const unsigned long SCREEN_OFF_TIMEOUT = 1200000;  
-bool isScreenOff = false;
-volatile bool wakeupPending = false; 
-volatile float core1_load = 0.0f; 
+pin_t pinPB = 1; pin_t pinPB2 = 2; pin_t pinPB3 = 10;    
+const int BOOT_SENSE_PIN = 0; const int CAROUSEL_BUTTON_PIN = 21; 
 
-volatile bool sleepRequested = false;
-volatile bool isSleeping = false;
-const int BATTERY_PIN = 4;
-volatile int currentBatteryPercent = 100;
-volatile bool isBatteryCharging = false;
+pin_t pinPar1 = 3; pin_t pinPar2 = 11; pin_t pinPar3 = 12; pin_t pinPar4 = 13; pin_t pinPar5 = 14; 
 
-// --- HARDWARE PIN ASSIGNMENTS ---
-pin_t pinPB = 1;     
-pin_t pinPB2 = 2;
-pin_t pinPB3 = 10;    
-const int BOOT_SENSE_PIN = 0; 
-const int CAROUSEL_BUTTON_PIN = 21; // Swapped to GPIO 21
+uint16_t lastMidiSent = 8192; volatile uint16_t currentPB1 = 8192; volatile uint16_t currentPB2 = 8192;
+volatile uint16_t currentPB3 = 8192; volatile uint16_t currentCC11 = 0;
+volatile float ui_audio_level = 0.0f; volatile float ui_output_level = 0.0f;
 
-// 5 Analog Knobs (ADC)
-pin_t pinPar1 = 3;
-pin_t pinPar2 = 11;
-pin_t pinPar3 = 12;
-pin_t pinPar4 = 13;
-pin_t pinPar5 = 14; 
-
-uint16_t lastMidiSent = 8192;
-volatile uint16_t currentPB1 = 8192;
-volatile uint16_t currentPB2 = 8192;
-volatile uint16_t currentPB3 = 8192;
-volatile uint16_t currentCC11 = 0;
-volatile float ui_audio_level = 0.0f; 
-volatile float ui_output_level = 0.0f;
-
-// --- CONTINUOUS AUTO-CALIBRATION BOUNDS ---
 uint16_t PB1_raw_min = 1000; uint16_t PB1_raw_max = 3000; uint16_t PB1_raw_center = 2048;
 uint16_t PB2_raw_min = 1000; uint16_t PB2_raw_max = 3000; uint16_t PB2_raw_center = 2048;
-uint16_t PB3_raw_min = 1000; uint16_t PB3_raw_max = 3000;
-int deadzone_size = 400; 
+uint16_t PB3_raw_min = 1000; uint16_t PB3_raw_max = 3000; int deadzone_size = 400; 
 
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB = pinPB;
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB3 = pinPB3;
 
-// New ADCs for Parameters
 FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar1 = pinPar1;
 FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar2 = pinPar2;
 FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar3 = pinPar3;
 FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar4 = pinPar4;
 FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar5 = pinPar5;
 
-BluetoothMIDI_Interface btmidi;
-USBMIDI_Interface usbmidi;
-MIDI_PipeFactory<4> pipes;
+BluetoothMIDI_Interface btmidi; USBMIDI_Interface usbmidi; MIDI_PipeFactory<4> pipes;
 
-// --- FLASH MEMORY SAVER FUNCTION ---
 void saveSettings() {
     preferences.begin("whammy_cfg", false); 
-    preferences.putInt("activeMode", activeEffectMode);
-    preferences.putInt("latMode", latencyMode);
-    preferences.putBool("pb2Linear", isPB2LinearMode);
-    preferences.putUInt("sampleRate", currentSampleRate);
+    preferences.putInt("activeMode", activeEffectMode); preferences.putInt("latMode", latencyMode);
+    preferences.putBool("pb2Linear", isPB2LinearMode); preferences.putUInt("sampleRate", currentSampleRate);
     for(int i = 0; i < 10; i++) {
-        char key[8];
-        sprintf(key, "fxMem%d", i);
-        preferences.putFloat(key, effectMemory[i]);
-        
-        for (int p = 0; p < 5; p++) {
-            char pKey[12];
-            sprintf(pKey, "fxP%d_%d", i, p);
-            preferences.putFloat(pKey, fxParams[i][p]);
-        }
+        char key[8]; sprintf(key, "fxMem%d", i); preferences.putFloat(key, effectMemory[i]);
+        for (int p = 0; p < 5; p++) { char pKey[12]; sprintf(pKey, "fxP%d_%d", i, p); preferences.putFloat(pKey, fxParams[i][p]); }
     }
     preferences.end();
 }
 
 int getBatteryPercentage(float voltage) {
-    if (voltage >= 4.15f) return 100;
-    if (voltage >= 4.00f) return 90;
-    if (voltage >= 3.90f) return 80;
-    if (voltage >= 3.80f) return 70;
-    if (voltage >= 3.75f) return 60;
-    if (voltage >= 3.70f) return 50;
-    if (voltage >= 3.65f) return 40;
-    if (voltage >= 3.60f) return 30;
-    if (voltage >= 3.55f) return 20;
-    if (voltage >= 3.50f) return 10;
-    if (voltage <= 3.30f) return 0;
+    if (voltage >= 4.15f) return 100; if (voltage >= 4.00f) return 90; if (voltage >= 3.90f) return 80;
+    if (voltage >= 3.80f) return 70; if (voltage >= 3.75f) return 60; if (voltage >= 3.70f) return 50;
+    if (voltage >= 3.65f) return 40; if (voltage >= 3.60f) return 30; if (voltage >= 3.55f) return 20;
+    if (voltage >= 3.50f) return 10; if (voltage <= 3.30f) return 0;
     return (int)((voltage - 3.3f) / (4.15f - 3.3f) * 100.0f);
 }
 
 analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
-    int outerDeadzone = 350; 
-    int deadLower = center - dZone;
-    int deadUpper = center + dZone;
-    int effMin = rMin + outerDeadzone;
-    int effMax = rMax - outerDeadzone;
-    
-    if (effMin >= deadLower) effMin = rMin + 50; 
-    if (effMax <= deadUpper) effMax = rMax - 50;
-    if (raw <= effMin) return 0;
-    if (raw >= effMax) return 16383;
-    if (raw >= deadLower && raw <= deadUpper) return 8192;
-    
+    int outerDeadzone = 350; int deadLower = center - dZone; int deadUpper = center + dZone;
+    int effMin = rMin + outerDeadzone; int effMax = rMax - outerDeadzone;
+    if (effMin >= deadLower) effMin = rMin + 50; if (effMax <= deadUpper) effMax = rMax - 50;
+    if (raw <= effMin) return 0; if (raw >= effMax) return 16383; if (raw >= deadLower && raw <= deadUpper) return 8192;
     long mappedValue;
-    if (raw < deadLower) { mappedValue = map(raw, effMin, deadLower, 0, 8191); } 
-    else { mappedValue = map(raw, deadUpper, effMax, 8193, 16383); }
+    if (raw < deadLower) { mappedValue = map(raw, effMin, deadLower, 0, 8191); } else { mappedValue = map(raw, deadUpper, effMax, 8193, 16383); }
     return constrain(mappedValue, 0, 16383);
 }
 
 analog_t map_raw_expression(int raw, uint16_t rMin, uint16_t rMax, bool invert) {
-    int heelLockZone = 350; int toeLockZone = 300;   
-    int lowerLimit, upperLimit;
-
+    int heelLockZone = 350; int toeLockZone = 300; int lowerLimit, upperLimit;
     if (!invert) {
         lowerLimit = rMin + heelLockZone; upperLimit = rMax - toeLockZone;
         if (lowerLimit >= upperLimit) { lowerLimit = rMin; upperLimit = rMax; }
-        if (raw <= lowerLimit) return 0; 
-        if (raw >= upperLimit) return 16383; 
-        return map(raw, lowerLimit, upperLimit, 0, 16383);
+        if (raw <= lowerLimit) return 0; if (raw >= upperLimit) return 16383; return map(raw, lowerLimit, upperLimit, 0, 16383);
     } else {
         lowerLimit = rMin + toeLockZone; upperLimit = rMax - heelLockZone;
         if (lowerLimit >= upperLimit) { lowerLimit = rMin; upperLimit = rMax; }
-        if (raw <= lowerLimit) return 16383; 
-        if (raw >= upperLimit) return 0; 
-        return map(raw, lowerLimit, upperLimit, 16383, 0);
+        if (raw <= lowerLimit) return 16383; if (raw >= upperLimit) return 0; return map(raw, lowerLimit, upperLimit, 16383, 0);
     }
 }
 
 void calibratePBs() {
-    for (int i = 0; i < 50; i++) { 
-        filterPB.update(); filterPB2.update(); filterPB3.update(); 
-        delay(1); 
-    }
+    for (int i = 0; i < 50; i++) { filterPB.update(); filterPB2.update(); filterPB3.update(); delay(1); }
     long sum1 = 0; long sum2 = 0;
-    for (int i = 1; i <= 250; i++) {
-        filterPB.update(); filterPB2.update(); filterPB3.update();
-        sum1 += filterPB.getValue(); sum2 += filterPB2.getValue();
-        delay(1);
-    }
+    for (int i = 1; i <= 250; i++) { filterPB.update(); filterPB2.update(); filterPB3.update(); sum1 += filterPB.getValue(); sum2 += filterPB2.getValue(); delay(1); }
     PB1_raw_center = sum1 / 250; PB2_raw_center = sum2 / 250;
-    
-    if (PB1_raw_center > 4000 || PB1_raw_center < 100) PB1_raw_center = 2048;
-    if (PB2_raw_center > 4000 || PB2_raw_center < 100) PB2_raw_center = 2048;
-    
-    PB1_raw_min = PB1_raw_center - 200; PB1_raw_max = PB1_raw_center + 200;
-    PB2_raw_min = PB2_raw_center - 200; PB2_raw_max = PB2_raw_center + 200;
+    if (PB1_raw_center > 4000 || PB1_raw_center < 100) PB1_raw_center = 2048; if (PB2_raw_center > 4000 || PB2_raw_center < 100) PB2_raw_center = 2048;
+    PB1_raw_min = PB1_raw_center - 200; PB1_raw_max = PB1_raw_center + 200; PB2_raw_min = PB2_raw_center - 200; PB2_raw_max = PB2_raw_center + 200;
     PB3_raw_min = 1000; PB3_raw_max = 3000; 
 }
 
 void toggleSampleRate() {
-    sleepRequested = true; globalAudioResetRequested = true; 
-    int timeoutCounter = 0;
+    sleepRequested = true; globalAudioResetRequested = true; int timeoutCounter = 0;
     while (!isSleeping && timeoutCounter < 40) { vTaskDelay(pdMS_TO_TICKS(5)); timeoutCounter++; }
-    
-    i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    
+    i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); vTaskDelay(pdMS_TO_TICKS(10));
     if (currentSampleRate == 96000) currentSampleRate = 48000; else currentSampleRate = 96000;
-    
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate);
-    i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
-    i2s_channel_reconfig_std_clock(rx_chan, &clk_cfg);
-    
+    i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg); i2s_channel_reconfig_std_clock(rx_chan, &clk_cfg);
     freezeLength = currentSampleRate; lutNeedsUpdate = true;
-    i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan);
-    hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
-    
-    sleepRequested = false; forceUIUpdate = true;
-    settingsNeedSaving = true; lastParameterChangeTime = millis();
+    i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
+    sleepRequested = false; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
 }
 
-void turnScreenOff() { 
-    if (!isScreenOff) { digitalWrite(38, LOW); digitalWrite(15, LOW); isScreenOff = true; } 
-}
-void turnScreenOn() { 
-    if (isScreenOff && !wakeupPending) wakeupPending = true; 
-}
+void turnScreenOff() { if (!isScreenOff) { digitalWrite(38, LOW); digitalWrite(15, LOW); isScreenOff = true; } }
+void turnScreenOn() { if (isScreenOff && !wakeupPending) wakeupPending = true; }
 
 void goToLightSleep() {
-    turnScreenOff(); sleepRequested = true; 
-    int timeoutCounter = 0;
+    turnScreenOff(); sleepRequested = true; int timeoutCounter = 0;
     while (!isSleeping && timeoutCounter < 10) { vTaskDelay(pdMS_TO_TICKS(10)); timeoutCounter++; }
-    
-    i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan);      
-    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
-    
-    rtc_gpio_init(GPIO_NUM_21); 
-    rtc_gpio_set_direction(GPIO_NUM_21, RTC_GPIO_MODE_INPUT_ONLY);
-    rtc_gpio_pullup_en(GPIO_NUM_21); 
+    i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    rtc_gpio_init(GPIO_NUM_21); rtc_gpio_set_direction(GPIO_NUM_21, RTC_GPIO_MODE_INPUT_ONLY); rtc_gpio_pullup_en(GPIO_NUM_21); 
     esp_sleep_enable_ext1_wakeup(1ULL << 21, ESP_EXT1_WAKEUP_ANY_LOW);
-    
     delay(50); esp_light_sleep_start();
     rtc_gpio_deinit(GPIO_NUM_21); pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP);
-    
-    i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan);
-    sleepRequested = false; timeoutCounter = 0;
+    i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); sleepRequested = false; timeoutCounter = 0;
     while (isSleeping && timeoutCounter < 10) { vTaskDelay(pdMS_TO_TICKS(10)); timeoutCounter++; }
     vTaskDelay(pdMS_TO_TICKS(200)); turnScreenOn(); 
 }
 
 inline float IRAM_ATTR processTap(uint32_t tapPhase, const float* buffer, int currentWriteIdx, uint32_t windowMask, uint32_t hannIntMult) {
-    int T = (tapPhase >> 16) & windowMask;
-    float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
+    int T = (tapPhase >> 16) & windowMask; float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
     int effTap = T + 2; 
-    int idx1 = (currentWriteIdx - effTap + MAX_BUFFER_SIZE) & BUFFER_MASK;
-    int idx0 = (idx1 + 1) & BUFFER_MASK; 
-    int idx2 = (idx1 - 1 + MAX_BUFFER_SIZE) & BUFFER_MASK; 
-    int idx3 = (idx1 - 2 + MAX_BUFFER_SIZE) & BUFFER_MASK;
-    
+    int idx1 = (currentWriteIdx - effTap + MAX_BUFFER_SIZE) & BUFFER_MASK; int idx0 = (idx1 + 1) & BUFFER_MASK; 
+    int idx2 = (idx1 - 1 + MAX_BUFFER_SIZE) & BUFFER_MASK; int idx3 = (idx1 - 2 + MAX_BUFFER_SIZE) & BUFFER_MASK;
     float y0 = buffer[idx0]; float y1 = buffer[idx1]; float y2 = buffer[idx2]; float y3 = buffer[idx3];
-    float c0 = y1; 
-    float c1 = 0.5f * (y2 - y0); 
-    float c3 = 1.5f * (y1 - y2) + 0.5f * (y3 - y0); 
-    float c2 = y0 - y1 + c1 - c3;
-    float sample = ((c3 * frac + c2) * frac + c1) * frac + c0;
-    int lutIdx = (T * hannIntMult) >> 16;
+    float c0 = y1; float c1 = 0.5f * (y2 - y0); float c3 = 1.5f * (y1 - y2) + 0.5f * (y3 - y0); float c2 = y0 - y1 + c1 - c3;
+    float sample = ((c3 * frac + c2) * frac + c1) * frac + c0; int lutIdx = (T * hannIntMult) >> 16;
     return sample * hannLUT[lutIdx];
 }
 
 void updateLUT() {
-    float basePitch = 0.0f; 
-    if (isCapoMode || (activeEffectMode == 4 && isWhammyActive)) basePitch += effectMemory[4]; 
-    float toeBend = effectMemory[0]; float heelBend = effectMemory[5];
-    
+    float basePitch = 0.0f; if (isCapoMode || (activeEffectMode == 4 && isWhammyActive)) basePitch += effectMemory[4]; 
+    float toeBend = effectMemory[0]; 
+    float heelBend = effectMemory[1]; // HEEL is stored at effectMemory[1]
     for (int i = 0; i < 16384; i++) {
         float normalizedThrow = (i >= 8192) ? ((float)(i - 8192) / 8191.0f) : ((float)(i - 8192) / 8192.0f);
         float dynamicBend = (normalizedThrow >= 0.0f) ? (toeBend * normalizedThrow) : (heelBend * fabsf(normalizedThrow));
@@ -387,132 +245,207 @@ void updateLUT() {
         if (i % 2048 == 0) { vTaskDelay(pdMS_TO_TICKS(1)); }
     }
     memcpy(pitchShiftLUT, pitchShiftLUT_temp, 16384 * sizeof(float));
-    globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f);
-    globalChorusRatio = powf(2.0f, effectMemory[8] / 12.0f);
+    globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f); 
+    globalChorusRatio = powf(2.0f, effectMemory[7] / 12.0f); // Fixed: Mode 7 is Chorus
     float fbIntervals[5] = {0.0f, 12.0f, 19.0f, 24.0f, 28.0f}; 
     globalFbRatio = powf(2.0f, fbIntervals[feedbackIntervalIdx % 5] / 12.0f);
-    float vibHz = (effectMemory[9] != 0.0f) ? fabsf(effectMemory[9]) : 2.0f;
+    float vibHz = (effectMemory[9] != 0.0f) ? fabsf(effectMemory[9]) : 2.0f; 
     globalVibratoPhaseInc = (vibHz * LFO_LUT_SIZE) / (float)currentSampleRate;
 }
 
 void updateMeters() {
     int barHeight = 98;
     int inFillHeight = constrain((int)(ui_audio_level * barHeight), 0, barHeight); 
-    meterSpr.fillSprite(TFT_BLACK); 
-    meterSpr.fillRect(0, barHeight - inFillHeight, 6, inFillHeight, (ui_audio_level > 0.90f) ? TFT_RED : TFT_GREEN); 
-    meterSpr.pushSprite(11, 31);
-    
+    meterSpr.fillSprite(TFT_BLACK); meterSpr.fillRect(0, barHeight - inFillHeight, 6, inFillHeight, (ui_audio_level > 0.90f) ? TFT_RED : TFT_GREEN); meterSpr.pushSprite(11, 31);
     int outFillHeight = constrain((int)(ui_output_level * barHeight), 0, barHeight); 
-    meterSpr.fillSprite(TFT_BLACK); 
-    meterSpr.fillRect(0, barHeight - outFillHeight, 6, outFillHeight, (ui_output_level > 0.90f) ? TFT_RED : TFT_GREEN); 
-    meterSpr.pushSprite(spr.width() - 17, 31);
+    meterSpr.fillSprite(TFT_BLACK); meterSpr.fillRect(0, barHeight - outFillHeight, 6, outFillHeight, (ui_output_level > 0.90f) ? TFT_RED : TFT_GREEN); meterSpr.pushSprite(spr.width() - 17, 31);
 }
+
+// --- UI HELPER: CIRCULAR GAUGES ---
+// type: 0 = Unipolar L-to-R, 1 = Bipolar Center-Out, 2 = Unipolar R-to-L
+void drawCircularGauge(TFT_eSprite& sprite, int x, int y, int radius, float value, const char* label, const char* valStr, uint32_t color, int type) {
+    int thickness = 3;
+    sprite.drawArc(x, y, radius, radius - thickness, 210, 150, TFT_DARKGREY, TFT_BLACK, true);
+    
+    if (type == 1) { // Bipolar (Center-Out)
+        float clamped = fmaxf(-1.0f, fminf(1.0f, value));
+        int sweep = (int)(clamped * 150.0f);
+        if (sweep > 0) sprite.drawArc(x, y, radius, radius - thickness, 0, sweep, color, TFT_BLACK, true);
+        else if (sweep < 0) sprite.drawArc(x, y, radius, radius - thickness, 360 + sweep, 360, color, TFT_BLACK, true);
+    } else if (type == 2) { // Unipolar Right-to-Left
+        float clamped = fmaxf(0.0f, fminf(1.0f, value));
+        int sweep = (int)(clamped * 300.0f);
+        if (sweep > 0) {
+            int startAngle = (150 - sweep + 360) % 360;
+            sprite.drawArc(x, y, radius, radius - thickness, startAngle, 150, color, TFT_BLACK, true);
+        }
+    } else { // 0: Unipolar Left-to-Right
+        float clamped = fmaxf(0.0f, fminf(1.0f, value));
+        int sweep = (int)(clamped * 300.0f);
+        if (sweep > 0) {
+            int endAngle = (210 + sweep) % 360;
+            sprite.drawArc(x, y, radius, radius - thickness, 210, endAngle, color, TFT_BLACK, true);
+        }
+    }
+    sprite.setTextDatum(MC_DATUM); sprite.setTextColor(TFT_WHITE, TFT_BLACK); sprite.setTextSize(1);
+    sprite.drawString(valStr, x, y - 4);
+    sprite.setTextColor(TFT_LIGHTGREY, TFT_BLACK); sprite.drawString(label, x, y + 14);
+}
+
+struct GaugeDef {
+    int type; // 0=LtoR, 1=Bipolar, 2=RtoL
+    float normVal;
+    const char* label;
+    char valStr[16];
+};
 
 void updateDisplay() {
     spr.fillSprite(TFT_BLACK); 
+    
+    // --- TOP STATUS BAR ---
     char batStr[16];
     if (isBatteryCharging) { sprintf(batStr, "CHG %d%%", currentBatteryPercent); spr.setTextColor(TFT_GREEN, TFT_BLACK); } 
     else { sprintf(batStr, "BAT %d%%", currentBatteryPercent); spr.setTextColor((currentBatteryPercent > 20) ? TFT_GREEN : TFT_RED, TFT_BLACK); }
-    spr.setTextDatum(TL_DATUM); spr.drawString(batStr, 5, 5); 
+    spr.setTextDatum(TL_DATUM); spr.setTextSize(1); spr.drawString(batStr, 5, 2); 
 
-    spr.setTextDatum(MC_DATUM); spr.setTextSize(1);
-    if (btmidi.isConnected()) { spr.setTextColor(TFT_GREEN, TFT_BLACK); spr.drawString("BT: Connected", spr.width() / 2, 10); } 
-    else { spr.setTextColor(TFT_YELLOW, TFT_BLACK); spr.drawString("BT: Waiting", spr.width() / 2, 10); }
+    spr.setTextDatum(TR_DATUM); 
+    if (btmidi.isConnected()) { spr.setTextColor(TFT_GREEN, TFT_BLACK); spr.drawString("BT: CONN", 315, 2); } 
+    else { spr.setTextColor(TFT_YELLOW, TFT_BLACK); spr.drawString("BT: WAIT", 315, 2); }
 
-    spr.drawRect(10, 30, 8, 100, TFT_DARKGREY); spr.setTextColor(TFT_WHITE, TFT_BLACK); spr.drawString("IN", 14, 140);
-    spr.drawRect(spr.width() - 18, 30, 8, 100, TFT_DARKGREY); spr.drawString("OUT", spr.width() - 14, 140);
-
-    bool effectIsActive = false;
-    if (activeEffectMode == 0) effectIsActive = isWhammyActive;
-    else if (activeEffectMode == 1) effectIsActive = (isWhammyActive || isFrozen);
-    else if (activeEffectMode == 2) effectIsActive = (isWhammyActive || isFeedbackActive);
-    else if (activeEffectMode == 3) effectIsActive = (isWhammyActive || isHarmonizerMode);
-    else if (activeEffectMode == 4) effectIsActive = (isWhammyActive || isCapoMode);
-    else if (activeEffectMode == 5) effectIsActive = (isWhammyActive || isSynthMode);
-    else if (activeEffectMode == 6) effectIsActive = (isWhammyActive || isPadMode);
-    else if (activeEffectMode == 7) effectIsActive = (isWhammyActive || isChorusMode);
-    else if (activeEffectMode == 8) effectIsActive = (isWhammyActive || isSwellMode);
-    else if (activeEffectMode == 9) effectIsActive = (isWhammyActive || isVibratoMode);
-    
-    spr.fillCircle(spr.width() - 12, 12, 6, effectIsActive ? TFT_GREEN : TFT_RED); 
-    spr.drawCircle(spr.width() - 12, 12, 6, TFT_WHITE);
-
-    spr.setTextSize(3); 
-    int titleXPosition = 215;
     const char* effectTitleNames[] = {"WHAMMY", "FREEZE", "FEEDBACK", "HARMONY", "CAPO", "SYNTH", "PAD", "CHORUS", "SWELL", "VIBRATO"};
     uint32_t effectTitleColors[] = {TFT_ORANGE, TFT_CYAN, TFT_RED, TFT_MAGENTA, TFT_GREEN, TFT_YELLOW, TFT_PINK, TFT_SKYBLUE, TFT_WHITE, TFT_PURPLE};
-    spr.setTextColor(effectTitleColors[activeEffectMode], TFT_BLACK); 
-    spr.drawString(effectTitleNames[activeEffectMode], titleXPosition, 30);
+    spr.setTextDatum(MC_DATUM); spr.setTextSize(2); spr.setTextColor(effectTitleColors[activeEffectMode], TFT_BLACK); 
+    spr.drawString(effectTitleNames[activeEffectMode], 160, 15);
+    
+    bool effectIsActive = false;
+    if (activeEffectMode == 0) effectIsActive = isWhammyActive; else if (activeEffectMode == 1) effectIsActive = (isWhammyActive || isFrozen);
+    else if (activeEffectMode == 2) effectIsActive = (isWhammyActive || isFeedbackActive); else if (activeEffectMode == 3) effectIsActive = (isWhammyActive || isHarmonizerMode);
+    else if (activeEffectMode == 4) effectIsActive = (isWhammyActive || isCapoMode); else if (activeEffectMode == 5) effectIsActive = (isWhammyActive || isSynthMode);
+    else if (activeEffectMode == 6) effectIsActive = (isWhammyActive || isPadMode); else if (activeEffectMode == 7) effectIsActive = (isWhammyActive || isChorusMode);
+    else if (activeEffectMode == 8) effectIsActive = (isWhammyActive || isSwellMode); else if (activeEffectMode == 9) effectIsActive = (isWhammyActive || isVibratoMode);
+    spr.fillCircle(240, 15, 6, effectIsActive ? TFT_GREEN : TFT_RED); spr.drawCircle(240, 15, 6, TFT_WHITE);
 
-    spr.setTextColor(TFT_WHITE);
+    // --- METER BORDERS ---
+    spr.drawRect(10, 30, 8, 100, TFT_DARKGREY); spr.setTextColor(TFT_WHITE, TFT_BLACK); spr.setTextSize(1); spr.drawString("IN", 14, 140);
+    spr.drawRect(spr.width() - 18, 30, 8, 100, TFT_DARKGREY); spr.drawString("OUT", spr.width() - 14, 140);
+
+    // --- TOP GAUGES (Hardware PB & CC11) ---
+    int topY = 55; int topR = 17; char valBuf[16];
+    
+    float pb1Val = (currentPB1 - 8192) / 8192.0f; sprintf(valBuf, "%d%%", (int)(pb1Val * 100));
+    drawCircularGauge(spr, 65, topY, topR, pb1Val, "PB1", valBuf, TFT_CYAN, 1);
+
+    float pb2Val = (currentPB2 - 8192) / 8192.0f; sprintf(valBuf, "%d%%", (int)(pb2Val * 100));
+    drawCircularGauge(spr, 125, topY, topR, pb2Val, isPB2LinearMode ? "PB2 W" : "PB2 H", valBuf, TFT_MAGENTA, 1);
+
+    float pb3Val = currentPB3 / 16383.0f; sprintf(valBuf, "%d%%", (int)(pb3Val * 100));
+    drawCircularGauge(spr, 185, topY, topR, pb3Val, isVolumeMode ? "VOL" : "PB3", valBuf, TFT_YELLOW, 0);
+
+    float cc11Val = currentCC11 / 16383.0f; sprintf(valBuf, "%d%%", (int)(cc11Val * 100));
+    drawCircularGauge(spr, 245, topY, topR, cc11Val, "CC11", valBuf, TFT_GREEN, 0);
+
+    // --- BOTTOM GAUGES (Dynamic Effect Parameters) ---
+    GaugeDef bGauges[6]; int numG = 0;
+    
+    // 1. Add Primary Pitch Gauge(s) First
     if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
-        char intervalTop[16]; char intervalBottom[16]; 
-        spr.setTextSize(3); 
-        sprintf(intervalTop, "%+.1f", effectMemory[0]); sprintf(intervalBottom, "%+.1f", effectMemory[5]); 
-        spr.drawString(intervalTop, titleXPosition, 60); spr.drawString(intervalBottom, titleXPosition, 85);
+        // Heel on left (PAR 1), Toe on right (PAR 2)
+        bGauges[numG++] = {1, effectMemory[1]/24.0f, "HEEL", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", effectMemory[1]);
+        bGauges[numG++] = {1, effectMemory[0]/24.0f, "TOE", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", effectMemory[0]);
+    } else if (activeEffectMode == 2) {
+        // Unipolar Feedback Overtone (PAR 1, fills right-to-left)
+        float fbi[] = {0.0f, 12.0f, 19.0f, 24.0f, 28.0f}; 
+        float val = fbi[feedbackIntervalIdx % 5];
+        bGauges[numG++] = {2, val/28.0f, "OVT", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", val);
     } else if (activeEffectMode == 4) {
-        char intervalCapo[16]; spr.setTextSize(4); 
-        sprintf(intervalCapo, "%+.2f", effectMemory[4]); spr.drawString(intervalCapo, titleXPosition, 75);
+        // Capo split into Semi (PAR 1, left) and Cent (PAR 2, right)
+        int semi = (int)effectMemory[4]; 
+        int cents = (int)roundf((effectMemory[4] - semi) * 100.0f);
+        bGauges[numG++] = {1, semi/24.0f, "SEMI", ""}; sprintf(bGauges[numG-1].valStr, "%+d", semi);
+        bGauges[numG++] = {1, cents/50.0f, "CENT", ""}; sprintf(bGauges[numG-1].valStr, "%+d", cents);
     } else {
-        char intervalSingle[16]; spr.setTextSize(4); 
-        float displayedValue = effectMemory[activeEffectMode];
-        if (activeEffectMode == 2) { 
-            float feedbackIntervals[] = {0.0f, 12.0f, 19.0f, 24.0f, 28.0f}; displayedValue = feedbackIntervals[feedbackIntervalIdx % 5]; 
+        // Single pitch parameter on PAR 1 for Modes 3, 5, 6, 7, 9
+        float val = effectMemory[activeEffectMode];
+        if (activeEffectMode == 3) {
+            bGauges[numG++] = {1, val/24.0f, "INT", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", val);
+        } else if (activeEffectMode == 5) {
+            bGauges[numG++] = {1, val/24.0f, "OSC", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", val);
+        } else if (activeEffectMode == 6) {
+            bGauges[numG++] = {1, val/24.0f, "SHFT", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", val);
+        } else if (activeEffectMode == 7) {
+            bGauges[numG++] = {1, val/24.0f, "SHFT", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", val);
+        } else if (activeEffectMode == 9) {
+            bGauges[numG++] = {1, val/24.0f, "BASE", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", val);
         }
-        sprintf(intervalSingle, "%+.1f", displayedValue); spr.drawString(intervalSingle, titleXPosition, 75);
-    }
-
-    int gaugeTopY = 30; int gaugeBottomY = 125;
-    int xPB1 = 40; int xPB2 = 75; int xPB3 = 110; int xCC11 = 145;
-    spr.setTextSize(1); spr.drawString("PB1", xPB1, gaugeBottomY + 15); 
-    spr.drawString(isPB2LinearMode ? "PB2 W" : "PB2 H", xPB2, gaugeBottomY + 15); 
-    spr.drawString(isVolumeMode ? "Vol" : "PB3", xPB3, gaugeBottomY + 15); 
-    spr.drawString("CC11", xCC11, gaugeBottomY + 15);
-    
-    for (int yStep = gaugeTopY; yStep <= gaugeBottomY; yStep += 5) { 
-        spr.drawFastVLine(xPB1, yStep, 2, TFT_DARKGREY); spr.drawFastVLine(xPB2, yStep, 2, TFT_DARKGREY); 
-        spr.drawFastVLine(xPB3, yStep, 2, TFT_DARKGREY); spr.drawFastVLine(xCC11, yStep, 2, TFT_DARKGREY); 
     }
     
-    spr.fillCircle(xPB1, map(currentPB1, 0, 16383, gaugeBottomY, gaugeTopY), 4, TFT_CYAN); 
-    spr.fillCircle(xPB2, map(currentPB2, 0, 16383, gaugeBottomY, gaugeTopY), 4, TFT_MAGENTA);
-    spr.fillCircle(xPB3, map(currentPB3, 0, 16383, gaugeBottomY, gaugeTopY), 4, TFT_YELLOW); 
-    spr.fillCircle(xCC11, map(currentCC11, 0, 16383, gaugeBottomY, gaugeTopY), 4, TFT_GREEN);
+    // 2. Add Active DSP Parameters (All Unipolar Right-to-Left = 2)
+    if (activeEffectMode == 0) {
+        bGauges[numG++] = {2, fxParams[0][0], "D.MIX", ""}; sprintf(bGauges[numG-1].valStr, "%.1f", fxParams[0][0]);
+        bGauges[numG++] = {2, fxParams[0][1], "W.MIX", ""}; sprintf(bGauges[numG-1].valStr, "%.1f", fxParams[0][1]);
+    } else if (activeEffectMode == 1) {
+        bGauges[numG++] = {2, fxParams[1][0]/0.95f, "RVB", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[1][0]);
+        bGauges[numG++] = {2, (fxParams[1][1]-0.00001f)/0.001f, "ATK", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[1][1]*1000.0f);
+        bGauges[numG++] = {2, (fxParams[1][2]-0.00001f)/0.0005f, "REL", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[1][2]*1000.0f);
+    } else if (activeEffectMode == 2) {
+        bGauges[numG++] = {2, (fxParams[2][0]-1000.0f)/10000.0f, "SPD", ""}; sprintf(bGauges[numG-1].valStr, "%.0f", fxParams[2][0]);
+        bGauges[numG++] = {2, (fxParams[2][1]-1.0f)/100.0f, "DRV", ""}; sprintf(bGauges[numG-1].valStr, "%.1f", fxParams[2][1]);
+        bGauges[numG++] = {2, (fxParams[2][2]-0.005f)/0.045f, "DLY", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[2][2]);
+    } else if (activeEffectMode == 3) {
+        bGauges[numG++] = {2, fxParams[3][0], "MIX", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[3][0]);
+    } else if (activeEffectMode == 5) {
+        bGauges[numG++] = {2, (fxParams[5][0]-0.01f)/0.5f, "ATK", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[5][0]);
+        bGauges[numG++] = {2, (fxParams[5][1]-0.001f)/0.05f, "REL", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[5][1]);
+        bGauges[numG++] = {2, (fxParams[5][2]-0.1f)/0.8f, "FLT", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[5][2]);
+        bGauges[numG++] = {2, fxParams[5][3], "MIX", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[5][3]);
+    } else if (activeEffectMode == 6) {
+        bGauges[numG++] = {2, (fxParams[6][0]-0.8f)/0.199f, "TON", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[6][0]);
+        bGauges[numG++] = {2, fxParams[6][1]/3.0f, "MIX", ""}; sprintf(bGauges[numG-1].valStr, "%.1f", fxParams[6][1]);
+    } else if (activeEffectMode == 7) {
+        bGauges[numG++] = {2, (fxParams[7][0]-500.0f)/4500.0f, "SPD", ""}; sprintf(bGauges[numG-1].valStr, "%.0f", fxParams[7][0]);
+        bGauges[numG++] = {2, fxParams[7][1], "MIX", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[7][1]);
+    } else if (activeEffectMode == 8) {
+        bGauges[numG++] = {2, (fxParams[8][0]-0.001f)/0.05f, "THR", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[8][0]);
+        bGauges[numG++] = {2, (fxParams[8][1]-0.00001f)/0.0005f, "ATK", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[8][1]*1000.0f);
+        bGauges[numG++] = {2, (fxParams[8][2]-0.00001f)/0.0005f, "REL", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[8][2]*1000.0f);
+    } else if (activeEffectMode == 9) {
+        bGauges[numG++] = {2, fxParams[9][0]/2.0f, "DEP", ""}; sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[9][0]);
+    }
 
-    int statsRowY = 162; 
-    spr.setTextSize(1); spr.setTextColor(TFT_LIGHTGREY, TFT_BLACK); spr.setTextDatum(ML_DATUM); 
-    char cpuUsageBuffer[16]; sprintf(cpuUsageBuffer, "CPU:%2d%%", (int)core1_load); spr.drawString(cpuUsageBuffer, 2, statsRowY);
-    char internalSramBuffer[16]; sprintf(internalSramBuffer, "SRM:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024)); spr.drawString(internalSramBuffer, 52, statsRowY);
-    char psramBuffer[16]; sprintf(psramBuffer, "PSR:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024)); spr.drawString(psramBuffer, 107, statsRowY);
+    int bY = 115; int bR = 17; uint32_t actCol = effectTitleColors[activeEffectMode];
+    for (int i = 0; i < numG; i++) {
+        int xPos = 160 - ((numG - 1) * 26) + (i * 52); 
+        drawCircularGauge(spr, xPos, bY, bR, bGauges[i].normVal, bGauges[i].label, bGauges[i].valStr, actCol, bGauges[i].type);
+    }
+
+    // --- ACTIVE EFFECT BANNERS ---
+    spr.setTextDatum(ML_DATUM); spr.setTextSize(1);
+    int bannerX = 25;
+    auto drawBanner = [&](const char* lbl, uint32_t col) { spr.setTextColor(col, TFT_BLACK); spr.drawString(lbl, bannerX, 150); bannerX += 28; };
+    if (isFrozen && activeEffectMode != 1) drawBanner("FRZ", TFT_CYAN); 
+    if (isFeedbackActive && activeEffectMode != 2) drawBanner("SCM", TFT_RED);
+    if (isHarmonizerMode && activeEffectMode != 3) drawBanner("HRM", TFT_MAGENTA); 
+    if (isCapoMode && activeEffectMode != 4) drawBanner("CAP", TFT_GREEN);
+    if (isSynthMode && activeEffectMode != 5) drawBanner("SYN", TFT_YELLOW); 
+    if (isPadMode && activeEffectMode != 6) drawBanner("PAD", TFT_PINK);
+    if (isChorusMode && activeEffectMode != 7) drawBanner("CHO", TFT_SKYBLUE); 
+    if (isSwellMode && activeEffectMode != 8) drawBanner("SWL", TFT_WHITE);
+    if (isVibratoMode && activeEffectMode != 9) drawBanner("VIB", TFT_PURPLE); 
+    if (isVolumeMode) drawBanner("VOL", TFT_DARKGREY);
+
+    // --- SYSTEM STATS ---
+    int statsRowY = 162; spr.setTextColor(TFT_LIGHTGREY, TFT_BLACK); spr.setTextDatum(ML_DATUM); 
+    char cpuUsageBuffer[16]; sprintf(cpuUsageBuffer, "CPU:%2d%%", (int)core1_load); spr.drawString(cpuUsageBuffer, 25, statsRowY);
+    char internalSramBuffer[16]; sprintf(internalSramBuffer, "SRM:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024)); spr.drawString(internalSramBuffer, 85, statsRowY);
+    char psramBuffer[16]; sprintf(psramBuffer, "PSR:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024)); spr.drawString(psramBuffer, 150, statsRowY);
 
     spr.setTextDatum(MC_DATUM); spr.setTextColor(TFT_WHITE); 
-    spr.drawRect(165, statsRowY - 7, 50, 14, TFT_DARKGREY);
-    spr.drawString((currentSampleRate == 96000) ? "96kHz" : "48kHz", 190, statsRowY);
+    spr.drawRect(210, statsRowY - 7, 40, 14, TFT_DARKGREY);
+    spr.drawString((currentSampleRate == 96000) ? "96k" : "48k", 230, statsRowY);
     
-    spr.drawRect(225, statsRowY - 7, 85, 14, TFT_DARKGREY);
-    const char* latencyLabelStrings[] = {"U.Low Lat", "Low Lat", "Mid Lat", "High Lat"}; 
-    spr.drawString(latencyLabelStrings[latencyMode], 267, statsRowY);
-
-    spr.setTextSize(2); spr.setTextDatum(MC_DATUM); 
-    int bannerCount = 0; int gridStartX = 175; int gridWidthX = 110; int gridStepX = gridWidthX / 2; 
-    int gridStartY = 110; int gridStepY = 18;  
-
-    auto drawActiveEffectBanner = [&](const char* shortLabel, uint32_t effectColor) {
-        int currentColumn = bannerCount % 3; int currentRow = bannerCount / 3;
-        int drawX = gridStartX + (currentColumn * gridStepX); int drawY = gridStartY + (currentRow * gridStepY);
-        spr.setTextColor(effectColor, TFT_BLACK); spr.drawString(shortLabel, drawX, drawY); bannerCount++;
-    };
-    
-    if (isFrozen && activeEffectMode != 1) drawActiveEffectBanner("FRZ", TFT_CYAN); 
-    if (isFeedbackActive && activeEffectMode != 2) drawActiveEffectBanner("SCM", TFT_RED);
-    if (isHarmonizerMode && activeEffectMode != 3) drawActiveEffectBanner("HRM", TFT_MAGENTA); 
-    if (isCapoMode && activeEffectMode != 4) drawActiveEffectBanner("CAP", TFT_GREEN);
-    if (isSynthMode && activeEffectMode != 5) drawActiveEffectBanner("SYN", TFT_YELLOW); 
-    if (isPadMode && activeEffectMode != 6) drawActiveEffectBanner("PAD", TFT_PINK);
-    if (isChorusMode && activeEffectMode != 7) drawActiveEffectBanner("CHO", TFT_SKYBLUE); 
-    if (isSwellMode && activeEffectMode != 8) drawActiveEffectBanner("SWL", TFT_WHITE);
-    if (isVibratoMode && activeEffectMode != 9) drawActiveEffectBanner("VIB", TFT_PURPLE); 
-    if (isVolumeMode) drawActiveEffectBanner("VOL", TFT_DARKGREY);
+    spr.drawRect(255, statsRowY - 7, 40, 14, TFT_DARKGREY);
+    const char* latencyLabelStrings[] = {"U.Low", "Low", "Mid", "High"}; 
+    spr.drawString(latencyLabelStrings[latencyMode], 275, statsRowY);
 
     spr.pushSprite(0, 0); updateMeters();
 }
@@ -632,7 +565,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     uint32_t hannIntMult = (1024U << 16) / (uint32_t)currentWindowSize; 
                     uint32_t windowMask = (uint32_t)currentWindowSize - 1;
                     
-                    // --- DYNAMIC FX PARAMETERS FETCH ---
                     float p_w_dry = fxParams[0][0]; float p_w_wet = fxParams[0][1];
                     float p_fz_apf = fxParams[1][0]; float p_fz_att = fxParams[1][1]; float p_fz_rel = fxParams[1][2];
                     float p_fb_spd = fxParams[2][0]; float p_fb_drv = fxParams[2][1]; float p_fb_off = fxParams[2][2];
@@ -919,7 +851,6 @@ void MidiTask(void * pvParameters) {
     static bool lastBtState = false; static uint8_t lastVolumeCC = 127;
     static int stableRawA = -1; static int stableRawB = -1; static int stableRawC = -1;
     
-    // Potentiometer Tracking States
     static int lastPar1 = -1; static int lastPar2 = -1; static int lastPar3 = -1;
     static int lastPar4 = -1; static int lastPar5 = -1;
     
@@ -970,7 +901,6 @@ void MidiTask(void * pvParameters) {
             }
         }
         
-        // --- 5 POTENTIOMETERS POLLING & MAPPING ---
         filterPar1.update(); filterPar2.update(); filterPar3.update(); filterPar4.update(); filterPar5.update();
         
         int par1Raw = filterPar1.getValue();
@@ -1007,7 +937,6 @@ void MidiTask(void * pvParameters) {
             Control_Surface.sendControlChange({28, Channel_1}, ccVal);
             lastPar5 = par5Raw;
         }
-        // ------------------------------------------
         
         filterPB.update(); filterPB2.update(); filterPB3.update();
         
@@ -1095,96 +1024,99 @@ void MidiTask(void * pvParameters) {
     }
 }
 
-// --- UPDATED INTERNAL TOGGLE LOGIC & PARAMETER INTERCEPTION ---
 bool channelMessageCallback(ChannelMessage cm) {
     if (cm.header == 0xB0) {
         
-        // INTERCEPT PAR1 - PAR5 HARDCODED TWEAKS
         if (cm.data1 >= 24 && cm.data1 <= 28) {
             float norm = (float)cm.data2 / 127.0f; 
             int pIdx = cm.data1 - 24; 
             
-            if (activeEffectMode == 0) { // Whammy
-                if (pIdx == 0) fxParams[0][0] = norm; // Dry Mix (0.0 to 1.0)
-                if (pIdx == 1) fxParams[0][1] = norm; // Wet Mix (0.0 to 1.0)
-                
-                // PAR 3 (CC 26) -> Toe Pitch Bend Interval
-                if (pIdx == 2) { 
-                    effectMemory[0] = roundf((norm * 48.0f) - 24.0f); 
-                    lutNeedsUpdate = true; 
-                    forceUIUpdate = true; 
-                }
-                
-                // PAR 4 (CC 27) -> Heel Pitch Bend Interval
-                if (pIdx == 3) { 
-                    effectMemory[5] = roundf((norm * 48.0f) - 24.0f); 
-                    lutNeedsUpdate = true; 
-                    forceUIUpdate = true; 
-                }
+            if (activeEffectMode == 0) { // WHAMMY
+                if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // HEEL (PAR 1)
+                if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // TOE  (PAR 2)
+                if (pIdx == 2) fxParams[0][0] = norm; // D.MIX (PAR 3)
+                if (pIdx == 3) fxParams[0][1] = norm; // W.MIX (PAR 4)
             } 
-            else if (activeEffectMode == 1) { // Freeze
-                if (pIdx == 0) fxParams[1][0] = 0.0f + (norm * 0.95f); // APF Reverb Coeff
-                if (pIdx == 1) fxParams[1][1] = 0.00001f + (norm * 0.001f); // Ramp Attack
-                if (pIdx == 2) fxParams[1][2] = 0.00001f + (norm * 0.0005f); // Ramp Release
+            else if (activeEffectMode == 1) { // FREEZE
+                if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // HEEL (PAR 1)
+                if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // TOE  (PAR 2)
+                if (pIdx == 2) fxParams[1][0] = 0.0f + (norm * 0.95f);               // RVB (PAR 3)
+                if (pIdx == 3) fxParams[1][1] = 0.00001f + (norm * 0.001f);          // ATK (PAR 4)
+                if (pIdx == 4) fxParams[1][2] = 0.00001f + (norm * 0.0005f);         // REL (PAR 5)
             }
-            else if (activeEffectMode == 2) { // Feedback
-                if (pIdx == 0) fxParams[2][0] = 1000.0f + (norm * 10000.0f); // LFO Squeal Speed
-                if (pIdx == 1) fxParams[2][1] = 1.0f + (norm * 100.0f); // Drive
-                if (pIdx == 2) fxParams[2][2] = 0.005f + (norm * 0.045f); // Delay Offset
+            else if (activeEffectMode == 2) { // FEEDBACK
+                if (pIdx == 0) { // OVT (PAR 1)
+                    int newIdx = constrain((int)roundf(norm * 4.0f), 0, 4);
+                    if (newIdx != feedbackIntervalIdx) {
+                        feedbackIntervalIdx = newIdx;
+                        lutNeedsUpdate = true;
+                        forceUIUpdate = true;
+                    }
+                }
+                if (pIdx == 1) fxParams[2][0] = 1000.0f + (norm * 10000.0f);         // SPD (PAR 2)
+                if (pIdx == 2) fxParams[2][1] = 1.0f + (norm * 100.0f);             // DRV (PAR 3)
+                if (pIdx == 3) fxParams[2][2] = 0.005f + (norm * 0.045f);            // DLY (PAR 4)
             }
-            else if (activeEffectMode == 3) { // Harmony
-                if (pIdx == 0) fxParams[3][0] = norm; // Harmony Vol Mix
+            else if (activeEffectMode == 3) { // HARMONY
+                if (pIdx == 0) { effectMemory[3] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // INT (PAR 1)
+                if (pIdx == 1) fxParams[3][0] = norm;                                // MIX (PAR 2)
             }
-            else if (activeEffectMode == 5) { // Synth
-                if (pIdx == 0) fxParams[5][0] = 0.01f + (norm * 0.5f); // Env Attack
-                if (pIdx == 1) fxParams[5][1] = 0.001f + (norm * 0.05f); // Env Rel
-                if (pIdx == 2) fxParams[5][2] = 0.1f + (norm * 0.8f); // Filter Base
-                if (pIdx == 3) fxParams[5][3] = norm; // Output Mix
+            else if (activeEffectMode == 4) { // CAPO
+                if (pIdx == 0) { // PAR 1 -> SEMI
+                    int c = (int)roundf((effectMemory[4] - (int)effectMemory[4]) * 100.0f); 
+                    effectMemory[4] = constrain(roundf((norm * 48.0f) - 24.0f) + (c / 100.0f), -24.0f, 24.0f);
+                    lutNeedsUpdate = true; forceUIUpdate = true; 
+                }
+                if (pIdx == 1) { // PAR 2 -> CENT
+                    int s = (int)effectMemory[4]; 
+                    float c = roundf((norm * 100.0f) - 50.0f) / 100.0f; 
+                    effectMemory[4] = constrain(s + c, -24.0f, 24.0f);
+                    lutNeedsUpdate = true; forceUIUpdate = true; 
+                }
             }
-            else if (activeEffectMode == 6) { // Pad
-                if (pIdx == 0) fxParams[6][0] = 0.8f + (norm * 0.199f); // Tone Smoothing
-                if (pIdx == 1) fxParams[6][1] = norm * 3.0f; // Mix Gain (0.0 to 3.0)
+            else if (activeEffectMode == 5) { // SYNTH
+                if (pIdx == 0) { effectMemory[5] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // OSC (PAR 1)
+                if (pIdx == 1) fxParams[5][0] = 0.01f + (norm * 0.5f);               // ATK (PAR 2)
+                if (pIdx == 2) fxParams[5][1] = 0.001f + (norm * 0.05f);             // REL (PAR 3)
+                if (pIdx == 3) fxParams[5][2] = 0.1f + (norm * 0.8f);               // FLT (PAR 4)
+                if (pIdx == 4) fxParams[5][3] = norm;                                // MIX (PAR 5)
             }
-            else if (activeEffectMode == 7) { // Chorus
-                if (pIdx == 0) fxParams[7][0] = 500.0f + (norm * 4500.0f); // LFO Speed
-                if (pIdx == 1) fxParams[7][1] = norm; // Mix Gain
+            else if (activeEffectMode == 6) { // PAD
+                if (pIdx == 0) { effectMemory[6] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // SHFT (PAR 1)
+                if (pIdx == 1) fxParams[6][0] = 0.8f + (norm * 0.199f);              // TON (PAR 2)
+                if (pIdx == 2) fxParams[6][1] = norm * 3.0f;                         // MIX (PAR 3)
             }
-            else if (activeEffectMode == 8) { // Swell
-                if (pIdx == 0) fxParams[8][0] = 0.001f + (norm * 0.05f); // Env Threshold
-                if (pIdx == 1) fxParams[8][1] = 0.00001f + (norm * 0.0005f); // Attack Time
-                if (pIdx == 2) fxParams[8][2] = 0.00001f + (norm * 0.0005f); // Rel Time
+            else if (activeEffectMode == 7) { // CHORUS
+                if (pIdx == 0) { effectMemory[7] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // SHFT (PAR 1)
+                if (pIdx == 1) fxParams[7][0] = 500.0f + (norm * 4500.0f);           // SPD (PAR 2)
+                if (pIdx == 2) fxParams[7][1] = norm;                                // MIX (PAR 3)
             }
-            else if (activeEffectMode == 9) { // Vibrato
-                if (pIdx == 0) fxParams[9][0] = norm * 2.0f; // Depth scale applied to LUT
+            else if (activeEffectMode == 8) { // SWELL
+                if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // HEEL (PAR 1)
+                if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // TOE  (PAR 2)
+                if (pIdx == 2) fxParams[8][0] = 0.001f + (norm * 0.05f);             // THR (PAR 3)
+                if (pIdx == 3) fxParams[8][1] = 0.00001f + (norm * 0.0005f);        // ATK (PAR 4)
+                if (pIdx == 4) fxParams[8][2] = 0.00001f + (norm * 0.0005f);        // REL (PAR 5)
+            }
+            else if (activeEffectMode == 9) { // VIBRATO
+                if (pIdx == 0) { effectMemory[9] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } // BASE (PAR 1)
+                if (pIdx == 1) fxParams[9][0] = norm * 2.0f;                         // DEP (PAR 2)
             }
             
-            settingsNeedSaving = true;
-            lastParameterChangeTime = millis();
+            settingsNeedSaving = true; lastParameterChangeTime = millis();
             return false;
         }
 
         if (cm.data1 == 5 && cm.data2 >= 64) {
-            isPB2LinearMode = !isPB2LinearMode;
-            int newCenter = filterPB2.getValue();
+            isPB2LinearMode = !isPB2LinearMode; int newCenter = filterPB2.getValue();
             if (newCenter < 4000 && newCenter > 100) PB2_raw_center = newCenter; else PB2_raw_center = 2048;
             PB2_raw_min = PB2_raw_center - 200; PB2_raw_max = PB2_raw_center + 200;
             forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
         }
-        else if (cm.data1 == 6 && cm.data2 >= 64) { 
-            isVolumeMode = !isVolumeMode; if (!isVolumeMode) volumePedalGain = 1.0f; 
-            forceUIUpdate = true; 
-        }
-        else if (cm.data1 == 0 && cm.data2 >= 64) { 
-            if (activeEffectMode == 0) activeEffectMode = 9; else activeEffectMode = activeEffectMode - 1;
-            lutNeedsUpdate = true; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
-        }
-        else if (cm.data1 == 1 && cm.data2 >= 64) { 
-            activeEffectMode = (activeEffectMode + 1) % 10; 
-            lutNeedsUpdate = true; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
-        }
-        else if (cm.data1 == 2 && cm.data2 >= 64) { 
-            latencyMode = (latencyMode + 1) % 4; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
-        }
+        else if (cm.data1 == 6 && cm.data2 >= 64) { isVolumeMode = !isVolumeMode; if (!isVolumeMode) volumePedalGain = 1.0f; forceUIUpdate = true; }
+        else if (cm.data1 == 0 && cm.data2 >= 64) { if (activeEffectMode == 0) activeEffectMode = 9; else activeEffectMode = activeEffectMode - 1; lutNeedsUpdate = true; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); }
+        else if (cm.data1 == 1 && cm.data2 >= 64) { activeEffectMode = (activeEffectMode + 1) % 10; lutNeedsUpdate = true; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); }
+        else if (cm.data1 == 2 && cm.data2 >= 64) { latencyMode = (latencyMode + 1) % 4; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); }
         else if (cm.data1 == 3 && cm.data2 >= 64) {
             globalAudioResetRequested = true; 
             bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVibratoMode || isVolumeMode;
@@ -1205,29 +1137,37 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 15 && cm.data2 >= 64) { isChorusMode = !isChorusMode; if (activeEffectMode == 7) isWhammyActive = isChorusMode; forceUIUpdate = true; }
         else if (cm.data1 == 16 && cm.data2 >= 64) { isSwellMode = !isSwellMode; if (activeEffectMode == 8) isWhammyActive = isSwellMode; forceUIUpdate = true; }
         else if (cm.data1 == 7 && cm.data2 >= 64) { isVibratoMode = !isVibratoMode; if (activeEffectMode == 9) isWhammyActive = isVibratoMode; forceUIUpdate = true; }
-        else if (cm.data1 == 18 || cm.data1 == 17) {
-            float direction = (cm.data2 < 64) ? 1.0f : -1.0f;
-            if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
-                if (cm.data1 == 18) effectMemory[0] = constrain(effectMemory[0] + direction, -24.0f, 24.0f); 
-                else effectMemory[5] = constrain(effectMemory[5] + direction, -24.0f, 24.0f);
-            } else if (activeEffectMode == 4) {
-                float change = (cm.data1 == 18) ? 1.0f : 0.01f;
-                effectMemory[4] = constrain(effectMemory[4] + change * direction, -24.0f, 24.0f);
-            } else if (activeEffectMode == 2) { 
-                if (direction > 0) feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5; 
-                else feedbackIntervalIdx = (feedbackIntervalIdx + 4) % 5;
-            } else { 
-                int memIndex = activeEffectMode; 
-                if (memIndex == 5) memIndex = 6; else if (memIndex == 6) memIndex = 7; 
-                else if (memIndex == 7) memIndex = 8; else if (memIndex == 9) memIndex = 9;
-                effectMemory[memIndex] = constrain(effectMemory[memIndex] + direction, -24.0f, 24.0f); 
+        else if (cm.data1 == 17 || cm.data1 == 18) {
+            float step = (cm.data2 >= 64) ? -1.0f : 1.0f; // Value 127 = Decrease, 0 = Increase
+
+            if (cm.data1 == 17) {
+                // CC 17 controls HEEL on Mode 0, 1, 8... and the PRIMARY pitch parameter for all other modes.
+                if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
+                    effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f); // HEEL
+                } else if (activeEffectMode == 4) {
+                    effectMemory[4] = constrain(effectMemory[4] + step, -24.0f, 24.0f); // CAPO (SEMI)
+                } else if (activeEffectMode == 2) { 
+                    if (step > 0) feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5; 
+                    else feedbackIntervalIdx = (feedbackIntervalIdx + 4) % 5;           // FEEDBACK (OVT)
+                } else { 
+                    // Directly steps primary pitch memory for current mode (INT, OSC, SHFT, BASE)
+                    effectMemory[activeEffectMode] = constrain(effectMemory[activeEffectMode] + step, -24.0f, 24.0f); 
+                }
+            } 
+            else if (cm.data1 == 18) {
+                // CC 18 exclusively controls TOE on Mode 0, 1, 8, and CENT on Mode 4.
+                if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
+                    effectMemory[0] = constrain(effectMemory[0] + step, -24.0f, 24.0f); // TOE
+                } else if (activeEffectMode == 4) {
+                    float centStep = step * 0.01f;
+                    effectMemory[4] = constrain(effectMemory[4] + centStep, -24.0f, 24.0f); // CAPO (CENT)
+                }
             }
-            lutNeedsUpdate = true; forceUIUpdate = true;
-            settingsNeedSaving = true; lastParameterChangeTime = millis();
+            
+            lutNeedsUpdate = true; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
         }
         else if (cm.data1 == 11) { 
-            uint16_t mappedCC = map(cm.data2, 0, 127, 0, 16383); 
-            currentCC11 = mappedCC; currentPB3 = mappedCC; 
+            uint16_t mappedCC = map(cm.data2, 0, 127, 0, 16383); currentCC11 = mappedCC; currentPB3 = mappedCC; 
             if (isVolumeMode) { volumePedalGain = (float)mappedCC / 16383.0f; Control_Surface.sendControlChange({19, Channel_1}, cm.data2); } 
             else { if (!lutNeedsUpdate) pitchShiftFactor = pitchShiftLUT[mappedCC]; }
             forceUIUpdate = true; 
@@ -1237,31 +1177,18 @@ bool channelMessageCallback(ChannelMessage cm) {
 }
 
 void setup() {
-    audioBufferMutex = xSemaphoreCreateMutex();
-    WiFi.mode(WIFI_OFF);
-
-    // --- LOAD SAVED SETTINGS FROM FLASH ---
+    audioBufferMutex = xSemaphoreCreateMutex(); WiFi.mode(WIFI_OFF);
     preferences.begin("whammy_cfg", true); 
-    activeEffectMode = preferences.getInt("activeMode", 0);
-    latencyMode = preferences.getInt("latMode", 0);
-    isPB2LinearMode = preferences.getBool("pb2Linear", false);
-    currentSampleRate = preferences.getUInt("sampleRate", 48000);
+    activeEffectMode = preferences.getInt("activeMode", 0); latencyMode = preferences.getInt("latMode", 0);
+    isPB2LinearMode = preferences.getBool("pb2Linear", false); currentSampleRate = preferences.getUInt("sampleRate", 48000);
     for(int i = 0; i < 10; i++) {
-        char key[8]; sprintf(key, "fxMem%d", i);
-        effectMemory[i] = preferences.getFloat(key, effectMemory[i]); 
-        
-        for (int p = 0; p < 5; p++) {
-            char pKey[12]; sprintf(pKey, "fxP%d_%d", i, p);
-            fxParams[i][p] = preferences.getFloat(pKey, fxParams[i][p]);
-        }
+        char key[8]; sprintf(key, "fxMem%d", i); effectMemory[i] = preferences.getFloat(key, effectMemory[i]); 
+        for (int p = 0; p < 5; p++) { char pKey[12]; sprintf(pKey, "fxP%d_%d", i, p); fxParams[i][p] = preferences.getFloat(pKey, fxParams[i][p]); }
     }
     preferences.end();
-    // --------------------------------------
 
-    pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP); 
-    pinMode(BATTERY_PIN, INPUT);
-    pinMode(38, OUTPUT); digitalWrite(38, LOW); 
-    pinMode(15, OUTPUT); digitalWrite(15, HIGH);
+    pinMode(CAROUSEL_BUTTON_PIN, INPUT_PULLUP); pinMode(BATTERY_PIN, INPUT);
+    pinMode(38, OUTPUT); digitalWrite(38, LOW); pinMode(15, OUTPUT); digitalWrite(15, HIGH);
     
     Serial.begin(115200); tft.init(); tft.setRotation(1); 
     spr.createSprite(tft.width(), tft.height()); meterSpr.createSprite(6, 98);
@@ -1290,8 +1217,7 @@ void setup() {
     }
     for (int i = 0; i < 2048; i++) { synthLUT[i] = sinf((((float)i - 1024.0f) / 1024.0f) * 45.0f); }
     
-    FilteredAnalog<>::setupADC(); 
-    delay(500); calibratePBs(); updateLUT();
+    FilteredAnalog<>::setupADC(); delay(500); calibratePBs(); updateLUT();
     
     Control_Surface >> pipes >> btmidi; Control_Surface >> pipes >> usbmidi; 
     usbmidi >> pipes >> Control_Surface; btmidi >> pipes >> Control_Surface;
@@ -1321,17 +1247,13 @@ void setup() {
 }
 
 void loop() {
-    if (lutNeedsUpdate) {
-        updateLUT(); pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; lutNeedsUpdate = false;
-    }
-    
+    if (lutNeedsUpdate) { updateLUT(); pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; lutNeedsUpdate = false; }
     if (clearBuffersRequested) {
         if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, portMAX_DELAY) == pdTRUE) {
             memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float)); memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(float)); memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(float));
             clearBuffersRequested = false; xSemaphoreGive(audioBufferMutex);
         }
     }
-    
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 3000)) { saveSettings(); settingsNeedSaving = false; }
     vTaskDelay(pdMS_TO_TICKS(10));
 }

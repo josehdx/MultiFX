@@ -713,7 +713,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             
                             int waveIdx = constrain((int)((procSample + 1.0f) * 1023.5f), 0, WAVE_LUT_SIZE - 1);
                             procSample = synthLUT[waveIdx]; 
-                            // BUG FIX #2: Correctly scale Synth Filter frequency so it stays uniform between 48kHz and 96kHz modes
+                            // BUG FIX #2: Scaled Synth filter coefficient by srScale for uniform cutoff across sample rates
                             float fltCoeff = fmaxf(0.001f, fminf(0.99f, (p_sy_flt + 0.6f * synthEnv) * srScale));
                             synthFilter = synthFilter + fltCoeff * (procSample - synthFilter) + DC_OFFSET; 
                             procSample = synthFilter * p_sy_mix;
@@ -814,7 +814,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             float satFb = feedbackFilterVar * (localFbRamp * localFbRamp * localFbRamp) * 0.85f; 
                             fbDelayBuffer[fbDelayWriteIdx] = satFb;
                             
-                            int delaySamples = (int)(currentSampleRate * p_fb_off);
+                            // BUG FIX #3: Constrain delay offset index to valid buffer bounds
+                            int delaySamples = constrain((int)(currentSampleRate * p_fb_off), 0, FB_BUFFER_SIZE - 1);
                             int fbReadIdx = (fbDelayWriteIdx - delaySamples + FB_BUFFER_SIZE) & FB_BUFFER_MASK;
                             fbOutNode = fbDelayBuffer[fbReadIdx];
                             fbDelayWriteIdx = (fbDelayWriteIdx + 1) & FB_BUFFER_MASK;
@@ -840,8 +841,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         int32_t step5 = (int32_t)((1.0f - spd5) * 65536.0f); tap_w5_1 += step5; tap_w5_2 += step5; 
                         writeIndex = (writeIndex + 1) & BUFFER_MASK;
                         
-                        if (padActive) { padFilter = padFilter * p_pd_sm + w1 * (1.0f - p_pd_sm) + DC_OFFSET; } 
-                        else { padFilter = padFilter * p_pd_sm + DC_OFFSET; }
+                        // Scale Pad filter decay factor by sample rate
+                        float pdSmCoeff = powf(p_pd_sm, srScale);
+                        if (padActive) { padFilter = padFilter * pdSmCoeff + w1 * (1.0f - pdSmCoeff) + DC_OFFSET; } 
+                        else { padFilter = padFilter * pdSmCoeff + DC_OFFSET; }
                         
                         dry_block[i] = inSample; fz_block[i] = fzOut; pad_block[i] = padFilter; fbOut_block[i] = fbOutNode;
                     }
@@ -1146,23 +1149,9 @@ void MidiTask(void * pvParameters) {
             if (stableRawB < 0) stableRawB = rawB; if (abs((int)rawB - stableRawB) > 6) stableRawB = rawB;
             if (stableRawC < 0) stableRawC = rawC; if (abs((int)rawC - stableRawC) > 16) stableRawC = rawC;
 
-            static bool unpluggedA = false; static bool unpluggedB = false;
-            static int previousRawA = 2048; static int previousRawB = 2048;
-
-            // BUG FIX #1: Delta + Voltage check catches cable yank without limiting PB upper maximums
-            if (PB1_unplugged_at_boot || (stableRawA >= 4050 && (stableRawA - previousRawA) > 400)) {
-                unpluggedA = true;
-            } else if (stableRawA < 3900) {
-                unpluggedA = false; PB1_unplugged_at_boot = false;
-            }
-
-            if (PB2_unplugged_at_boot || (stableRawB >= 4050 && (stableRawB - previousRawB) > 400)) {
-                unpluggedB = true;
-            } else if (stableRawB < 3900) {
-                unpluggedB = false; PB2_unplugged_at_boot = false;
-            }
-
-            previousRawA = stableRawA; previousRawB = stableRawB;
+            // BUG FIX #1: Power-up state determines unplugged mode; fast movements during play never trigger reset
+            bool unpluggedA = PB1_unplugged_at_boot;
+            bool unpluggedB = PB2_unplugged_at_boot;
 
             if (!unpluggedA) {
                 if (stableRawA < PB1_raw_min && stableRawA > 200) PB1_raw_min = stableRawA;
@@ -1293,7 +1282,6 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 17 || cm.data1 == 18) {
             float step = (cm.data2 >= 64) ? -1.0f : 1.0f; 
 
-            // DISREGARDED BUG FIX #3: Kept original CC 17/18 functionality for Capo mode
             if (cm.data1 == 17) {
                 if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
                     effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f); 

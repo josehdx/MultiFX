@@ -157,6 +157,20 @@ FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar5 = pinPar5;
 
 BluetoothMIDI_Interface btmidi; USBMIDI_Interface usbmidi; MIDI_PipeFactory<4> pipes;
 
+// BUG FIX #2: Helper function unifies mode switching for both button and MIDI triggers
+void switchEffectMode(int newMode) {
+    activeEffectMode = (newMode % 10 + 10) % 10;
+    chorusLfoPhase = 0.0f; 
+    feedbackLfoPhase = 0.0f; 
+    vibratoLfoPhase = 0.0f; 
+    swellGain = 0.0f; 
+    isWhammyActive = true; 
+    lutNeedsUpdate = true; 
+    forceUIUpdate = true; 
+    settingsNeedSaving = true; 
+    lastParameterChangeTime = millis();
+}
+
 void saveSettings() {
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
 
@@ -1071,10 +1085,8 @@ void MidiTask(void * pvParameters) {
             } else if (carouselBtn.state == HIGH && carouselBtn.isActive) {
                 carouselBtn.isActive = false; 
                 if (millis() - carouselBtn.pressedTime < 400) { 
-                    activeEffectMode = (activeEffectMode + 1) % 10; 
-                    chorusLfoPhase = 0.0f; feedbackLfoPhase = 0.0f; vibratoLfoPhase = 0.0f; swellGain = 0.0f; 
-                    isWhammyActive = true; lutNeedsUpdate = true; 
-                    settingsNeedSaving = true; lastParameterChangeTime = millis();
+                    // BUG FIX #2: Unified switchEffectMode helper handles state resets
+                    switchEffectMode(activeEffectMode + 1);
                 } 
                 forceUIUpdate = true;
             }
@@ -1137,25 +1149,28 @@ void MidiTask(void * pvParameters) {
             if (stableRawC < 0) stableRawC = rawC; if (abs((int)rawC - stableRawC) > 16) stableRawC = rawC;
 
             static bool unpluggedA = false; static bool unpluggedB = false;
-            static int previousRawA = 2048; static int previousRawB = 2048;
 
-            // BUG FIX #1: Delta + Voltage check prevents false unplugged triggers during smooth pedal movement
-            if (PB1_unplugged_at_boot || (stableRawA > 4080 && (stableRawA - previousRawA) > 800)) unpluggedA = true;
-            else if (stableRawA < 3900) { unpluggedA = false; PB1_unplugged_at_boot = false; }
+            // BUG FIX #1: Replaced flawed single-frame delta check with boot status + range checks
+            if (PB1_unplugged_at_boot || (stableRawA > 4050 && PB1_raw_max < 3800)) {
+                unpluggedA = true;
+            } else if (stableRawA < 3900) {
+                unpluggedA = false; PB1_unplugged_at_boot = false;
+            }
 
-            if (PB2_unplugged_at_boot || (stableRawB > 4080 && (stableRawB - previousRawB) > 800)) unpluggedB = true;
-            else if (stableRawB < 3900) { unpluggedB = false; PB2_unplugged_at_boot = false; }
-
-            previousRawA = stableRawA; previousRawB = stableRawB;
+            if (PB2_unplugged_at_boot || (stableRawB > 4050 && PB2_raw_max < 3800)) {
+                unpluggedB = true;
+            } else if (stableRawB < 3900) {
+                unpluggedB = false; PB2_unplugged_at_boot = false;
+            }
 
             if (!unpluggedA) {
                 if (stableRawA < PB1_raw_min && stableRawA > 200) PB1_raw_min = stableRawA;
-                if (stableRawA > PB1_raw_max && stableRawA < 3800) PB1_raw_max = stableRawA;
+                if (stableRawA > PB1_raw_max && stableRawA < 4095) PB1_raw_max = stableRawA;
             }
 
             if (!unpluggedB) {
                 if (stableRawB < PB2_raw_min && stableRawB > 200) PB2_raw_min = stableRawB;
-                if (stableRawB > PB2_raw_max && stableRawB < 3800) PB2_raw_max = stableRawB;
+                if (stableRawB > PB2_raw_max && stableRawB < 4095) PB2_raw_max = stableRawB;
             }
             
             if (stableRawC < PB3_raw_min) PB3_raw_min = stableRawC;
@@ -1188,7 +1203,8 @@ void MidiTask(void * pvParameters) {
                 if (moveB) { lastActivePedal = calB; pitchChanged = true; }
                 if (moveC && !isVolumeMode) { lastActivePedal = calC; pitchChanged = true; }
 
-                if (pitchChanged && !lutNeedsUpdate) pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)];
+                // BUG FIX #3: Always record lastActivePedal and update pitchShiftFactor immediately
+                if (pitchChanged) pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)];
 
                 if (moveC && isVolumeMode) {
                     uint8_t vCC = map(calC, 0, 16383, 0, 127); 
@@ -1251,8 +1267,9 @@ bool channelMessageCallback(ChannelMessage cm) {
             }
             forceUIUpdate = true; 
         }
-        else if (cm.data1 == 0 && cm.data2 >= 64) { if (activeEffectMode == 0) activeEffectMode = 9; else activeEffectMode = activeEffectMode - 1; lutNeedsUpdate = true; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); }
-        else if (cm.data1 == 1 && cm.data2 >= 64) { activeEffectMode = (activeEffectMode + 1) % 10; lutNeedsUpdate = true; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); }
+        // BUG FIX #2: Unified switchEffectMode helper ensures MIDI mode changes perform state resets
+        else if (cm.data1 == 0 && cm.data2 >= 64) { switchEffectMode(activeEffectMode - 1); }
+        else if (cm.data1 == 1 && cm.data2 >= 64) { switchEffectMode(activeEffectMode + 1); }
         else if (cm.data1 == 2 && cm.data2 >= 64) { latencyMode = (latencyMode + 1) % 4; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); }
         else if (cm.data1 == 3 && cm.data2 >= 64) {
             globalAudioResetRequested = true; 

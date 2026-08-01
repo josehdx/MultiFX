@@ -16,8 +16,6 @@
 #include <Preferences.h>
 
 // --- HARDWARE CONFIGURATION TOGGLES ---
-// Set to 'false' if physical 5-PAR potentiometers are unplugged to avoid floating pin noise.
-// Set to 'true' once you plug physical knobs into pins 3, 11, 12, 13, 14.
 #define ENABLE_PAR_KNOBS false  
 
 // --- MEMORY PREFERENCES ---
@@ -28,7 +26,7 @@ struct AppSettings {
 
 Preferences preferences;
 volatile bool settingsNeedSaving = false;
-volatile unsigned long lastParameterChangeTime = 0; // Fixed: Cross-Core safe volatile flag
+volatile unsigned long lastParameterChangeTime = 0; 
 
 // --- DYNAMIC FX PARAMETERS MATRIX ---
 volatile float fxParams[10][5] = {
@@ -157,7 +155,6 @@ FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar5 = pinPar5;
 BluetoothMIDI_Interface btmidi; USBMIDI_Interface usbmidi; MIDI_PipeFactory<4> pipes;
 
 void saveSettings() {
-    // BUG FIX #1: Protect PSRAM access during Flash write kernel cycle
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
 
     preferences.begin("whammy_cfg", false); 
@@ -167,7 +164,6 @@ void saveSettings() {
     preferences.putUInt("sampleRate", currentSampleRate);
     preferences.putInt("fbIdx", feedbackIntervalIdx); 
     
-    // BUG FIX #3: Structural Flash Wear Protection 
     AppSettings currentSettings;
     for(int i = 0; i < 10; i++) {
         currentSettings.fxMem[i] = effectMemory[i];
@@ -294,7 +290,6 @@ void updateLUT() {
         if (i % 2048 == 0) { vTaskDelay(pdMS_TO_TICKS(1)); }
     }
     
-    // BUG FIX #2: Atomic Pointer Swap to prevent preemption audio aliasing
     float* tempPtr = pitchShiftLUT;
     pitchShiftLUT = pitchShiftLUT_temp;
     pitchShiftLUT_temp = tempPtr;
@@ -601,7 +596,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
                 ui_audio_level = 0.0f; ui_output_level = 0.0f;
             } else {
-                if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, 0) == pdTRUE) {
+                // BUG FIX #1: Replaced wait-time from 0 to 5ms to perfectly mask Flash Writes and stop audio popping
+                if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                     float targetWindow = LATENCY_WINDOWS[latencyMode];
                     if (currentWindowSize != targetWindow) { 
                         currentWindowSize = targetWindow; 
@@ -1132,14 +1128,15 @@ void MidiTask(void * pvParameters) {
 
             previousRawA = stableRawA; previousRawB = stableRawB;
 
+            // BUG FIX #2: Clamped Dynamic Auto-Calibration logic to prevent permanent deadzones from voltage noise spikes
             if (!unpluggedA) {
-                if (stableRawA < PB1_raw_min) PB1_raw_min = stableRawA;
-                if (stableRawA > PB1_raw_max) PB1_raw_max = stableRawA;
+                if (stableRawA < PB1_raw_min && stableRawA > 200) PB1_raw_min = stableRawA;
+                if (stableRawA > PB1_raw_max && stableRawA < 3800) PB1_raw_max = stableRawA;
             }
 
             if (!unpluggedB) {
-                if (stableRawB < PB2_raw_min) PB2_raw_min = stableRawB;
-                if (stableRawB > PB2_raw_max) PB2_raw_max = stableRawB;
+                if (stableRawB < PB2_raw_min && stableRawB > 200) PB2_raw_min = stableRawB;
+                if (stableRawB > PB2_raw_max && stableRawB < 3800) PB2_raw_max = stableRawB;
             }
             
             if (stableRawC < PB3_raw_min) PB3_raw_min = stableRawC;
@@ -1295,7 +1292,6 @@ void setup() {
     currentSampleRate = preferences.getUInt("sampleRate", 48000);
     feedbackIntervalIdx = preferences.getInt("fbIdx", 0); 
     
-    // BUG FIX #3: Load entirely from optimized memory struct
     AppSettings savedSettings;
     size_t len = preferences.getBytes("dspData", &savedSettings, sizeof(AppSettings));
     if (len == sizeof(AppSettings)) {

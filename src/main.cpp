@@ -66,7 +66,6 @@ float* delayBuffer = nullptr;
 float* fbDelayBuffer = nullptr;  
 float* freezeBuffer = nullptr;   
 
-// BUG FIX #2: Volatile pointer qualifier forces cross-core register reloading
 float* volatile pitchShiftLUT = nullptr; 
 float* pitchShiftLUT_temp = nullptr; 
 
@@ -225,7 +224,6 @@ void calibratePBs() {
     PB1_raw_center = sum1 / 250; PB2_raw_center = sum2 / 250;
     if (PB1_raw_center > 4000 || PB1_raw_center < 100) PB1_raw_center = 2048; if (PB2_raw_center > 4000 || PB2_raw_center < 100) PB2_raw_center = 2048;
     
-    // BUG FIX #1: Initialize realistic boundaries to stop snap-to-max jump on initial pedal touch
     PB1_raw_min = 1000; PB1_raw_max = 3000; 
     PB2_raw_min = 1000; PB2_raw_max = 3000; 
     PB3_raw_min = 1000; PB3_raw_max = 3000; 
@@ -754,14 +752,16 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         if (vibratoActive) {
                             vibratoLfoPhase += globalVibratoPhaseInc; 
                             if (vibratoLfoPhase >= LFO_LUT_SIZE) { vibratoLfoPhase -= LFO_LUT_SIZE; }
-                            spd1 *= 1.0f + ((lfoLUT[(int)vibratoLfoPhase] - 1.0f) * p_vb_dep);
+                            // BUG FIX #3: Mask LFO LUT index with & 1023
+                            spd1 *= 1.0f + ((lfoLUT[(int)vibratoLfoPhase & 1023] - 1.0f) * p_vb_dep);
                         }
                         
                         float spd2 = harmPitch; float spd3 = choPitch;
                         if (chorusActive) { 
                             chorusLfoPhase += chorusPhaseIncr; 
                             if (chorusLfoPhase >= LFO_LUT_SIZE) { chorusLfoPhase -= LFO_LUT_SIZE; }
-                            spd3 *= lfoLUT[(int)chorusLfoPhase]; 
+                            // BUG FIX #3: Mask LFO LUT index with & 1023
+                            spd3 *= lfoLUT[(int)chorusLfoPhase & 1023]; 
                         }
                         
                         float spd4 = 1.0f; float spd5 = 1.0f;
@@ -770,7 +770,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         if (feedbackActive || localFbRamp > 0.0f) { 
                             feedbackLfoPhase += feedbackPhaseIncr; 
                             if (feedbackLfoPhase >= LFO_LUT_SIZE) { feedbackLfoPhase -= LFO_LUT_SIZE; }
-                            float lfoVal = lfoLUT[(int)feedbackLfoPhase]; spd4 = lfoVal; spd5 = fbPitch * lfoVal; 
+                            // BUG FIX #3: Mask LFO LUT index with & 1023
+                            float lfoVal = lfoLUT[(int)feedbackLfoPhase & 1023]; spd4 = lfoVal; spd5 = fbPitch * lfoVal; 
                             
                             w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                             w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
@@ -947,6 +948,9 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
             effectMemory[4] = constrain((float)semi + c, -24.0f, 24.0f);
             lutNeedsUpdate = true; forceUIUpdate = true; 
         }
+        // BUG FIX #2: Add missing HEEL (pIdx 2) and TOE (pIdx 3) controls in Capo Mode
+        if (pIdx == 2) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
+        if (pIdx == 3) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
     }
     else if (activeEffectMode == 5) { 
         if (pIdx == 0) { effectMemory[5] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
@@ -1129,12 +1133,10 @@ void MidiTask(void * pvParameters) {
             if (stableRawC < 0) stableRawC = rawC; if (abs((int)rawC - stableRawC) > 16) stableRawC = rawC;
 
             static bool unpluggedA = false; static bool unpluggedB = false;
-            static int previousRawA = 2048; static int previousRawB = 2048;
 
-            if ((stableRawA - previousRawA) > 1000 && stableRawA > 4050) unpluggedA = true; else if (stableRawA < 3900) unpluggedA = false;
-            if ((stableRawB - previousRawB) > 1000 && stableRawB > 4050) unpluggedB = true; else if (stableRawB < 3900) unpluggedB = false;
-
-            previousRawA = stableRawA; previousRawB = stableRawB;
+            // BUG FIX #1: Absolute threshold check prevents pedal from jumping to Max Pitch Bend when unplugged
+            if (stableRawA > 4000) unpluggedA = true; else if (stableRawA < 3900) unpluggedA = false;
+            if (stableRawB > 4000) unpluggedB = true; else if (stableRawB < 3900) unpluggedB = false;
 
             if (!unpluggedA) {
                 if (stableRawA < PB1_raw_min && stableRawA > 200) PB1_raw_min = stableRawA;
@@ -1223,8 +1225,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             int newCenter = filterPB2.getValue();
             if (newCenter < 4000 && newCenter > 100) PB2_raw_center = newCenter; 
             else PB2_raw_center = 2048;
-            
-            // BUG FIX #1: Keep mechanical baseline limits on snapshot recalibration
             PB2_raw_min = 1000; 
             PB2_raw_max = 3000;
             forceUIUpdate = true; 

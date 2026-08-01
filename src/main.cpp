@@ -23,7 +23,7 @@
 // --- MEMORY PREFERENCES ---
 Preferences preferences;
 volatile bool settingsNeedSaving = false;
-unsigned long lastParameterChangeTime = 0;
+volatile unsigned long lastParameterChangeTime = 0; // BUG FIX #2: Added volatile for Cross-Core safety
 
 // --- DYNAMIC FX PARAMETERS MATRIX ---
 volatile float fxParams[10][5] = {
@@ -557,7 +557,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
         if (sleepRequested) { isSleeping = true; vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         isSleeping = false; 
         size_t bytesRead; 
-        i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, portMAX_DELAY);
+        
+        // BUG FIX #1: Added pdMS_TO_TICKS(20) to prevent permanent WDT Deadlock on I2S stall
+        i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, pdMS_TO_TICKS(20));
         
         if (bytesRead > 0) {
             int framesRead = bytesRead / 8; 
@@ -766,7 +768,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             float feedInput = (frzActive && localFrzRamp > 0.0f) ? fzOut : (w4 * (1.0f - mixV)) + (w5 * mixV);
                             
                             fbHpfState += 0.05f * (feedInput - fbHpfState) + DC_OFFSET; 
-                            float gainDrive = constrain((feedInput - fbHpfState) * p_fb_drv, -1.0f, 1.0f); 
+                            
+                            // BUG FIX #3: Added soft-clipping polynomial to gainDrive to stop aliasing harshness
+                            float rawDrive = (feedInput - fbHpfState) * p_fb_drv;
+                            float boundedDrive = fmaxf(-1.5f, fminf(rawDrive, 1.5f));
+                            float gainDrive = boundedDrive * (1.0f - (0.15f * boundedDrive * boundedDrive));
                             
                             feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
                             float satFb = feedbackFilterVar * (localFbRamp * localFbRamp * localFbRamp) * 0.85f; 
@@ -978,7 +984,6 @@ void MidiTask(void * pvParameters) {
         static unsigned long lastBatteryTime = 0;
         static float smoothedVoltage = -1.0f;
 
-        // --- ACCURATE ACCUMULATED & SMOOTHED BATTERY MONITORING ---
         if (millis() - lastBatteryTime > 1000) {
             lastBatteryTime = millis();
             
@@ -1006,7 +1011,7 @@ void MidiTask(void * pvParameters) {
             static bool wasCharging = false;
             
             if (charging) {
-                newPercent = currentBatteryPercent; // Freeze percentage while charging
+                newPercent = currentBatteryPercent; 
             } else {
                 if (wasCharging || currentBatteryPercent == 100) {
                     newPercent = calculatedPercent;
@@ -1236,26 +1241,26 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 16 && cm.data2 >= 64) { isSwellMode = !isSwellMode; if (activeEffectMode == 8) isWhammyActive = isSwellMode; forceUIUpdate = true; }
         else if (cm.data1 == 7 && cm.data2 >= 64) { isVibratoMode = !isVibratoMode; if (activeEffectMode == 9) isWhammyActive = isVibratoMode; forceUIUpdate = true; }
         else if (cm.data1 == 17 || cm.data1 == 18) {
-            float step = (cm.data2 >= 64) ? -1.0f : 1.0f; // Value 127 = Decrease, 0 = Increase
+            float step = (cm.data2 >= 64) ? -1.0f : 1.0f; 
 
             if (cm.data1 == 17) {
                 if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
-                    effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f); // HEEL
+                    effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f); 
                 } else if (activeEffectMode == 4) {
-                    effectMemory[4] = constrain(effectMemory[4] + step, -24.0f, 24.0f); // CAPO (SEMI)
+                    effectMemory[4] = constrain(effectMemory[4] + step, -24.0f, 24.0f); 
                 } else if (activeEffectMode == 2) { 
                     if (step > 0) feedbackIntervalIdx = (feedbackIntervalIdx + 1) % 5; 
-                    else feedbackIntervalIdx = (feedbackIntervalIdx + 4) % 5;           // FEEDBACK (OVT)
+                    else feedbackIntervalIdx = (feedbackIntervalIdx + 4) % 5;           
                 } else { 
                     effectMemory[activeEffectMode] = constrain(effectMemory[activeEffectMode] + step, -24.0f, 24.0f); 
                 }
             } 
             else if (cm.data1 == 18) {
                 if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
-                    effectMemory[0] = constrain(effectMemory[0] + step, -24.0f, 24.0f); // TOE
+                    effectMemory[0] = constrain(effectMemory[0] + step, -24.0f, 24.0f); 
                 } else if (activeEffectMode == 4) {
                     float centStep = step * 0.01f;
-                    effectMemory[4] = constrain(effectMemory[4] + centStep, -24.0f, 24.0f); // CAPO (CENT)
+                    effectMemory[4] = constrain(effectMemory[4] + centStep, -24.0f, 24.0f); 
                 }
             }
             

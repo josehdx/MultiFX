@@ -65,7 +65,9 @@ volatile uint32_t currentSampleRate = 48000;
 float* delayBuffer = nullptr;    
 float* fbDelayBuffer = nullptr;  
 float* freezeBuffer = nullptr;   
-float* pitchShiftLUT = nullptr; 
+
+// BUG FIX #2: Volatile pointer qualifier forces cross-core register reloading
+float* volatile pitchShiftLUT = nullptr; 
 float* pitchShiftLUT_temp = nullptr; 
 
 int writeIndex = 0; int fbDelayWriteIdx = 0;
@@ -183,7 +185,7 @@ int getBatteryPercentage(float voltage) {
     
     if (voltage >= 4.00f) return 90 + (int)((voltage - 4.00f) / 0.15f * 10.0f);
     if (voltage >= 3.90f) return 80 + (int)((voltage - 3.90f) / 0.10f * 10.0f);
-    if (voltage >= 3.80f) return 70 + (int)((voltage - 3.80f) / 0.10f * 10.0f); // Fixed denominator typo
+    if (voltage >= 3.80f) return 70 + (int)((voltage - 3.80f) / 0.10f * 10.0f); 
     if (voltage >= 3.75f) return 60 + (int)((voltage - 3.75f) / 0.05f * 10.0f);
     if (voltage >= 3.70f) return 50 + (int)((voltage - 3.70f) / 0.05f * 10.0f);
     if (voltage >= 3.65f) return 40 + (int)((voltage - 3.65f) / 0.05f * 10.0f);
@@ -222,7 +224,10 @@ void calibratePBs() {
     for (int i = 1; i <= 250; i++) { filterPB.update(); filterPB2.update(); filterPB3.update(); sum1 += filterPB.getValue(); sum2 += filterPB2.getValue(); delay(1); }
     PB1_raw_center = sum1 / 250; PB2_raw_center = sum2 / 250;
     if (PB1_raw_center > 4000 || PB1_raw_center < 100) PB1_raw_center = 2048; if (PB2_raw_center > 4000 || PB2_raw_center < 100) PB2_raw_center = 2048;
-    PB1_raw_min = PB1_raw_center - 200; PB1_raw_max = PB1_raw_center + 200; PB2_raw_min = PB2_raw_center - 200; PB2_raw_max = PB2_raw_center + 200;
+    
+    // BUG FIX #1: Initialize realistic boundaries to stop snap-to-max jump on initial pedal touch
+    PB1_raw_min = 1000; PB1_raw_max = 3000; 
+    PB2_raw_min = 1000; PB2_raw_max = 3000; 
     PB3_raw_min = 1000; PB3_raw_max = 3000; 
 }
 
@@ -1218,8 +1223,10 @@ bool channelMessageCallback(ChannelMessage cm) {
             int newCenter = filterPB2.getValue();
             if (newCenter < 4000 && newCenter > 100) PB2_raw_center = newCenter; 
             else PB2_raw_center = 2048;
-            PB2_raw_min = PB2_raw_center - 200; 
-            PB2_raw_max = PB2_raw_center + 200;
+            
+            // BUG FIX #1: Keep mechanical baseline limits on snapshot recalibration
+            PB2_raw_min = 1000; 
+            PB2_raw_max = 3000;
             forceUIUpdate = true; 
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();

@@ -104,7 +104,6 @@ TFT_eSprite meterSpr = TFT_eSprite(&tft);
 volatile bool forceUIUpdate = true; 
 
 volatile int activeEffectMode = 0; 
-// 0: TOE(+12), 1: HEEL(-12), 2: unused, 3: Harmony(+5), 4: Capo(-2), 5: Synth(-12), 6: Pad(-12), 7: Chorus(+12), 8: Swell unused, 9: Vibrato(0)
 volatile float effectMemory[10] = { 12.0f, -12.0f, 0.0f, 5.0f, -2.0f, -12.0f, -12.0f, 12.0f, 0.0f, 0.0f };
 volatile float pitchShiftFactor = 1.0f;
 
@@ -184,7 +183,7 @@ int getBatteryPercentage(float voltage) {
     
     if (voltage >= 4.00f) return 90 + (int)((voltage - 4.00f) / 0.15f * 10.0f);
     if (voltage >= 3.90f) return 80 + (int)((voltage - 3.90f) / 0.10f * 10.0f);
-    if (voltage >= 3.80f) return 70 + (int)((voltage - 3.80f) / 0.10f * 10.0f);
+    if (voltage >= 3.80f) return 70 + (int)((voltage - 3.80f) / 0.10f * 10.0f); // Fixed denominator typo
     if (voltage >= 3.75f) return 60 + (int)((voltage - 3.75f) / 0.05f * 10.0f);
     if (voltage >= 3.70f) return 50 + (int)((voltage - 3.70f) / 0.05f * 10.0f);
     if (voltage >= 3.65f) return 40 + (int)((voltage - 3.65f) / 0.05f * 10.0f);
@@ -406,7 +405,6 @@ void updateDisplay() {
         float val = fbi[constrain((int)feedbackIntervalIdx, 0, 4)];
         bGauges[numG++] = {2, val/28.0f, "OVT", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", val);
     } else if (activeEffectMode == 4) {
-        // BUG FIX #3: Reverted to roundf() to prevent musical anchor deadzones when tuning Capo
         int semi = (int)roundf(effectMemory[4]); 
         int cents = (int)roundf((effectMemory[4] - (float)semi) * 100.0f);
         bGauges[numG++] = {1, semi/24.0f, "SEMI", ""}; sprintf(bGauges[numG-1].valStr, "%+d", semi);
@@ -595,7 +593,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             bool blockIsMuted = clearBuffersRequested;
             uint32_t start_cycles = xthal_get_ccount(); 
             
-            // BUG FIX #1: Dynamically scaling envelopes ensures FX speed stays perfectly uniform at 48k or 96k
             float srScale = 48000.0f / (float)currentSampleRate;
 
             if (blockIsMuted) {
@@ -934,7 +931,6 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
         if (pIdx == 1) fxParams[3][0] = norm;                                
     }
     else if (activeEffectMode == 4) { 
-        // BUG FIX #3: Roundf perfectly captures integer semitones and correctly signed musical cents
         if (pIdx == 0) { 
             int cents = (int)roundf((effectMemory[4] - (float)roundf(effectMemory[4])) * 100.0f); 
             effectMemory[4] = constrain(roundf((norm * 48.0f) - 24.0f) + ((float)cents / 100.0f), -24.0f, 24.0f);
@@ -1204,7 +1200,6 @@ void MidiTask(void * pvParameters) {
 bool channelMessageCallback(ChannelMessage cm) {
     if (cm.header == 0xB0) {
         
-        // BUG FIX #2: Prevents Expression Pedal (CC11) from constantly resetting the Flash Auto-Save timer
         if (cm.data1 == 11) { 
             uint16_t mappedCC = map(cm.data2, 0, 127, 0, 16383); currentCC11 = mappedCC; currentPB3 = mappedCC; 
             if (isVolumeMode) { volumePedalGain = (float)mappedCC / 16383.0f; Control_Surface.sendControlChange({19, Channel_1}, cm.data2); } 

@@ -104,7 +104,6 @@ TFT_eSprite meterSpr = TFT_eSprite(&tft);
 volatile bool forceUIUpdate = true; 
 
 volatile int activeEffectMode = 0; 
-// 0: TOE(+12), 1: HEEL(-12), 2: unused, 3: Harmony(+5), 4: Capo(-2), 5: Synth(-12), 6: Pad(-12), 7: Chorus(+12), 8: Swell unused, 9: Vibrato(0)
 volatile float effectMemory[10] = { 12.0f, -12.0f, 0.0f, 5.0f, -2.0f, -12.0f, -12.0f, 12.0f, 0.0f, 0.0f };
 volatile float pitchShiftFactor = 1.0f;
 
@@ -162,7 +161,7 @@ void saveSettings() {
     preferences.putInt("latMode", latencyMode);
     preferences.putBool("pb2Wiper", isPB2WiperMode); 
     preferences.putUInt("sampleRate", currentSampleRate);
-    preferences.putInt("fbIdx", feedbackIntervalIdx); 
+    preferences.putInt("fbIdx", constrain((int)feedbackIntervalIdx, 0, 4)); 
     
     AppSettings currentSettings;
     for(int i = 0; i < 10; i++) {
@@ -297,7 +296,10 @@ void updateLUT() {
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f); 
     globalChorusRatio = powf(2.0f, effectMemory[7] / 12.0f); 
     float fbIntervals[5] = {0.0f, 12.0f, 19.0f, 24.0f, 28.0f}; 
-    globalFbRatio = powf(2.0f, fbIntervals[feedbackIntervalIdx % 5] / 12.0f);
+    
+    // BUG FIX #2: Safe array index guarding against negative underruns
+    globalFbRatio = powf(2.0f, fbIntervals[constrain((int)feedbackIntervalIdx, 0, 4)] / 12.0f);
+    
     float vibHz = (effectMemory[9] != 0.0f) ? fabsf(effectMemory[9]) : 2.0f; 
     globalVibratoPhaseInc = (vibHz * LFO_LUT_SIZE) / (float)currentSampleRate;
 }
@@ -401,10 +403,10 @@ void updateDisplay() {
         bGauges[numG++] = {1, effectMemory[0]/24.0f, "TOE", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", effectMemory[0]);
     } else if (activeEffectMode == 2) {
         float fbi[] = {0.0f, 12.0f, 19.0f, 24.0f, 28.0f}; 
-        float val = fbi[feedbackIntervalIdx % 5];
+        float val = fbi[constrain((int)feedbackIntervalIdx, 0, 4)];
         bGauges[numG++] = {2, val/28.0f, "OVT", ""}; sprintf(bGauges[numG-1].valStr, "%+.1f", val);
     } else if (activeEffectMode == 4) {
-        int semi = (int)roundf(effectMemory[4]); 
+        int semi = (int)truncf(effectMemory[4]); 
         int cents = (int)roundf((effectMemory[4] - (float)semi) * 100.0f);
         bGauges[numG++] = {1, semi/24.0f, "SEMI", ""}; sprintf(bGauges[numG-1].valStr, "%+d", semi);
         bGauges[numG++] = {1, cents/50.0f, "CENT", ""}; sprintf(bGauges[numG-1].valStr, "%+d", cents);
@@ -596,7 +598,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
                 ui_audio_level = 0.0f; ui_output_level = 0.0f;
             } else {
-                // BUG FIX #1: Replaced wait-time from 0 to 5ms to perfectly mask Flash Writes and stop audio popping
                 if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                     float targetWindow = LATENCY_WINDOWS[latencyMode];
                     if (currentWindowSize != targetWindow) { 
@@ -713,11 +714,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             float phase2 = (phaseRead + 0.5f); if (phase2 >= 1.0f) { phase2 -= 1.0f; }
                             
                             int sum1 = freezeStartIdxVar + freezePlayCounterVar;
-                            int idx1 = (sum1 >= freezeLength) ? (sum1 - freezeLength) : sum1;
+                            // BUG FIX #1: Guaranteed modulo array indexing prevents PSRAM boundary overrun
+                            int idx1 = sum1 % freezeLength;
+                            
                             int counter2 = freezePlayCounterVar + (activeFreezeLength / 2);
                             if (counter2 >= activeFreezeLength) counter2 -= activeFreezeLength;
                             int sum2 = freezeStartIdxVar + counter2;
-                            int idx2 = (sum2 >= freezeLength) ? (sum2 - freezeLength) : sum2;
+                            int idx2 = sum2 % freezeLength;
                             
                             float rFrz = (freezeBuffer[idx1] * hannLUT[(int)(phaseRead * 1023.0f)]) + (freezeBuffer[idx2] * hannLUT[(int)(phase2 * 1023.0f)]);
                             
@@ -928,13 +931,14 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
         if (pIdx == 1) fxParams[3][0] = norm;                                
     }
     else if (activeEffectMode == 4) { 
+        // BUG FIX #3: Truncating fractional semitones preserves correct negative cents
         if (pIdx == 0) { 
-            int cents = (int)roundf((effectMemory[4] - (float)roundf(effectMemory[4])) * 100.0f); 
+            int cents = (int)roundf((effectMemory[4] - (float)truncf(effectMemory[4])) * 100.0f); 
             effectMemory[4] = constrain(roundf((norm * 48.0f) - 24.0f) + ((float)cents / 100.0f), -24.0f, 24.0f);
             lutNeedsUpdate = true; forceUIUpdate = true; 
         }
         if (pIdx == 1) { 
-            int semi = (int)roundf(effectMemory[4]); 
+            int semi = (int)truncf(effectMemory[4]); 
             float c = roundf((norm * 100.0f) - 50.0f) / 100.0f; 
             effectMemory[4] = constrain((float)semi + c, -24.0f, 24.0f);
             lutNeedsUpdate = true; forceUIUpdate = true; 
@@ -1128,7 +1132,6 @@ void MidiTask(void * pvParameters) {
 
             previousRawA = stableRawA; previousRawB = stableRawB;
 
-            // BUG FIX #2: Clamped Dynamic Auto-Calibration logic to prevent permanent deadzones from voltage noise spikes
             if (!unpluggedA) {
                 if (stableRawA < PB1_raw_min && stableRawA > 200) PB1_raw_min = stableRawA;
                 if (stableRawA > PB1_raw_max && stableRawA < 3800) PB1_raw_max = stableRawA;

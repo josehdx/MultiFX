@@ -306,7 +306,6 @@ void updateLUT() {
     pitchShiftLUT = pitchShiftLUT_temp;
     pitchShiftLUT_temp = tempPtr;
 
-    // FIX 2: Global ratio updates now run inside the mutex lock to prevent multi-core race conditions
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f); 
     globalChorusRatio = powf(2.0f, effectMemory[7] / 12.0f); 
     float fbIntervals[5] = {0.0f, 12.0f, 19.0f, 24.0f, 28.0f}; 
@@ -594,7 +593,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
                 ui_audio_level = 0.0f; ui_output_level = 0.0f;
             } else {
-                if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                // Mutex take timeout increased to 15 ms so Core 0 task preemption does not cause audio block dropouts
+                if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(15)) == pdTRUE) {
                     float targetWindow = LATENCY_WINDOWS[latencyMode];
                     if (currentWindowSize != targetWindow) { 
                         currentWindowSize = targetWindow; 
@@ -643,13 +643,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             int prev = tempIdx - 1;
                             if (prev < 0) prev += freezeLength;
                             if (freezeBuffer[tempIdx] >= 0.0f && freezeBuffer[prev] < 0.0f) { 
-                                // FIX 1: Corrected inverted grain size calculation to hold a true fundamental pitch grain
+                                // FIX 1: Preserves the exact zero-crossing grain period `s` without resetting to 48000
                                 activeFreezeLength = s; 
                                 break; 
                             }
                             tempIdx = prev;
                         }
-                        if (activeFreezeLength < freezeLength / 2) activeFreezeLength = freezeLength;
+                        if (activeFreezeLength < 64) activeFreezeLength = freezeLength;
                     } 
                     if (!frzActive && wasFrozen) apfNeedsClear = true;
                     wasFrozen = frzActive;
@@ -748,6 +748,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             freezePlayCounterVar++; if (freezePlayCounterVar >= activeFreezeLength) { freezePlayCounterVar = 0; }
                         } else if (apfNeedsClear) {
                             memset(apf1Buffer, 0, sizeof(apf1Buffer)); memset(apf2Buffer, 0, sizeof(apf2Buffer));
+                            // Reset index pointers on freeze clear to prevent phase clicks
+                            apf1Idx = 0; apf2Idx = 0; 
                             apfNeedsClear = false;
                         }
                         
@@ -975,7 +977,7 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
         if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
         if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
         if (pIdx == 2) fxParams[8][0] = 0.001f + (norm * 0.05f);             
-        if (pIdx == 3) fxParams[8][1] = 0.00001f + (norm * 0.0005f);        
+        if (pIdx == 3) fxParams[8][1] = 0.00001f + (norm * 0.001f);        
         if (pIdx == 4) fxParams[8][2] = 0.00001f + (norm * 0.0005f);        
     }
     else if (activeEffectMode == 9) { 
@@ -996,46 +998,14 @@ void MidiTask(void * pvParameters) {
     static bool lastBtState = false; static uint8_t lastVolumeCC = 127;
     static int lastCcOut[5] = {-1, -1, -1, -1, -1};
     
+    // Non-blocking rolling battery ADC variables
+    static uint32_t rawSum = 0;
+    static int batterySampleCount = 0;
+    static float smoothedVoltage = -1.0f;
+    
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
     
     for (;;) {
-        static unsigned long lastBatteryTime = 0;
-        static float smoothedVoltage = -1.0f;
-
-        if (millis() - lastBatteryTime > 1000) {
-            lastBatteryTime = millis();
-            
-            uint32_t rawSum = 0;
-            for (int i = 0; i < 32; i++) {
-                rawSum += analogRead(BATTERY_PIN);
-            }
-            float rawAvg = (float)rawSum / 32.0f;
-            
-            const float CALIBRATION_MULTIPLIER = 1.04571f; 
-            float instantVoltage = (rawAvg / 4095.0f) * 3.3f * 2.0f * CALIBRATION_MULTIPLIER;
-            
-            if (instantVoltage > 2.0f) {
-                bool charging = (instantVoltage > 4.20f);
-                
-                if (smoothedVoltage < 0.1f) {
-                    smoothedVoltage = instantVoltage; 
-                } else {
-                    smoothedVoltage = (smoothedVoltage * 0.9f) + (instantVoltage * 0.1f);
-                }
-                
-                currentBatteryVoltage = smoothedVoltage;
-                int calculatedPercent = getBatteryPercentage(smoothedVoltage);
-                int newPercent = calculatedPercent;
-                
-                isBatteryCharging = charging;
-                
-                if (newPercent != currentBatteryPercent) {
-                    currentBatteryPercent = newPercent; 
-                    forceUIUpdate = true;
-                }
-            }
-        }
-
         Control_Surface.loop(); 
         
         bool currentBtState = btmidi.isConnected();
@@ -1155,6 +1125,41 @@ void MidiTask(void * pvParameters) {
             
             vTaskDelay(pdMS_TO_TICKS(250)); 
         }
+
+        // FIX 1: Battery ADC sampling executes at the very end of the loop, right before vTaskDelay(5) to provide a 5 ms settling time
+        rawSum += analogRead(BATTERY_PIN);
+        batterySampleCount++;
+
+        if (batterySampleCount >= 32) {
+            float rawAvg = (float)rawSum / 32.0f;
+            rawSum = 0;
+            batterySampleCount = 0;
+
+            const float CALIBRATION_MULTIPLIER = 1.04571f; 
+            float instantVoltage = (rawAvg / 4095.0f) * 3.3f * 2.0f * CALIBRATION_MULTIPLIER;
+            
+            if (instantVoltage > 2.0f) {
+                bool charging = (instantVoltage > 4.20f);
+                
+                if (smoothedVoltage < 0.1f) {
+                    smoothedVoltage = instantVoltage; 
+                } else {
+                    smoothedVoltage = (smoothedVoltage * 0.9f) + (instantVoltage * 0.1f);
+                }
+                
+                currentBatteryVoltage = smoothedVoltage;
+                int calculatedPercent = getBatteryPercentage(smoothedVoltage);
+                int newPercent = calculatedPercent;
+                
+                isBatteryCharging = charging;
+                
+                if (newPercent != currentBatteryPercent) {
+                    currentBatteryPercent = newPercent; 
+                    forceUIUpdate = true;
+                }
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
@@ -1191,18 +1196,19 @@ bool channelMessageCallback(ChannelMessage cm) {
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();
         }
+        // FIX 4: Mutex protection for Volume Mode state and volumePedalGain mutations
         else if (cm.data1 == 6 && cm.data2 >= 64) { 
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isVolumeMode = !isVolumeMode; 
             if (!isVolumeMode) {
                 volumePedalGain = 1.0f; 
             } else {
                 lastActivePedal = 8192;
                 if (!lutNeedsUpdate && pitchShiftLUT != nullptr) {
-                    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
                     pitchShiftFactor = pitchShiftLUT[8192];
-                    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
                 }
             }
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             forceUIUpdate = true; 
         }
         else if (cm.data1 == 0 && cm.data2 >= 64) { switchEffectMode(activeEffectMode - 1); }
@@ -1216,6 +1222,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 3 && cm.data2 >= 64) {
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             globalAudioResetRequested = true; 
+            // FIX 3: Included isVibratoMode in anyEffectOn check to prevent unwanted Whammy activation
             bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVibratoMode || isVolumeMode;
             if (anyEffectOn) {
                 isWhammyActive = false; isFrozen = false; isFeedbackActive = false; isHarmonizerMode = false;
@@ -1226,7 +1233,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             lutNeedsUpdate = true; forceUIUpdate = true;
         }
         else if (cm.data1 == 4 && cm.data2 >= 64) { toggleSampleRate(); }
-        // FIX 3: Mutex protections added across direct state toggles to prevent multi-core audio pops
         else if (cm.data1 == 8 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isFrozen = !isFrozen; if (activeEffectMode == 1) isWhammyActive = isFrozen; 

@@ -1022,10 +1022,11 @@ void MidiTask(void * pvParameters) {
         if (currentBtState != lastBtState) { 
             lastBtState = currentBtState; forceUIUpdate = true; 
             if (isScreenOff) turnScreenOn(); 
+            // FIX: Added lastScreenActivityTime update to prevent the screen from immediately turning off again when BT connects
             lastActivityTime = millis(); 
+            lastScreenActivityTime = millis(); 
         }
         
-        // BUG 1 FIX: Removed `if (currentBtState) lastActivityTime = millis();` to allow Flash Auto-Save
         if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) goToLightSleep(); 
         if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) turnScreenOff(); 
         

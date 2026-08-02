@@ -124,7 +124,7 @@ public:
     }
 
     void process(int rawA, int rawB, int rawC, bool isVolumeMode, bool invertPB3) {
-        // Increased Continuous Exponential Moving Average (EMA) filters for strong physical/electrical smoothing
+        // Continuous Exponential Moving Average (EMA) filter
         if (stableRawA < 0) stableRawA = rawA; else stableRawA = (stableRawA * 7 + rawA) / 8;
         if (stableRawB < 0) stableRawB = rawB; else stableRawB = (stableRawB * 7 + rawB) / 8;
         if (stableRawC < 0) stableRawC = rawC; else stableRawC = (stableRawC * 7 + rawC) / 8;

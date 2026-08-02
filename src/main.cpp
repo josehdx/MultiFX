@@ -548,6 +548,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float padFilter = 0.0f; static float padEnv = 0.0f;
     static float inputEnvelope = 0.0f; static float feedbackFilterVar = 0.0f;
     static float smoothedVolGain = 1.0f;
+    
     static float currentPitch = 1.0f; 
     
     static int freezeWriteIdxVar = 0; static int freezePlayCounterVar = 0; 
@@ -593,7 +594,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
                 ui_audio_level = 0.0f; ui_output_level = 0.0f;
             } else {
-                // Mutex take timeout increased to 15 ms so Core 0 task preemption does not cause audio block dropouts
+                // FIX 2: Mutex take timeout increased to 15 ms so Core 0 task preemption does not cause audio block dropouts
                 if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(15)) == pdTRUE) {
                     float targetWindow = LATENCY_WINDOWS[latencyMode];
                     if (currentWindowSize != targetWindow) { 
@@ -748,7 +749,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             freezePlayCounterVar++; if (freezePlayCounterVar >= activeFreezeLength) { freezePlayCounterVar = 0; }
                         } else if (apfNeedsClear) {
                             memset(apf1Buffer, 0, sizeof(apf1Buffer)); memset(apf2Buffer, 0, sizeof(apf2Buffer));
-                            // Reset index pointers on freeze clear to prevent phase clicks
+                            // FIX 3: Reset index pointers on freeze clear to prevent phase clicks
                             apf1Idx = 0; apf2Idx = 0; 
                             apfNeedsClear = false;
                         }
@@ -998,7 +999,6 @@ void MidiTask(void * pvParameters) {
     static bool lastBtState = false; static uint8_t lastVolumeCC = 127;
     static int lastCcOut[5] = {-1, -1, -1, -1, -1};
     
-    // Non-blocking rolling battery ADC variables
     static uint32_t rawSum = 0;
     static int batterySampleCount = 0;
     static float smoothedVoltage = -1.0f;
@@ -1126,7 +1126,8 @@ void MidiTask(void * pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(250)); 
         }
 
-        // FIX 1: Battery ADC sampling executes at the very end of the loop, right before vTaskDelay(5) to provide a 5 ms settling time
+        // FIX 1: Battery ADC sampling moved to the end of loop. 
+        // 5 ms delay provides hardware settling time, eliminating ADC1 multiplexer crosstalk jumps.
         rawSum += analogRead(BATTERY_PIN);
         batterySampleCount++;
 
@@ -1196,7 +1197,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();
         }
-        // FIX 4: Mutex protection for Volume Mode state and volumePedalGain mutations
         else if (cm.data1 == 6 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isVolumeMode = !isVolumeMode; 
@@ -1222,7 +1222,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 3 && cm.data2 >= 64) {
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             globalAudioResetRequested = true; 
-            // FIX 3: Included isVibratoMode in anyEffectOn check to prevent unwanted Whammy activation
+            // FIX 3: Added isVibratoMode to anyEffectOn check
             bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVibratoMode || isVolumeMode;
             if (anyEffectOn) {
                 isWhammyActive = false; isFrozen = false; isFeedbackActive = false; isHarmonizerMode = false;

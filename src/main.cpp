@@ -305,16 +305,17 @@ void updateLUT() {
     float* tempPtr = pitchShiftLUT;
     pitchShiftLUT = pitchShiftLUT_temp;
     pitchShiftLUT_temp = tempPtr;
-    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 
+    // FIX 2: Global ratio updates now run inside the mutex lock to prevent multi-core race conditions
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f); 
     globalChorusRatio = powf(2.0f, effectMemory[7] / 12.0f); 
     float fbIntervals[5] = {0.0f, 12.0f, 19.0f, 24.0f, 28.0f}; 
-    
     globalFbRatio = powf(2.0f, fbIntervals[constrain((int)feedbackIntervalIdx, 0, 4)] / 12.0f);
     
     float vibHz = (effectMemory[9] != 0.0f) ? fabsf(effectMemory[9]) : 2.0f; 
     globalVibratoPhaseInc = (vibHz * LFO_LUT_SIZE) / (float)currentSampleRate;
+
+    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 }
 
 void updateMeters() {
@@ -548,8 +549,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float padFilter = 0.0f; static float padEnv = 0.0f;
     static float inputEnvelope = 0.0f; static float feedbackFilterVar = 0.0f;
     static float smoothedVolGain = 1.0f;
-    
-    // NEW FIX: Retain pitch across block boundaries for smooth linear sample-level interpolation
     static float currentPitch = 1.0f; 
     
     static int freezeWriteIdxVar = 0; static int freezePlayCounterVar = 0; 
@@ -620,11 +619,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float chorusPhaseIncr = p_ch_spd / (float)currentSampleRate; 
                     float feedbackPhaseIncr = p_fb_spd / (float)currentSampleRate;
                     
-                    // NEW FIX 1: Compute slope increment for sample-level linear pitch smoothing across block
                     float targetPitch = pitchShiftFactor;
                     float pitchInc = (targetPitch - currentPitch) / (float)framesRead;
                     
-                    // NEW FIX 2: Replaced heavy % modulo loop math with lightweight pointer wrapping to eliminate CPU spikes
                     bool frzActive = ((activeEffectMode == 1 && isWhammyActive) || isFrozen); 
                     if (frzActive && !wasFrozen) { 
                         freezePlayCounterVar = 0; 
@@ -645,7 +642,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         for (int s = 0; s < 4000; s++) {
                             int prev = tempIdx - 1;
                             if (prev < 0) prev += freezeLength;
-                            if (freezeBuffer[tempIdx] >= 0.0f && freezeBuffer[prev] < 0.0f) { activeFreezeLength = freezeLength - s; break; }
+                            if (freezeBuffer[tempIdx] >= 0.0f && freezeBuffer[prev] < 0.0f) { 
+                                // FIX 1: Corrected inverted grain size calculation to hold a true fundamental pitch grain
+                                activeFreezeLength = s; 
+                                break; 
+                            }
                             tempIdx = prev;
                         }
                         if (activeFreezeLength < freezeLength / 2) activeFreezeLength = freezeLength;
@@ -675,7 +676,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     dsps_biquad_f32(input_block, dc_block, framesRead, dc_coeffs, dc_state);
                     
                     for (int i = 0; i < framesRead; i++) {
-                        // NEW FIX 1 (Cont): Ramped pitch per sample eliminates step/zipper artifacts
                         currentPitch += pitchInc;
                         float harmPitch = currentPitch * globalHarmRatio;
                         float choPitch  = currentPitch * globalChorusRatio;
@@ -909,7 +909,6 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
     float norm = (float)val / 127.0f; 
     int pIdx = cc - 24; 
     
-    // NEW FIX 3: Thread lock prevents cross-core parameter memory race conditions
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
 
     if (activeEffectMode == 0) { 
@@ -1215,29 +1214,76 @@ bool channelMessageCallback(ChannelMessage cm) {
             forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); 
         }
         else if (cm.data1 == 3 && cm.data2 >= 64) {
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             globalAudioResetRequested = true; 
-            bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVolumeMode;
+            bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVibratoMode || isVolumeMode;
             if (anyEffectOn) {
                 isWhammyActive = false; isFrozen = false; isFeedbackActive = false; isHarmonizerMode = false;
                 isCapoMode = false; isSynthMode = false; isPadMode = false; isChorusMode = false; isSwellMode = false; isVibratoMode = false; isVolumeMode = false;
                 volumePedalGain = 1.0f; activeEffectMode = 0; 
             } else { isWhammyActive = true; }
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             lutNeedsUpdate = true; forceUIUpdate = true;
         }
         else if (cm.data1 == 4 && cm.data2 >= 64) { toggleSampleRate(); }
-        else if (cm.data1 == 8 && cm.data2 >= 64) { isFrozen = !isFrozen; if (activeEffectMode == 1) isWhammyActive = isFrozen; forceUIUpdate = true; }
-        else if (cm.data1 == 9 && cm.data2 >= 64) { isFeedbackActive = !isFeedbackActive; if (activeEffectMode == 2) isWhammyActive = isFeedbackActive; forceUIUpdate = true; }
-        else if (cm.data1 == 10 && cm.data2 >= 64) { isHarmonizerMode = !isHarmonizerMode; if (activeEffectMode == 3) isWhammyActive = isHarmonizerMode; forceUIUpdate = true; }
-        else if (cm.data1 == 12 && cm.data2 >= 64) { isCapoMode = !isCapoMode; if (activeEffectMode == 4) isWhammyActive = isCapoMode; lutNeedsUpdate = true; forceUIUpdate = true; }
-        else if (cm.data1 == 13 && cm.data2 >= 64) { isSynthMode = !isSynthMode; if (activeEffectMode == 5) isWhammyActive = isSynthMode; forceUIUpdate = true; }
-        else if (cm.data1 == 14 && cm.data2 >= 64) { isPadMode = !isPadMode; if (activeEffectMode == 6) isWhammyActive = isPadMode; forceUIUpdate = true; }
-        else if (cm.data1 == 15 && cm.data2 >= 64) { isChorusMode = !isChorusMode; if (activeEffectMode == 7) isWhammyActive = isChorusMode; forceUIUpdate = true; }
-        else if (cm.data1 == 16 && cm.data2 >= 64) { isSwellMode = !isSwellMode; if (activeEffectMode == 8) isWhammyActive = isSwellMode; forceUIUpdate = true; }
-        else if (cm.data1 == 7 && cm.data2 >= 64) { isVibratoMode = !isVibratoMode; if (activeEffectMode == 9) isWhammyActive = isVibratoMode; forceUIUpdate = true; }
+        // FIX 3: Mutex protections added across direct state toggles to prevent multi-core audio pops
+        else if (cm.data1 == 8 && cm.data2 >= 64) { 
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+            isFrozen = !isFrozen; if (activeEffectMode == 1) isWhammyActive = isFrozen; 
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 9 && cm.data2 >= 64) { 
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+            isFeedbackActive = !isFeedbackActive; if (activeEffectMode == 2) isWhammyActive = isFeedbackActive; 
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 10 && cm.data2 >= 64) { 
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+            isHarmonizerMode = !isHarmonizerMode; if (activeEffectMode == 3) isWhammyActive = isHarmonizerMode; 
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 12 && cm.data2 >= 64) { 
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+            isCapoMode = !isCapoMode; if (activeEffectMode == 4) isWhammyActive = isCapoMode; 
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+            lutNeedsUpdate = true; forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 13 && cm.data2 >= 64) { 
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+            isSynthMode = !isSynthMode; if (activeEffectMode == 5) isWhammyActive = isSynthMode; 
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 14 && cm.data2 >= 64) { 
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+            isPadMode = !isPadMode; if (activeEffectMode == 6) isWhammyActive = isPadMode; 
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 15 && cm.data2 >= 64) { 
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+            isChorusMode = !isChorusMode; if (activeEffectMode == 7) isWhammyActive = isChorusMode; 
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 16 && cm.data2 >= 64) { 
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+            isSwellMode = !isSwellMode; if (activeEffectMode == 8) isWhammyActive = isSwellMode; 
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+            forceUIUpdate = true; 
+        }
+        else if (cm.data1 == 7 && cm.data2 >= 64) { 
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+            isVibratoMode = !isVibratoMode; if (activeEffectMode == 9) isWhammyActive = isVibratoMode; 
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+            forceUIUpdate = true; 
+        }
         else if (cm.data1 == 17 || cm.data1 == 18) {
             float step = (cm.data2 >= 64) ? -1.0f : 1.0f; 
 
-            // NEW FIX 3: Mutex locks protect effectMemory reads and writes from cross-core race conditions
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             if (cm.data1 == 17) {
                 if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {

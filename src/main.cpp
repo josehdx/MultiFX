@@ -247,7 +247,7 @@ void calibratePBs() {
     if (PB1_raw_center > 4000 || PB1_raw_center < 100) PB1_raw_center = 2048; 
     if (PB2_raw_center > 4000 || PB2_raw_center < 100) PB2_raw_center = 2048;
     
-    // Adjusted dynamic limits to calculate dynamically offset values
+    // Auto-calibration uses dynamically calculated relative bounds from the physical center
     PB1_raw_min = PB1_raw_center - 200; 
     PB1_raw_max = PB1_raw_center + 200; 
     
@@ -286,7 +286,6 @@ void goToLightSleep() {
 
     i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
     
-    // Add external wakeup on GPIO_NUM_0 (BOOT Button) to wake from light sleep
     rtc_gpio_init(GPIO_NUM_0); 
     rtc_gpio_set_direction(GPIO_NUM_0, RTC_GPIO_MODE_INPUT_ONLY);
     rtc_gpio_pullup_en(GPIO_NUM_0); 
@@ -305,7 +304,7 @@ void goToLightSleep() {
     while (isSleeping && timeoutCounter < 10) { vTaskDelay(pdMS_TO_TICKS(10)); timeoutCounter++; }
     vTaskDelay(pdMS_TO_TICKS(200)); 
     
-    if (isScreenOff) turnScreenOn(); // Wake the display up when un-sleeping
+    if (isScreenOff) turnScreenOn(); 
 
     lastActivityTime = millis();
     lastScreenActivityTime = millis(); 

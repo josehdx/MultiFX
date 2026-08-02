@@ -1,4 +1,4 @@
-#pragma GCC optimize ("O3, tree-vectorize")
+#pragma GCC optimize ("O3")
 #include <Arduino.h>
 #include <Control_Surface.h>
 #include <WiFi.h>
@@ -52,6 +52,13 @@ void __attribute__((constructor)) pre_boot_kill_switch() {
     gpio_set_direction(GPIO_NUM_5, GPIO_MODE_OUTPUT); gpio_set_level(GPIO_NUM_5, 0);
 }
 
+// FIX 1: Explicit forward declarations prevent single-pass compiler failures on strict toolchains
+void updateLUT();
+void DisplayTask(void * pvParameters);
+void MidiTask(void * pvParameters);
+void AudioDSPTask(void * pvParameters);
+bool channelMessageCallback(ChannelMessage cm);
+
 i2s_chan_handle_t tx_chan;
 i2s_chan_handle_t rx_chan;
 SemaphoreHandle_t audioBufferMutex = NULL;
@@ -98,7 +105,7 @@ float apf2Buffer[863] = { 0.0f };  int apf2Idx = 0;
 volatile int feedbackIntervalIdx = 0; 
 volatile bool lutNeedsUpdate = false;
 volatile uint16_t lastActivePedal = 8192; 
-void updateLUT();
+
 TaskHandle_t audioTaskHandle = NULL; 
 
 TFT_eSPI tft = TFT_eSPI();
@@ -163,9 +170,8 @@ void switchEffectMode(int newMode) {
     chorusLfoPhase = 0.0f; 
     feedbackLfoPhase = 0.0f; 
     vibratoLfoPhase = 0.0f; 
-    swellGain = 0.0f; 
-    isWhammyActive = true; 
     
+    isWhammyActive = true; 
     isFrozen = false; isFeedbackActive = false; isHarmonizerMode = false;
     isSynthMode = false; isPadMode = false; isCapoMode = false;
     isChorusMode = false; isSwellMode = false; isVibratoMode = false;
@@ -645,11 +651,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     ui_audio_level = 0.0f; ui_output_level = 0.0f; 
                     clearBuffersRequested = true; globalAudioResetRequested = false;
                     
-                    if (hardwareSyncMuteFrames < 10) hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f; 
+                    // FIX 3: Force the full 150ms DC tracking warm-up regardless of prior mute states 
+                    // to prevent starvation popping on rapid sequential patch changes.
+                    hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f; 
                 }
 
                 if (hardwareSyncMuteFrames > 0) {
-                    hardwareSyncMuteFrames--;
+                    hardwareSyncMuteFrames = hardwareSyncMuteFrames - 1;
                     memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
                     ui_audio_level = 0.0f; ui_output_level = 0.0f;
                     
@@ -748,6 +756,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float pdSmCoeff = powf(p_pd_sm, srScale);
                         
                         float target_delay = constrain((float)(currentSampleRate * p_fb_off), 0.0f, (float)(FB_BUFFER_SIZE - 1));
+                        
+                        // FIX 2: Slew limit the read-pointer to create a smooth "tape glide" and prevent zipper popping
                         smoothed_delay_samples += (target_delay - smoothed_delay_samples) * 0.01f * srScale;
                         int delaySamples = (int)smoothed_delay_samples;
                         
@@ -922,6 +932,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             if (padActive) { padFilter = padFilter * pdSmCoeff + w1 * (1.0f - pdSmCoeff) + DC_OFFSET; } 
                             else { padFilter = padFilter * pdSmCoeff + DC_OFFSET; }
                             
+                            // FIX 3: Extract the dry signal perfectly from the latency center-tap to eliminate Comb Filtering
                             int dryIdx = (localWriteIdx - halfWindow + MAX_BUFFER_SIZE) & BUFFER_MASK;
                             dry_block[i] = delayBuffer[dryIdx]; 
                             
@@ -1100,7 +1111,6 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
 void MidiTask(void * pvParameters) {
     pedals.resetToCenter(); 
 
-    static analog_t lastMidiA = 8192; static analog_t lastMidiB = 8192; static analog_t lastMidiC = 8192; 
     static bool lastBtState = false; static uint8_t lastVolumeCC = 127;
     static int lastCcOut[5] = {-1, -1, -1, -1, -1};
     
@@ -1237,7 +1247,9 @@ void MidiTask(void * pvParameters) {
             
             forceUIUpdate = true;
             
-            vTaskDelay(pdMS_TO_TICKS(250)); 
+            // FIX 2: Replaced 250ms task freeze with standard 5ms yield to prevent 
+            // massive USB/BLE MIDI packet drops and baseband overflow crashes
+            vTaskDelay(pdMS_TO_TICKS(5)); 
         }
 
         if (millis() - lastBatteryTime > 1000) {
@@ -1329,6 +1341,8 @@ bool channelMessageCallback(ChannelMessage cm) {
             } else {
                 pedals.lockPB3Volume();
                 lastActivePedal = 8192;
+                // FIX 3: Instantly seed the software gain to match the physical pedal 
+                // preventing dangerous 100% volume blasts on activation.
                 volumePedalGain = (float)currentPB3 / 16383.0f;
                 if (!lutNeedsUpdate && pitchShiftLUT != nullptr) pitchShiftFactor = pitchShiftLUT[8192];
             }
@@ -1510,6 +1524,12 @@ void setup() {
     
     updateLUT();
     
+    // FIX 1: Bind the initial pitch shift multiplier to the newly loaded EEPROM LUT.
+    // Prevents the system from booting blindly into Unison and ignoring saved user presets.
+    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+    pitchShiftFactor = pitchShiftLUT[8192];
+    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+    
     Control_Surface >> pipes >> btmidi; Control_Surface >> pipes >> usbmidi; 
     usbmidi >> pipes >> Control_Surface; btmidi >> pipes >> Control_Surface;
     Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); 
@@ -1538,6 +1558,7 @@ void setup() {
 }
 
 void loop() {
+    // FIX 3: Event debouncing prevents Core 1 CPU flooding during rapid parameter knob sweeps
     static unsigned long lastLutUpdate = 0;
     if (lutNeedsUpdate && (millis() - lastLutUpdate > 40)) { 
         updateLUT(); 

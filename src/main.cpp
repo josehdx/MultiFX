@@ -756,6 +756,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float fbLpfRetain = 1.0f - fbLpfCoeff;
 
                         float dc_alpha = (currentSampleRate == 96000) ? 0.0005f : 0.001f;
+                        
+                        int halfWindow = (int)currentWindowSize / 2;
 
                         #pragma GCC ivdep
                         for (int i = 0; i < framesRead; i++) { 
@@ -916,12 +918,16 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             int32_t step3 = (int32_t)((1.0f - spd3) * 65536.0f); tap_w3_1 += step3; tap_w3_2 += step3; 
                             int32_t step4 = (int32_t)((1.0f - spd4) * 65536.0f); tap_w4_1 += step4; tap_w4_2 += step4; 
                             int32_t step5 = (int32_t)((1.0f - spd5) * 65536.0f); tap_w5_1 += step5; tap_w5_2 += step5; 
-                            writeIndex = (writeIndex + 1) & BUFFER_MASK;
                             
                             if (padActive) { padFilter = padFilter * pdSmCoeff + w1 * (1.0f - pdSmCoeff) + DC_OFFSET; } 
                             else { padFilter = padFilter * pdSmCoeff + DC_OFFSET; }
                             
-                            dry_block[i] = inSample; fz_block[i] = fzOut; pad_block[i] = padFilter; fbOut_block[i] = fbOutNode;
+                            int dryIdx = (localWriteIdx - halfWindow + MAX_BUFFER_SIZE) & BUFFER_MASK;
+                            dry_block[i] = delayBuffer[dryIdx]; 
+                            
+                            fz_block[i] = fzOut; pad_block[i] = padFilter; fbOut_block[i] = fbOutNode;
+                            
+                            writeIndex = (writeIndex + 1) & BUFFER_MASK;
                         }
                         
                         swellGain = localSwellGain; freezeRamp = localFrzRamp; feedbackRamp = localFbRamp;

@@ -121,7 +121,7 @@ volatile int latencyMode = 0; const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 
 volatile bool globalAudioResetRequested = false; volatile bool clearBuffersRequested = false; volatile int hardwareSyncMuteFrames = 0; 
 
 unsigned long lastActivityTime = 0; unsigned long lastScreenActivityTime = 0;
-const unsigned long LIGHT_SLEEP_TIMEOUT = 300000; const unsigned long SCREEN_OFF_TIMEOUT = 60000;  
+const unsigned long LIGHT_SLEEP_TIMEOUT = 90000; const unsigned long SCREEN_OFF_TIMEOUT = 60000;  
 bool isScreenOff = false; volatile bool wakeupPending = false; volatile float core1_load = 0.0f; 
 volatile bool sleepRequested = false; volatile bool isSleeping = false;
 const int BATTERY_PIN = 4; 
@@ -171,43 +171,45 @@ void switchEffectMode(int newMode) {
 }
 
 void saveSettings() {
-    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-
-    preferences.begin("whammy_cfg", false); 
-    preferences.putInt("activeMode", activeEffectMode); 
-    preferences.putInt("latMode", latencyMode);
-    preferences.putBool("pb2Wiper", isPB2WiperMode); 
-    preferences.putUInt("sampleRate", currentSampleRate);
-    preferences.putInt("fbIdx", constrain((int)feedbackIntervalIdx, 0, 4)); 
-    
     AppSettings currentSettings;
+    
+    // Copy the settings instantly to avoid holding the audio processing loop hostage
+    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     for(int i = 0; i < 10; i++) {
         currentSettings.fxMem[i] = effectMemory[i];
         for (int p = 0; p < 5; p++) {
             currentSettings.params[i][p] = fxParams[i][p];
         }
     }
-    preferences.putBytes("dspData", &currentSettings, sizeof(AppSettings));
-
-    preferences.end();
-    
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+
+    // Save to NVS Flash memory safely without freezing the audio thread
+    preferences.begin("whammy_cfg", false); 
+    preferences.putInt("activeMode", activeEffectMode); 
+    preferences.putInt("latMode", latencyMode);
+    preferences.putBool("pb2Wiper", isPB2WiperMode); 
+    preferences.putUInt("sampleRate", currentSampleRate);
+    preferences.putInt("fbIdx", constrain((int)feedbackIntervalIdx, 0, 4)); 
+    preferences.putBytes("dspData", &currentSettings, sizeof(AppSettings));
+    preferences.end();
 }
 
 int getBatteryPercentage(float voltage) {
-    if (voltage >= 4.15f) return 100;
-    if (voltage <= 3.30f) return 0;
+    float clampedVolts = fmaxf(3.30f, fminf(4.15f, voltage));
     
-    if (voltage >= 4.00f) return 90 + (int)((voltage - 4.00f) / 0.15f * 10.0f);
-    if (voltage >= 3.90f) return 80 + (int)((voltage - 3.90f) / 0.10f * 10.0f);
-    if (voltage >= 3.80f) return 70 + (int)((voltage - 3.80f) / 0.10f * 10.0f); 
-    if (voltage >= 3.75f) return 60 + (int)((voltage - 3.75f) / 0.05f * 10.0f);
-    if (voltage >= 3.70f) return 50 + (int)((voltage - 3.70f) / 0.05f * 10.0f);
-    if (voltage >= 3.65f) return 40 + (int)((voltage - 3.65f) / 0.05f * 10.0f);
-    if (voltage >= 3.60f) return 30 + (int)((voltage - 3.60f) / 0.10f * 10.0f);
-    if (voltage >= 3.55f) return 20 + (int)((voltage - 3.55f) / 0.05f * 10.0f);
-    if (voltage >= 3.50f) return 10 + (int)((voltage - 3.50f) / 0.05f * 10.0f);
-    return (int)((voltage - 3.30f) / 0.20f * 10.0f);
+    if (clampedVolts >= 4.15f) return 100;
+    if (clampedVolts <= 3.30f) return 0;
+    
+    if (clampedVolts >= 4.00f) return 90 + (int)((clampedVolts - 4.00f) / 0.15f * 10.0f);
+    if (clampedVolts >= 3.90f) return 80 + (int)((clampedVolts - 3.90f) / 0.10f * 10.0f);
+    if (clampedVolts >= 3.80f) return 70 + (int)((clampedVolts - 3.80f) / 0.10f * 10.0f); 
+    if (clampedVolts >= 3.75f) return 60 + (int)((clampedVolts - 3.75f) / 0.05f * 10.0f);
+    if (clampedVolts >= 3.70f) return 50 + (int)((clampedVolts - 3.70f) / 0.05f * 10.0f);
+    if (clampedVolts >= 3.65f) return 40 + (int)((clampedVolts - 3.65f) / 0.05f * 10.0f);
+    if (clampedVolts >= 3.60f) return 30 + (int)((clampedVolts - 3.60f) / 0.05f * 10.0f);
+    if (clampedVolts >= 3.55f) return 20 + (int)((clampedVolts - 3.55f) / 0.05f * 10.0f);
+    if (clampedVolts >= 3.50f) return 10 + (int)((clampedVolts - 3.50f) / 0.05f * 10.0f);
+    return (int)((clampedVolts - 3.30f) / 0.20f * 10.0f);
 }
 
 analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
@@ -279,7 +281,17 @@ void goToLightSleep() {
 
     i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
     
+    // Add external wakeup on GPIO_NUM_0 (BOOT Button) to wake from light sleep
+    rtc_gpio_init(GPIO_NUM_0); 
+    rtc_gpio_set_direction(GPIO_NUM_0, RTC_GPIO_MODE_INPUT_ONLY);
+    rtc_gpio_pullup_en(GPIO_NUM_0); 
+    esp_sleep_enable_ext1_wakeup(1ULL << 0, ESP_EXT1_WAKEUP_ANY_LOW);
+    
     delay(50); esp_light_sleep_start();
+    
+    rtc_gpio_deinit(GPIO_NUM_0); 
+    pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
+    
     i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); 
 
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
@@ -288,6 +300,8 @@ void goToLightSleep() {
     while (isSleeping && timeoutCounter < 10) { vTaskDelay(pdMS_TO_TICKS(10)); timeoutCounter++; }
     vTaskDelay(pdMS_TO_TICKS(200)); 
     
+    if (isScreenOff) turnScreenOn(); // Wake the display up when un-sleeping
+
     lastActivityTime = millis();
     lastScreenActivityTime = millis(); 
 }
@@ -314,9 +328,12 @@ void updateLUT() {
         if (i % 2048 == 0) { vTaskDelay(pdMS_TO_TICKS(1)); }
     }
     
+    // Safely swap the pointers under the mutex to prevent read corruption on Core 1
+    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     float* tempPtr = pitchShiftLUT;
     pitchShiftLUT = pitchShiftLUT_temp;
     pitchShiftLUT_temp = tempPtr;
+    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 
     globalHarmRatio = powf(2.0f, effectMemory[3] / 12.0f); 
     globalChorusRatio = powf(2.0f, effectMemory[7] / 12.0f); 
@@ -1023,7 +1040,6 @@ void MidiTask(void * pvParameters) {
             
             static bool wasCharging = false;
             
-            // BUG FIX #2: Dynamically update battery percentage while charging
             if (charging) {
                 newPercent = calculatedPercent; 
             } else {
@@ -1184,7 +1200,6 @@ void MidiTask(void * pvParameters) {
 }
 
 bool channelMessageCallback(ChannelMessage cm) {
-    // BUG FIX #3: Reset activity timers when receiving remote MIDI channel messages
     if (isScreenOff) turnScreenOn();
     lastActivityTime = millis();
     lastScreenActivityTime = millis();

@@ -1025,6 +1025,7 @@ void MidiTask(void * pvParameters) {
             lastActivityTime = millis(); 
         }
         
+        // BUG 1 FIX: Removed `if (currentBtState) lastActivityTime = millis();` to allow Flash Auto-Save
         if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) goToLightSleep(); 
         if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) turnScreenOff(); 
         

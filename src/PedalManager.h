@@ -124,10 +124,10 @@ public:
     }
 
     void process(int rawA, int rawB, int rawC, bool isVolumeMode, bool invertPB3) {
-        // Fast delta smoothing filter restores ultra-responsive zero-latency tracking
-        if (stableRawA < 0) stableRawA = rawA; if (abs(rawA - stableRawA) > 6) stableRawA = rawA;
-        if (stableRawB < 0) stableRawB = rawB; if (abs(rawB - stableRawB) > 6) stableRawB = rawB;
-        if (stableRawC < 0) stableRawC = rawC; if (abs(rawC - stableRawC) > 16) stableRawC = rawC;
+        // Increased Continuous Exponential Moving Average (EMA) filters for strong physical/electrical smoothing
+        if (stableRawA < 0) stableRawA = rawA; else stableRawA = (stableRawA * 7 + rawA) / 8;
+        if (stableRawB < 0) stableRawB = rawB; else stableRawB = (stableRawB * 7 + rawB) / 8;
+        if (stableRawC < 0) stableRawC = rawC; else stableRawC = (stableRawC * 7 + rawC) / 8;
 
         // Unplug State Machine
         if (stableRawA > TRS_UNPLUGGED_VOLTAGE) unpluggedA = true;

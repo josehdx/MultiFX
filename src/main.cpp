@@ -133,10 +133,6 @@ volatile int currentBatteryPercent = 100;
 volatile float currentBatteryVoltage = 4.00f; 
 volatile bool isBatteryCharging = false;
 
-// --- ON-SCREEN DIAGNOSTIC MONITORING VARIABLES ---
-volatile int32_t diag_raw_max = 0;
-volatile float diag_dc_val = 0.0f;
-
 pin_t pinPB = 1; pin_t pinPB2 = 2; pin_t pinPB3 = 10;    
 const int BOOT_SENSE_PIN = 0; 
 
@@ -242,7 +238,6 @@ void toggleSampleRate() {
     i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); 
     vTaskDelay(pdMS_TO_TICKS(50)); 
     
-    // FIX: Hard teardown of I2S peripheral to guarantee pristine DMA bit alignment on 96kHz swaps
     i2s_del_channel(tx_chan); 
     i2s_del_channel(rx_chan);
     
@@ -288,7 +283,6 @@ void goToLightSleep() {
 
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan);
-    // FIX: Hard teardown of I2S to fully release DMA buses prior to RTOS CPU Sleep
     i2s_del_channel(tx_chan); 
     i2s_del_channel(rx_chan);
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
@@ -304,7 +298,6 @@ void goToLightSleep() {
 
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     
-    // FIX: Rebuild pristine I2S connection to external ADC upon waking
     i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
     i2sConfig.dma_desc_num = 8; i2sConfig.dma_frame_num = HOP_SIZE; i2sConfig.auto_clear = true;
     i2s_new_channel(&i2sConfig, &tx_chan, &rx_chan);
@@ -568,16 +561,17 @@ void updateDisplay() {
 
     int statsRowY = 162; spr.setTextColor(TFT_LIGHTGREY, TFT_BLACK); spr.setTextDatum(ML_DATUM); 
     char cpuUsageBuffer[16]; sprintf(cpuUsageBuffer, "CPU:%2d%%", (int)core1_load); spr.drawString(cpuUsageBuffer, 25, statsRowY);
+    char internalSramBuffer[16]; sprintf(internalSramBuffer, "SRM:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024)); spr.drawString(internalSramBuffer, 85, statsRowY);
+    char psramBuffer[16]; sprintf(psramBuffer, "PSR:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024)); spr.drawString(psramBuffer, 150, statsRowY);
+
+    // FIX 3: Reclaimed TFT screen real estate and restored sample rate / latency readout visuals
+    spr.setTextDatum(MC_DATUM); spr.setTextColor(TFT_WHITE); 
+    spr.drawRect(210, statsRowY - 7, 40, 14, TFT_DARKGREY);
+    spr.drawString((currentSampleRate == 96000) ? "96k" : "48k", 230, statsRowY);
     
-    // --- ON-SCREEN MONITORING TOOL ---
-    char diagStr[50];
-    sprintf(diagStr, "SR:%sk DC:%.3f R:0x%06X M:%d", 
-            (currentSampleRate == 96000) ? "96" : "48", 
-            diag_dc_val, 
-            (unsigned int)((diag_raw_max >> 8) & 0xFFFFFF), 
-            hardwareSyncMuteFrames);
-    spr.setTextColor(TFT_YELLOW, TFT_BLACK);
-    spr.drawString(diagStr, 85, statsRowY);
+    spr.drawRect(255, statsRowY - 7, 40, 14, TFT_DARKGREY);
+    const char* latencyLabelStrings[] = {"U.Low", "Low", "Mid", "High"}; 
+    spr.drawString(latencyLabelStrings[latencyMode], 275, statsRowY);
 
     spr.pushSprite(0, 0); updateMeters();
 }
@@ -642,15 +636,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             framesRead &= ~3; 
             
             if (framesRead > 0) {
-                
-                int32_t block_raw_max = 0;
-                for (int i = 0; i < framesRead; i++) {
-                    int32_t raw_s = i2s_in_block[i * 2];
-                    if (abs(raw_s) > abs(block_raw_max)) block_raw_max = raw_s;
-                }
-                diag_raw_max = block_raw_max;
-                diag_dc_val = input_dc_offset;
-
                 if (globalAudioResetRequested) {
                     synthEnv = 0.0f; synthFilter = 0.0f; padFilter = 0.0f; padEnv = 0.0f;
                     inputEnvelope = 0.0f; feedbackFilterVar = 0.0f; smoothedVolGain = volumePedalGain; currentPitch = 1.0f;
@@ -791,6 +776,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 if (inputEnvelope > p_sw_thr) { localSwellGain = fminf(1.0f, localSwellGain + (p_sw_att * srScale)); } 
                                 else { localSwellGain = fmaxf(0.0f, localSwellGain - (p_sw_rel * srScale)); }
                             } else { 
+                                // FIX 2: Swell bypass release ramp dynamically scaled
                                 if (localSwellGain < 1.0f) localSwellGain = fminf(1.0f, localSwellGain + (0.005f * srScale)); 
                                 else localSwellGain = 1.0f; 
                             }
@@ -975,9 +961,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             }
                         }
                         
+                        // FIX 2: Dynamic alpha scaling guarantees the physical expression pedal feels identical at 48k and 96k
+                        float vol_alpha = 0.01f * srScale;
+
                         #pragma GCC ivdep
                         for (int i = 0; i < framesRead; i++) {
-                            smoothedVolGain = smoothedVolGain * 0.99f + localVolGain * 0.01f;
+                            smoothedVolGain = smoothedVolGain * (1.0f - vol_alpha) + localVolGain * vol_alpha;
                             float rawOut = mix_block[i] * localSwellGain * smoothedVolGain; 
                             
                             if (fabsf(dc_block[i]) > peakInputVal) peakInputVal = fabsf(dc_block[i]); 
@@ -1266,15 +1255,16 @@ void MidiTask(void * pvParameters) {
                     smoothedVoltage = (smoothedVoltage * 0.9f) + (instantVoltage * 0.1f);
                 }
                 
-                currentBatteryVoltage = smoothedVoltage;
                 int newPercent = getBatteryPercentage(smoothedVoltage);
                 
+                // FIX 1: Forces immediate UI response when USB cable is plugged/unplugged
+                bool stateChanged = (newPercent != currentBatteryPercent) || (charging != isBatteryCharging);
+                
+                currentBatteryVoltage = smoothedVoltage;
+                currentBatteryPercent = newPercent;
                 isBatteryCharging = charging;
                 
-                if (newPercent != currentBatteryPercent) {
-                    currentBatteryPercent = newPercent; 
-                    forceUIUpdate = true;
-                }
+                if (stateChanged) forceUIUpdate = true;
             }
         }
 

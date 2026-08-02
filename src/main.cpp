@@ -121,13 +121,18 @@ volatile int latencyMode = 0; const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 
 volatile bool globalAudioResetRequested = false; volatile bool clearBuffersRequested = false; volatile int hardwareSyncMuteFrames = 0; 
 
 unsigned long lastActivityTime = 0; unsigned long lastScreenActivityTime = 0;
-const unsigned long LIGHT_SLEEP_TIMEOUT = 90000; const unsigned long SCREEN_OFF_TIMEOUT = 60000;  
+
+// USER TESTING TIMEOUTS APPLIED HERE 📌
+const unsigned long LIGHT_SLEEP_TIMEOUT = 45000; const unsigned long SCREEN_OFF_TIMEOUT = 15000;  
+
 bool isScreenOff = false; volatile bool wakeupPending = false; volatile float core1_load = 0.0f; 
 volatile bool sleepRequested = false; volatile bool isSleeping = false;
 const int BATTERY_PIN = 4; 
 volatile int currentBatteryPercent = 100; 
 volatile float currentBatteryVoltage = 4.00f; 
 volatile bool isBatteryCharging = false;
+
+volatile int systemRecoveryFrames = 50; // Global lockout for extreme limit tracking at boot/wake
 
 pin_t pinPB = 1; pin_t pinPB2 = 2; pin_t pinPB3 = 10;    
 const int BOOT_SENSE_PIN = 0; 
@@ -144,6 +149,7 @@ uint16_t PB3_raw_min = 1000; uint16_t PB3_raw_max = 3000; int deadzone_size = 40
 
 bool PB1_unplugged_at_boot = false;
 bool PB2_unplugged_at_boot = false;
+bool PB3_unplugged_at_boot = false;
 
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB = pinPB;
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
@@ -173,7 +179,6 @@ void switchEffectMode(int newMode) {
 void saveSettings() {
     AppSettings currentSettings;
     
-    // Copy the settings instantly to avoid holding the audio processing loop hostage
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     for(int i = 0; i < 10; i++) {
         currentSettings.fxMem[i] = effectMemory[i];
@@ -183,7 +188,6 @@ void saveSettings() {
     }
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 
-    // Save to NVS Flash memory safely without freezing the audio thread
     preferences.begin("whammy_cfg", false); 
     preferences.putInt("activeMode", activeEffectMode); 
     preferences.putInt("latMode", latencyMode);
@@ -213,7 +217,8 @@ int getBatteryPercentage(float voltage) {
 }
 
 analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
-    int outerDeadzone = 350; int deadLower = center - dZone; int deadUpper = center + dZone;
+    int outerDeadzone = 150; 
+    int deadLower = center - dZone; int deadUpper = center + dZone;
     int effMin = rMin + outerDeadzone; int effMax = rMax - outerDeadzone;
     if (effMin >= deadLower) effMin = rMin + 50; if (effMax <= deadUpper) effMax = rMax - 50;
     if (raw <= effMin) return 0; if (raw >= effMax) return 16383; if (raw >= deadLower && raw <= deadUpper) return 8192;
@@ -237,17 +242,21 @@ analog_t map_raw_expression(int raw, uint16_t rMin, uint16_t rMax, bool invert) 
 
 void calibratePBs() {
     for (int i = 0; i < 50; i++) { filterPB.update(); filterPB2.update(); filterPB3.update(); delay(1); }
-    long sum1 = 0; long sum2 = 0;
-    for (int i = 1; i <= 250; i++) { filterPB.update(); filterPB2.update(); filterPB3.update(); sum1 += filterPB.getValue(); sum2 += filterPB2.getValue(); delay(1); }
-    PB1_raw_center = sum1 / 250; PB2_raw_center = sum2 / 250;
+    long sum1 = 0; long sum2 = 0; long sum3 = 0;
+    for (int i = 1; i <= 250; i++) { 
+        filterPB.update(); filterPB2.update(); filterPB3.update(); 
+        sum1 += filterPB.getValue(); sum2 += filterPB2.getValue(); sum3 += filterPB3.getValue();
+        delay(1); 
+    }
+    PB1_raw_center = sum1 / 250; PB2_raw_center = sum2 / 250; int PB3_raw_avg = sum3 / 250;
     
     if (PB1_raw_center > 4000) PB1_unplugged_at_boot = true;
     if (PB2_raw_center > 4000) PB2_unplugged_at_boot = true;
+    if (PB3_raw_avg > 4000) PB3_unplugged_at_boot = true;
 
     if (PB1_raw_center > 4000 || PB1_raw_center < 100) PB1_raw_center = 2048; 
     if (PB2_raw_center > 4000 || PB2_raw_center < 100) PB2_raw_center = 2048;
     
-    // Auto-calibration uses dynamically calculated relative bounds from the physical center
     PB1_raw_min = PB1_raw_center - 200; 
     PB1_raw_max = PB1_raw_center + 200; 
     
@@ -305,6 +314,12 @@ void goToLightSleep() {
     vTaskDelay(pdMS_TO_TICKS(200)); 
     
     if (isScreenOff) turnScreenOn(); 
+    
+    systemRecoveryFrames = 50; 
+    PB1_raw_min = PB1_raw_center - 200;
+    PB1_raw_max = PB1_raw_center + 200;
+    PB2_raw_min = PB2_raw_center - 200;
+    PB2_raw_max = PB2_raw_center + 200;
 
     lastActivityTime = millis();
     lastScreenActivityTime = millis(); 
@@ -332,7 +347,6 @@ void updateLUT() {
         if (i % 2048 == 0) { vTaskDelay(pdMS_TO_TICKS(1)); }
     }
     
-    // Safely swap the pointers under the mutex to prevent read corruption on Core 1
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     float* tempPtr = pitchShiftLUT;
     pitchShiftLUT = pitchShiftLUT_temp;
@@ -1030,38 +1044,25 @@ void MidiTask(void * pvParameters) {
             const float CALIBRATION_MULTIPLIER = 1.04571f; 
             float instantVoltage = (rawAvg / 4095.0f) * 3.3f * 2.0f * CALIBRATION_MULTIPLIER;
             
-            bool charging = (instantVoltage > 4.20f);
-            
-            if (smoothedVoltage < 0.1f) {
-                smoothedVoltage = instantVoltage; 
-            } else {
-                smoothedVoltage = (smoothedVoltage * 0.9f) + (instantVoltage * 0.1f);
-            }
-            
-            currentBatteryVoltage = smoothedVoltage;
-            int calculatedPercent = getBatteryPercentage(smoothedVoltage);
-            int newPercent = currentBatteryPercent;
-            
-            static bool wasCharging = false;
-            
-            if (charging) {
-                newPercent = calculatedPercent; 
-            } else {
-                if (wasCharging || currentBatteryPercent == 100) {
-                    newPercent = calculatedPercent;
-                } else if (calculatedPercent < currentBatteryPercent) {
-                    newPercent = calculatedPercent; 
+            if (instantVoltage > 2.0f) {
+                bool charging = (instantVoltage > 4.20f);
+                
+                if (smoothedVoltage < 0.1f) {
+                    smoothedVoltage = instantVoltage; 
+                } else {
+                    smoothedVoltage = (smoothedVoltage * 0.9f) + (instantVoltage * 0.1f);
                 }
-            }
-            wasCharging = charging;
-            
-            Serial.printf("[BATTERY] RawAvg: %.1f | Instant: %.3fV | Display: %.2fV | Percent: %d%%\n", 
-                          rawAvg, instantVoltage, smoothedVoltage, newPercent);
-            
-            if (newPercent != currentBatteryPercent || charging != isBatteryCharging) {
-                currentBatteryPercent = newPercent; 
-                isBatteryCharging = charging; 
-                forceUIUpdate = true;
+                
+                currentBatteryVoltage = smoothedVoltage;
+                int calculatedPercent = getBatteryPercentage(smoothedVoltage);
+                int newPercent = calculatedPercent;
+                
+                isBatteryCharging = charging;
+                
+                if (newPercent != currentBatteryPercent) {
+                    currentBatteryPercent = newPercent; 
+                    forceUIUpdate = true;
+                }
             }
         }
 
@@ -1135,30 +1136,57 @@ void MidiTask(void * pvParameters) {
 
             static bool unpluggedA = PB1_unplugged_at_boot;
             static bool unpluggedB = PB2_unplugged_at_boot;
-            static int previousRawA = 2048;
-            static int previousRawB = 2048;
+            static bool unpluggedC = PB3_unplugged_at_boot;
 
-            if ((stableRawA - previousRawA) > 1000 && stableRawA > 4050) unpluggedA = true;
+            static int recoveryA = 0;
+            static int recoveryB = 0;
+            static int recoveryC = 0;
+
+            // BUG FIX: Removed velocity requirement. Cable capacitance prevents instant jumps.
+            // Anything above 4050 on a pull-up circuit is 100% guaranteed to be unplugged.
+            if (stableRawA > 4050) unpluggedA = true;
             else if (stableRawA < 3900) unpluggedA = false;
 
-            if ((stableRawB - previousRawB) > 1000 && stableRawB > 4050) unpluggedB = true;
+            if (stableRawB > 4050) unpluggedB = true;
             else if (stableRawB < 3900) unpluggedB = false;
+            
+            if (stableRawC > 4050) unpluggedC = true;
+            else if (stableRawC < 3900) unpluggedC = false;
 
-            previousRawA = stableRawA;
-            previousRawB = stableRawB;
+            if (systemRecoveryFrames > 0) systemRecoveryFrames--;
 
-            if (!unpluggedA) {
+            if (unpluggedA) {
+                recoveryA = 300; 
+                PB1_raw_min = PB1_raw_center - 200;
+                PB1_raw_max = PB1_raw_center + 200;
+            } else if (recoveryA > 0) {
+                recoveryA--;
+            } else if (systemRecoveryFrames == 0) {
                 if (stableRawA < PB1_raw_min && stableRawA > 200) PB1_raw_min = stableRawA;
                 if (stableRawA > PB1_raw_max && stableRawA <= 4095) PB1_raw_max = stableRawA;
             }
 
-            if (!unpluggedB) {
+            if (unpluggedB) {
+                recoveryB = 300;
+                PB2_raw_min = PB2_raw_center - 200;
+                PB2_raw_max = PB2_raw_center + 200;
+            } else if (recoveryB > 0) {
+                recoveryB--;
+            } else if (systemRecoveryFrames == 0) {
                 if (stableRawB < PB2_raw_min && stableRawB > 200) PB2_raw_min = stableRawB;
                 if (stableRawB > PB2_raw_max && stableRawB <= 4095) PB2_raw_max = stableRawB;
             }
             
-            if (stableRawC < PB3_raw_min) PB3_raw_min = stableRawC;
-            if (stableRawC > PB3_raw_max && stableRawC <= 4095) PB3_raw_max = stableRawC;
+            if (unpluggedC) {
+                recoveryC = 300;
+                PB3_raw_min = 1000;
+                PB3_raw_max = 3000;
+            } else if (recoveryC > 0) {
+                recoveryC--;
+            } else if (systemRecoveryFrames == 0) {
+                if (stableRawC < PB3_raw_min && stableRawC > 200) PB3_raw_min = stableRawC;
+                if (stableRawC > PB3_raw_max && stableRawC <= 4095) PB3_raw_max = stableRawC;
+            }
             
             analog_t calA = map_raw_deadzone(stableRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
             
@@ -1169,8 +1197,9 @@ void MidiTask(void * pvParameters) {
             
             analog_t calC = map_raw_expression(stableRawC, PB3_raw_min, PB3_raw_max, INVERT_PB3);
             
-            if (unpluggedA) calA = 8192;
-            if (unpluggedB) calB = 8192;
+            if (unpluggedA || systemRecoveryFrames > 0 || recoveryA > 0) calA = 8192;
+            if (unpluggedB || systemRecoveryFrames > 0 || recoveryB > 0) calB = 8192;
+            if (unpluggedC || systemRecoveryFrames > 0 || recoveryC > 0) calC = lastMidiC;
             
             bool moveA = (abs((int)calA - (int)lastMidiA) > 12) || ((calA == 8192 || calA == 0 || calA == 16383) && calA != lastMidiA);
             bool moveB = (abs((int)calB - (int)lastMidiB) > 12) || ((calB == 8192 || calB == 0 || calB == 16383) && calB != lastMidiB);

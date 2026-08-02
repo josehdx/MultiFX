@@ -1142,8 +1142,7 @@ void MidiTask(void * pvParameters) {
             static int recoveryB = 0;
             static int recoveryC = 0;
 
-            // BUG FIX: Removed velocity requirement. Cable capacitance prevents instant jumps.
-            // Anything above 4050 on a pull-up circuit is 100% guaranteed to be unplugged.
+            // BUG FIX 1: Absolute threshold detection avoids "slow float" capacitance bugs
             if (stableRawA > 4050) unpluggedA = true;
             else if (stableRawA < 3900) unpluggedA = false;
 
@@ -1197,13 +1196,22 @@ void MidiTask(void * pvParameters) {
             
             analog_t calC = map_raw_expression(stableRawC, PB3_raw_min, PB3_raw_max, INVERT_PB3);
             
+            // BUG FIX 2: Force PB1 and PB2 to precisely 50% (8192) when unplugged so the UI meters center
             if (unpluggedA || systemRecoveryFrames > 0 || recoveryA > 0) calA = 8192;
             if (unpluggedB || systemRecoveryFrames > 0 || recoveryB > 0) calB = 8192;
-            if (unpluggedC || systemRecoveryFrames > 0 || recoveryC > 0) calC = lastMidiC;
+            
+            // BUG FIX 3: PB3 outputs 100% when volume is active (avoids muting), and 50% when whammy is active
+            if (unpluggedC || systemRecoveryFrames > 0 || recoveryC > 0) {
+                if (isVolumeMode) {
+                    calC = 16383; // 100% Volume
+                } else {
+                    calC = 8192;  // 50% Neutral Pitch/Whammy
+                }
+            }
             
             bool moveA = (abs((int)calA - (int)lastMidiA) > 12) || ((calA == 8192 || calA == 0 || calA == 16383) && calA != lastMidiA);
             bool moveB = (abs((int)calB - (int)lastMidiB) > 12) || ((calB == 8192 || calB == 0 || calB == 16383) && calB != lastMidiB);
-            bool moveC = (abs((int)calC - (int)lastMidiC) >= 128) || ((calC == 0 || calC == 16383) && calC != lastMidiC);
+            bool moveC = (abs((int)calC - (int)lastMidiC) >= 128) || ((calC == 0 || calC == 16383 || calC == 8192) && calC != lastMidiC);
             
             if (moveA || moveB || moveC) {
                 if (isScreenOff) turnScreenOn();

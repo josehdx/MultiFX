@@ -167,7 +167,6 @@ void switchEffectMode(int newMode) {
     swellGain = 0.0f; 
     isWhammyActive = true; 
     
-    // FIX 1: Clear all ghosted effects to prevent multi-patch DSP stacking
     isFrozen = false; isFeedbackActive = false; isHarmonizerMode = false;
     isSynthMode = false; isPadMode = false; isCapoMode = false;
     isChorusMode = false; isSwellMode = false; isVibratoMode = false;
@@ -190,7 +189,6 @@ void saveSettings() {
             currentSettings.params[i][p] = fxParams[i][p];
         }
     }
-    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 
     preferences.begin("whammy_cfg", false); 
     preferences.putInt("activeMode", activeEffectMode); 
@@ -200,6 +198,8 @@ void saveSettings() {
     preferences.putInt("fbIdx", constrain((int)feedbackIntervalIdx, 0, 4)); 
     preferences.putBytes("dspData", &currentSettings, sizeof(AppSettings));
     preferences.end();
+    
+    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 }
 
 int getBatteryPercentage(float voltage) {
@@ -569,7 +569,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float smoothedVolGain = 1.0f;
     static float currentPitch = 1.0f; 
     
-    // FIX 2: Static allocation outside the fast block loop correctly preserves feedback delay tail memory
     static float fbOutNode = 0.0f;
     
     static int freezeWriteIdxVar = 0; static int freezePlayCounterVar = 0; 
@@ -588,21 +587,33 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
         if (bytesRead > 0) {
             int framesRead = bytesRead / 8; 
             
+            // FIX 3: Bitwise mask forces SIMD-aligned buffer lengths to prevent stack corruption in ESP-DSP
+            framesRead &= ~3;
+            
             if (framesRead > 0) {
                 if (hardwareSyncMuteFrames > 0) {
                     hardwareSyncMuteFrames--;
                     memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
                     ui_audio_level = 0.0f; ui_output_level = 0.0f;
-                    for(int j = 0; j < 4; j++) dc_state[j] = 0.0f; 
+                    
+                    // FIX 2: Run the DC filter silently during the hardware mute block.
+                    // This allows the software high-pass pole to perfectly track and warm-up to the external ADC's 
+                    // inherent ambient DC bias voltage (approx ~1.65v) during sample rate synchronization.
+                    for (int i = 0; i < framesRead; i++) { 
+                        int32_t clean_sample = i2s_in_block[i * 2] & 0xFFFFFF00;
+                        input_block[i] = ((float)clean_sample * normFactor); 
+                    }
+                    dsps_biquad_f32(input_block, dc_block, framesRead, dc_coeffs, dc_state);
+                    
                     size_t bytesWrittenCount; i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, portMAX_DELAY);
                     continue; 
                 }
                 
                 if (globalAudioResetRequested) {
                     synthEnv = 0.0f; synthFilter = 0.0f; padFilter = 0.0f; padEnv = 0.0f;
-                    inputEnvelope = 0.0f; feedbackFilterVar = 0.0f; smoothedVolGain = 1.0f; currentPitch = 1.0f;
+                    inputEnvelope = 0.0f; feedbackFilterVar = 0.0f; smoothedVolGain = volumePedalGain; currentPitch = 1.0f;
                     freezeWriteIdxVar = 0; freezePlayCounterVar = 0; freezeStartIdxVar = 0; activeFreezeLength = currentSampleRate;
-                    fbDelayWriteIdx = 0; writeIndex = 0;
+                    fbDelayWriteIdx = 0; writeIndex = 0; apfNeedsClear = true;
                     for(int j = 0; j < 4; j++) dc_state[j] = 0.0f; 
                     ui_audio_level = 0.0f; ui_output_level = 0.0f; 
                     clearBuffersRequested = true; globalAudioResetRequested = false;
@@ -713,7 +724,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 if (inputEnvelope > p_sw_thr) { localSwellGain = fminf(1.0f, localSwellGain + (p_sw_att * srScale)); } 
                                 else { localSwellGain = fmaxf(0.0f, localSwellGain - (p_sw_rel * srScale)); }
                             } else { 
-                                // FIX 4: Smooth release ramp to prevent massive DC popping when bypassing Swell mid-envelope
                                 if (localSwellGain < 1.0f) localSwellGain = fminf(1.0f, localSwellGain + (0.005f * srScale)); 
                                 else localSwellGain = 1.0f; 
                             }
@@ -818,7 +828,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 
                                 float mixV = fmaxf(0.0f, fminf((localFbRamp - 0.1f) * 2.0f, 1.0f));
                                 
-                                // FIX 2: Restored mathematical feedback loop routing to guarantee infinite physical sustain
                                 float feedInput = (frzActive && localFrzRamp > 0.0f) ? fzOut : (w4 * (1.0f - mixV)) + (w5 * mixV) + (fbOutNode * 0.95f);
                                 
                                 fbHpfState += 0.05f * (feedInput - fbHpfState) + DC_OFFSET; 
@@ -895,7 +904,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 sMix += baseSignal * g_base; sMix += p_w2[i] * g_w2; sMix += p_w3[i] * g_w3;
                                 sMix += p_pad[i] * g_pad; sMix += p_fz[i] * g_frz; sMix += p_fb[i] * g_fb;
                                 sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
-                                // FIX 3: Attenuation scalar added to polynomial to guarantee mathematical safety against integer shearing
                                 p_mix[i] = sMix * (1.0f - (0.1f * sMix * sMix)) * 0.82f;
                             }
                         }
@@ -1047,9 +1055,10 @@ void MidiTask(void * pvParameters) {
             lastActivityTime = millis(); 
             lastScreenActivityTime = millis(); 
         }
-
+        
         if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) goToLightSleep(); 
-        if (!currentBtState && !isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) turnScreenOff(); 
+        // FIX 1: Screen will now correctly time out and turn off even if a Bluetooth device is actively paired
+        if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) turnScreenOff(); 
         
         #if ENABLE_PAR_KNOBS
             if (filterPar1.update()) {
@@ -1271,6 +1280,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 2 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             latencyMode = (latencyMode + 1) % 4; 
+            globalAudioResetRequested = true; 
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); 
         }

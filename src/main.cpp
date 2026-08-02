@@ -83,6 +83,7 @@ DRAM_ATTR float synthLUT[WAVE_LUT_SIZE];
 volatile float globalHarmRatio = 1.0f; volatile float globalChorusRatio = 1.0f;
 volatile float globalFbRatio = 1.0f; volatile float globalVibratoPhaseInc = 0.0f;
 
+// Restored missing tap declarations
 uint32_t tap_w1_1 = 0; uint32_t tap_w1_2 = 256 << 16; 
 uint32_t tap_w2_1 = 0; uint32_t tap_w2_2 = 256 << 16; 
 uint32_t tap_w3_1 = 0; uint32_t tap_w3_2 = 256 << 16; 
@@ -159,12 +160,15 @@ BluetoothMIDI_Interface btmidi; USBMIDI_Interface usbmidi; MIDI_PipeFactory<4> p
 PedalManager pedals;
 
 void switchEffectMode(int newMode) {
+    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     activeEffectMode = (newMode % 10 + 10) % 10;
     chorusLfoPhase = 0.0f; 
     feedbackLfoPhase = 0.0f; 
     vibratoLfoPhase = 0.0f; 
     swellGain = 0.0f; 
     isWhammyActive = true; 
+    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+    
     lutNeedsUpdate = true; 
     forceUIUpdate = true; 
     settingsNeedSaving = true; 
@@ -533,8 +537,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float w1_block[HOP_SIZE] __attribute__((aligned(16)));
     static float w2_block[HOP_SIZE] __attribute__((aligned(16)));
     static float w3_block[HOP_SIZE] __attribute__((aligned(16)));
-    static float w4_block[HOP_SIZE] __attribute__((aligned(16)));
-    static float w5_block[HOP_SIZE] __attribute__((aligned(16)));
     static float dry_block[HOP_SIZE] __attribute__((aligned(16)));
     static float fz_block[HOP_SIZE] __attribute__((aligned(16)));
     static float pad_block[HOP_SIZE] __attribute__((aligned(16)));
@@ -547,6 +549,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float padFilter = 0.0f; static float padEnv = 0.0f;
     static float inputEnvelope = 0.0f; static float feedbackFilterVar = 0.0f;
     static float smoothedVolGain = 1.0f;
+    static float currentPitch = 1.0f; 
     
     static int freezeWriteIdxVar = 0; static int freezePlayCounterVar = 0; 
     static int freezeStartIdxVar = 0; static int activeFreezeLength = 48000;
@@ -574,7 +577,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             
             if (globalAudioResetRequested) {
                 synthEnv = 0.0f; synthFilter = 0.0f; padFilter = 0.0f; padEnv = 0.0f;
-                inputEnvelope = 0.0f; feedbackFilterVar = 0.0f; smoothedVolGain = 1.0f; 
+                inputEnvelope = 0.0f; feedbackFilterVar = 0.0f; smoothedVolGain = 1.0f; currentPitch = 1.0f;
                 freezeWriteIdxVar = 0; freezePlayCounterVar = 0; freezeStartIdxVar = 0; activeFreezeLength = currentSampleRate;
                 fbDelayWriteIdx = 0; writeIndex = 0;
                 for(int j = 0; j < 4; j++) dc_state[j] = 0.0f; 
@@ -616,22 +619,32 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float chorusPhaseIncr = p_ch_spd / (float)currentSampleRate; 
                     float feedbackPhaseIncr = p_fb_spd / (float)currentSampleRate;
                     
+                    float targetPitch = pitchShiftFactor;
+                    float pitchInc = (targetPitch - currentPitch) / (float)framesRead;
+                    
+                    // Heavy % modulo logic completely replaced with light bounded wrapping
                     bool frzActive = ((activeEffectMode == 1 && isWhammyActive) || isFrozen); 
                     if (frzActive && !wasFrozen) { 
                         freezePlayCounterVar = 0; 
                         int bestStart = freezeWriteIdxVar;
+                        int tempIdx = freezeWriteIdxVar;
                         for (int s = 0; s < 4000; s++) {
-                            int idx = (freezeWriteIdxVar - s + freezeLength) % freezeLength;
-                            int prev = (idx - 1 + freezeLength) % freezeLength;
-                            if (freezeBuffer[idx] >= 0.0f && freezeBuffer[prev] < 0.0f) { bestStart = idx; break; }
+                            int prev = tempIdx - 1;
+                            if (prev < 0) prev += freezeLength;
+                            if (freezeBuffer[tempIdx] >= 0.0f && freezeBuffer[prev] < 0.0f) { bestStart = tempIdx; break; }
+                            tempIdx = prev;
                         }
                         freezeStartIdxVar = bestStart;
                         activeFreezeLength = freezeLength;
-                        int searchEnd = (bestStart - 1 + freezeLength) % freezeLength;
+                        
+                        int searchEnd = bestStart - 1;
+                        if (searchEnd < 0) searchEnd += freezeLength;
+                        tempIdx = searchEnd;
                         for (int s = 0; s < 4000; s++) {
-                            int idx = (searchEnd - s + freezeLength) % freezeLength;
-                            int prev = (idx - 1 + freezeLength) % freezeLength;
-                            if (freezeBuffer[idx] >= 0.0f && freezeBuffer[prev] < 0.0f) { activeFreezeLength = freezeLength - s; break; }
+                            int prev = tempIdx - 1;
+                            if (prev < 0) prev += freezeLength;
+                            if (freezeBuffer[tempIdx] >= 0.0f && freezeBuffer[prev] < 0.0f) { activeFreezeLength = freezeLength - s; break; }
+                            tempIdx = prev;
                         }
                         if (activeFreezeLength < freezeLength / 2) activeFreezeLength = freezeLength;
                     } 
@@ -659,12 +672,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     }
                     dsps_biquad_f32(input_block, dc_block, framesRead, dc_coeffs, dc_state);
                     
-                    float currentPitch = pitchShiftFactor; 
-                    float harmPitch = currentPitch * globalHarmRatio;
-                    float choPitch  = currentPitch * globalChorusRatio;
-                    float fbPitch   = currentPitch * globalFbRatio;
-                    
                     for (int i = 0; i < framesRead; i++) {
+                        currentPitch += pitchInc;
+                        float harmPitch = currentPitch * globalHarmRatio;
+                        float choPitch  = currentPitch * globalChorusRatio;
+                        float fbPitch   = currentPitch * globalFbRatio;
+                        
                         float inSample = dc_block[i]; 
                         inputEnvelope = inputEnvelope * 0.99f + fabsf(inSample) * 0.01f + DC_OFFSET;
                         
@@ -679,7 +692,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             if (inputEnvelope > 0.005f) { synthEnv = fminf(1.0f, synthEnv + (p_sy_att * srScale)); } 
                             else { synthEnv = fmaxf(0.0f, synthEnv - (p_sy_rel * srScale)); }
                             
-                            // BUG FIX 3: Prevent NaN memory reads in synthesizer wave lookup
+                            // Prevent NaN memory reads in synthesizer wave lookup
                             if (isnan(procSample)) procSample = 0.0f;
                             int waveIdx = constrain((int)((procSample + 1.0f) * 1023.5f), 0, WAVE_LUT_SIZE - 1);
                             procSample = synthLUT[waveIdx]; 
@@ -755,15 +768,15 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         }
                         
                         float spd4 = 1.0f; float spd5 = 1.0f;
-                        float w4 = 0.0f; float w5 = 0.0f; float fbOutNode = 0.0f;
+                        float fbOutNode = 0.0f;
                         
                         if (feedbackActive || localFbRamp > 0.0f) { 
                             feedbackLfoPhase += feedbackPhaseIncr; 
                             if (feedbackLfoPhase >= LFO_LUT_SIZE) { feedbackLfoPhase -= LFO_LUT_SIZE; }
                             float lfoVal = lfoLUT[(int)feedbackLfoPhase & 1023]; spd4 = lfoVal; spd5 = fbPitch * lfoVal; 
                             
-                            w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
-                            w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                            float w4 = processTap(tap_w4_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + processTap(tap_w4_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
+                            float w5 = processTap(tap_w5_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + processTap(tap_w5_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                                 
                             if (feedbackActive) {
                                 if (inputEnvelope > 0.005f) { localFbRamp = fminf(1.0f, localFbRamp + (0.000011f * srScale)); } 
@@ -799,8 +812,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float w3 = 0.0f;
                         if (chorusActive) w3 = processTap(tap_w3_1, delayBuffer, localWriteIdx, windowMask, hannIntMult) + processTap(tap_w3_2, delayBuffer, localWriteIdx, windowMask, hannIntMult);
                         w3_block[i] = w3; 
-                        
-                        w4_block[i] = w4; w5_block[i] = w5; 
                         
                         int32_t step1 = (int32_t)((1.0f - spd1) * 65536.0f); tap_w1_1 += step1; tap_w1_2 += step1; 
                         int32_t step2 = (int32_t)((1.0f - spd2) * 65536.0f); tap_w2_1 += step2; tap_w2_2 += step2; 
@@ -896,6 +907,9 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
     float norm = (float)val / 127.0f; 
     int pIdx = cc - 24; 
     
+    // BUG FIX 2: Mutex added to prevent race conditions during CC matrix updates
+    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+
     if (activeEffectMode == 0) { 
         if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
         if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
@@ -967,6 +981,8 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
         if (pIdx == 0) { effectMemory[9] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; forceUIUpdate = true; } 
         if (pIdx == 1) fxParams[9][0] = norm * 2.0f;                         
     }
+
+    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
     
     settingsNeedSaving = true; 
     lastParameterChangeTime = millis();
@@ -1190,7 +1206,12 @@ bool channelMessageCallback(ChannelMessage cm) {
         }
         else if (cm.data1 == 0 && cm.data2 >= 64) { switchEffectMode(activeEffectMode - 1); }
         else if (cm.data1 == 1 && cm.data2 >= 64) { switchEffectMode(activeEffectMode + 1); }
-        else if (cm.data1 == 2 && cm.data2 >= 64) { latencyMode = (latencyMode + 1) % 4; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); }
+        else if (cm.data1 == 2 && cm.data2 >= 64) { 
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+            latencyMode = (latencyMode + 1) % 4; 
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+            forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); 
+        }
         else if (cm.data1 == 3 && cm.data2 >= 64) {
             globalAudioResetRequested = true; 
             bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVibratoMode || isVolumeMode;
@@ -1214,6 +1235,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 17 || cm.data1 == 18) {
             float step = (cm.data2 >= 64) ? -1.0f : 1.0f; 
 
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             if (cm.data1 == 17) {
                 if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
                     effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f); 
@@ -1234,6 +1256,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[4] = constrain(effectMemory[4] + centStep, -24.0f, 24.0f); 
                 }
             }
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             
             lutNeedsUpdate = true; forceUIUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
         }
@@ -1336,7 +1359,7 @@ void loop() {
         }
     }
     
-    // BUG FIX 5: Ensure Core 0 Flash Erase/Write operations do not stall live MIDI parameter changes
+    // BUG FIX: Ensure Core 0 Flash Erase/Write operations do not stall live MIDI parameter changes
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000) && (millis() - lastActivityTime > 2000)) { 
         saveSettings(); 
         settingsNeedSaving = false; 

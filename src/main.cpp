@@ -247,8 +247,13 @@ void calibratePBs() {
     if (PB1_raw_center > 4000 || PB1_raw_center < 100) PB1_raw_center = 2048; 
     if (PB2_raw_center > 4000 || PB2_raw_center < 100) PB2_raw_center = 2048;
     
-    PB1_raw_min = 1000; PB1_raw_max = 3000; 
-    PB2_raw_min = 1000; PB2_raw_max = 3000; 
+    // Adjusted dynamic limits to calculate dynamically offset values
+    PB1_raw_min = PB1_raw_center - 200; 
+    PB1_raw_max = PB1_raw_center + 200; 
+    
+    PB2_raw_min = PB2_raw_center - 200; 
+    PB2_raw_max = PB2_raw_center + 200; 
+    
     PB3_raw_min = 1000; PB3_raw_max = 3000; 
 }
 
@@ -1129,8 +1134,19 @@ void MidiTask(void * pvParameters) {
             if (stableRawB < 0) stableRawB = rawB; if (abs((int)rawB - stableRawB) > 6) stableRawB = rawB;
             if (stableRawC < 0) stableRawC = rawC; if (abs((int)rawC - stableRawC) > 16) stableRawC = rawC;
 
-            bool unpluggedA = PB1_unplugged_at_boot;
-            bool unpluggedB = PB2_unplugged_at_boot;
+            static bool unpluggedA = PB1_unplugged_at_boot;
+            static bool unpluggedB = PB2_unplugged_at_boot;
+            static int previousRawA = 2048;
+            static int previousRawB = 2048;
+
+            if ((stableRawA - previousRawA) > 1000 && stableRawA > 4050) unpluggedA = true;
+            else if (stableRawA < 3900) unpluggedA = false;
+
+            if ((stableRawB - previousRawB) > 1000 && stableRawB > 4050) unpluggedB = true;
+            else if (stableRawB < 3900) unpluggedB = false;
+
+            previousRawA = stableRawA;
+            previousRawB = stableRawB;
 
             if (!unpluggedA) {
                 if (stableRawA < PB1_raw_min && stableRawA > 200) PB1_raw_min = stableRawA;
@@ -1146,7 +1162,12 @@ void MidiTask(void * pvParameters) {
             if (stableRawC > PB3_raw_max && stableRawC <= 4095) PB3_raw_max = stableRawC;
             
             analog_t calA = map_raw_deadzone(stableRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
+            
+            // NOTICE: PB2 will always be a self-centered device, either a Hall effect sensor 
+            // or a wiper potentiometer. It will never be a linear toe-to-heel expression pedal.
+            // Therefore, we permanently apply map_raw_deadzone here. (Not a bug)
             analog_t calB = map_raw_deadzone(stableRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
+            
             analog_t calC = map_raw_expression(stableRawC, PB3_raw_min, PB3_raw_max, INVERT_PB3);
             
             if (unpluggedA) calA = 8192;
@@ -1173,7 +1194,11 @@ void MidiTask(void * pvParameters) {
                 if (moveB) { lastActivePedal = calB; pitchChanged = true; }
                 if (moveC && !isVolumeMode) { lastActivePedal = calC; pitchChanged = true; }
 
-                if (pitchChanged) pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)];
+                if (pitchChanged) {
+                    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+                    pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)];
+                    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+                }
 
                 if (moveC && isVolumeMode) {
                     uint8_t vCC = map(calC, 0, 16383, 0, 127); 
@@ -1189,7 +1214,13 @@ void MidiTask(void * pvParameters) {
                 lastMidiA = 8192; lastMidiB = 8192; lastMidiC = 8192; 
                 currentPB1 = 8192; currentPB2 = 8192; currentPB3 = 8192; 
                 lastActivePedal = 8192;
-                if (!lutNeedsUpdate) pitchShiftFactor = pitchShiftLUT[8192]; 
+                
+                if (!lutNeedsUpdate) {
+                    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+                    pitchShiftFactor = pitchShiftLUT[8192]; 
+                    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+                }
+                
                 if (isVolumeMode) volumePedalGain = 8192.0f / 16383.0f; 
                 forceUIUpdate = true;
             }
@@ -1209,7 +1240,13 @@ bool channelMessageCallback(ChannelMessage cm) {
         if (cm.data1 == 11) { 
             uint16_t mappedCC = map(cm.data2, 0, 127, 0, 16383); currentCC11 = mappedCC; currentPB3 = mappedCC; 
             if (isVolumeMode) { volumePedalGain = (float)mappedCC / 16383.0f; Control_Surface.sendControlChange({19, Channel_1}, cm.data2); } 
-            else { if (!lutNeedsUpdate) pitchShiftFactor = pitchShiftLUT[mappedCC]; }
+            else { 
+                if (!lutNeedsUpdate) {
+                    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+                    pitchShiftFactor = pitchShiftLUT[mappedCC]; 
+                    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+                }
+            }
             forceUIUpdate = true; 
             return false; 
         }
@@ -1224,8 +1261,8 @@ bool channelMessageCallback(ChannelMessage cm) {
             int newCenter = filterPB2.getValue();
             if (newCenter < 4000 && newCenter > 100) PB2_raw_center = newCenter; 
             else PB2_raw_center = 2048;
-            PB2_raw_min = 1000; 
-            PB2_raw_max = 3000;
+            PB2_raw_min = PB2_raw_center - 200; 
+            PB2_raw_max = PB2_raw_center + 200; 
             forceUIUpdate = true; 
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();
@@ -1236,7 +1273,11 @@ bool channelMessageCallback(ChannelMessage cm) {
                 volumePedalGain = 1.0f; 
             } else {
                 lastActivePedal = 8192;
-                if (!lutNeedsUpdate && pitchShiftLUT != nullptr) pitchShiftFactor = pitchShiftLUT[8192];
+                if (!lutNeedsUpdate && pitchShiftLUT != nullptr) {
+                    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+                    pitchShiftFactor = pitchShiftLUT[8192];
+                    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+                }
             }
             forceUIUpdate = true; 
         }
@@ -1374,7 +1415,13 @@ void setup() {
 }
 
 void loop() {
-    if (lutNeedsUpdate) { updateLUT(); pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; lutNeedsUpdate = false; }
+    if (lutNeedsUpdate) { 
+        updateLUT(); 
+        if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+        pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
+        if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+        lutNeedsUpdate = false; 
+    }
     if (clearBuffersRequested) {
         if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, portMAX_DELAY) == pdTRUE) {
             memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float)); memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(float)); memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(float));

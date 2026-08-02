@@ -236,12 +236,15 @@ void toggleSampleRate() {
 
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
 
-    i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); vTaskDelay(pdMS_TO_TICKS(10));
+    i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); 
+    vTaskDelay(pdMS_TO_TICKS(50)); 
+    
     if (currentSampleRate == 96000) currentSampleRate = 48000; else currentSampleRate = 96000;
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate);
     i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg); i2s_channel_reconfig_std_clock(rx_chan, &clk_cfg);
     freezeLength = currentSampleRate; lutNeedsUpdate = true;
-    i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
+    i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); 
+    hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
 
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 
@@ -258,21 +261,24 @@ void goToLightSleep() {
     while (!isSleeping && timeoutCounter < 10) { vTaskDelay(pdMS_TO_TICKS(10)); timeoutCounter++; }
 
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+    i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan);
+    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 
-    i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
-    
-    rtc_gpio_init(GPIO_NUM_0); 
-    rtc_gpio_set_direction(GPIO_NUM_0, RTC_GPIO_MODE_INPUT_ONLY);
-    rtc_gpio_pullup_en(GPIO_NUM_0); 
-    esp_sleep_enable_ext1_wakeup(1ULL << 0, ESP_EXT1_WAKEUP_ANY_LOW);
-    
-    delay(50); esp_light_sleep_start();
-    
-    rtc_gpio_deinit(GPIO_NUM_0); 
-    pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
-    
+    int initA = filterPB.getValue(); int initB = filterPB2.getValue(); int initC = filterPB3.getValue();
+    while (digitalRead(BOOT_SENSE_PIN) == HIGH) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        filterPB.update(); filterPB2.update(); filterPB3.update();
+        if (abs((int)filterPB.getValue() - initA) > 150) break;
+        if (abs((int)filterPB2.getValue() - initB) > 150) break;
+        if (abs((int)filterPB3.getValue() - initC) > 150) break;
+    }
+
+    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); 
-
+    
+    hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
+    globalAudioResetRequested = true;
+    
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 
     sleepRequested = false; timeoutCounter = 0;
@@ -587,27 +593,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
         if (bytesRead > 0) {
             int framesRead = bytesRead / 8; 
             
-            // FIX 3: Bitwise mask forces SIMD-aligned buffer lengths to prevent stack corruption in ESP-DSP
+            // FIX 3: Bitwise mask forces strict 128-bit SIMD register alignment to prevent memory overwrite panics
             framesRead &= ~3;
             
             if (framesRead > 0) {
-                if (hardwareSyncMuteFrames > 0) {
-                    hardwareSyncMuteFrames--;
-                    memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
-                    ui_audio_level = 0.0f; ui_output_level = 0.0f;
-                    
-                    // FIX 2: Run the DC filter silently during the hardware mute block.
-                    // This allows the software high-pass pole to perfectly track and warm-up to the external ADC's 
-                    // inherent ambient DC bias voltage (approx ~1.65v) during sample rate synchronization.
-                    for (int i = 0; i < framesRead; i++) { 
-                        int32_t clean_sample = i2s_in_block[i * 2] & 0xFFFFFF00;
-                        input_block[i] = ((float)clean_sample * normFactor); 
-                    }
-                    dsps_biquad_f32(input_block, dc_block, framesRead, dc_coeffs, dc_state);
-                    
-                    size_t bytesWrittenCount; i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, portMAX_DELAY);
-                    continue; 
-                }
                 
                 if (globalAudioResetRequested) {
                     synthEnv = 0.0f; synthFilter = 0.0f; padFilter = 0.0f; padEnv = 0.0f;
@@ -617,6 +606,29 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     for(int j = 0; j < 4; j++) dc_state[j] = 0.0f; 
                     ui_audio_level = 0.0f; ui_output_level = 0.0f; 
                     clearBuffersRequested = true; globalAudioResetRequested = false;
+                }
+
+                if (hardwareSyncMuteFrames > 0) {
+                    hardwareSyncMuteFrames--;
+                    memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
+                    ui_audio_level = 0.0f; ui_output_level = 0.0f;
+                    
+                    // FIX 1: Prevent IIR Filter Poisoning.
+                    // The ADC spits out violent MCLK PLL-lock noise during the first ~100ms of a sample rate switch or sleep wake. 
+                    // We only allow the DC Blocker to track the signal during the final 40 frames of the mute, 
+                    // ensuring it captures the clean, steady-state DC offset without absorbing the massive noise spikes.
+                    if (hardwareSyncMuteFrames < 40) {
+                        for (int i = 0; i < framesRead; i++) { 
+                            int32_t clean_sample = i2s_in_block[i * 2] & 0xFFFFFF00;
+                            input_block[i] = ((float)clean_sample * normFactor); 
+                        }
+                        dsps_biquad_f32(input_block, dc_block, framesRead, dc_coeffs, dc_state);
+                    } else {
+                        for(int j = 0; j < 4; j++) dc_state[j] = 0.0f; 
+                    }
+                    
+                    size_t bytesWrittenCount; i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, portMAX_DELAY);
+                    continue; 
                 }
 
                 bool blockIsMuted = clearBuffersRequested;
@@ -703,6 +715,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
 
                         float pdSmCoeff = powf(p_pd_sm, srScale);
                         int delaySamples = constrain((int)(currentSampleRate * p_fb_off), 0, FB_BUFFER_SIZE - 1);
+                        
+                        // FIX 3: Dynamically scale feedback IIR filters to prevent octave shifting and distortion changes at 96kHz
+                        float fbHpfCoeff = (currentSampleRate == 96000) ? 0.025f : 0.05f;
+                        float fbLpfCoeff = (currentSampleRate == 96000) ? 0.05f : 0.1f;
+                        float fbLpfRetain = 1.0f - fbLpfCoeff;
 
                         #pragma GCC ivdep
                         for (int i = 0; i < framesRead; i++) { 
@@ -830,13 +847,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 
                                 float feedInput = (frzActive && localFrzRamp > 0.0f) ? fzOut : (w4 * (1.0f - mixV)) + (w5 * mixV) + (fbOutNode * 0.95f);
                                 
-                                fbHpfState += 0.05f * (feedInput - fbHpfState) + DC_OFFSET; 
+                                fbHpfState += fbHpfCoeff * (feedInput - fbHpfState) + DC_OFFSET; 
                                 
                                 float rawDrive = (feedInput - fbHpfState) * p_fb_drv;
                                 float boundedDrive = fmaxf(-1.5f, fminf(rawDrive, 1.5f));
                                 float gainDrive = boundedDrive * (1.0f - (0.15f * boundedDrive * boundedDrive));
                                 
-                                feedbackFilterVar = feedbackFilterVar * 0.9f + gainDrive * 0.1f + DC_OFFSET;
+                                feedbackFilterVar = feedbackFilterVar * fbLpfRetain + gainDrive * fbLpfCoeff + DC_OFFSET;
                                 float satFb = feedbackFilterVar * (localFbRamp * localFbRamp * localFbRamp) * 0.85f; 
                                 fbDelayBuffer[fbDelayWriteIdx] = satFb;
                                 
@@ -1055,9 +1072,10 @@ void MidiTask(void * pvParameters) {
             lastActivityTime = millis(); 
             lastScreenActivityTime = millis(); 
         }
-        
+
         if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) goToLightSleep(); 
-        // FIX 1: Screen will now correctly time out and turn off even if a Bluetooth device is actively paired
+        
+        // FIX 2: Insomnia Screen-Override Block Removed entirely. 
         if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) turnScreenOff(); 
         
         #if ENABLE_PAR_KNOBS

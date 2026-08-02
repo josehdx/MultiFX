@@ -554,6 +554,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float pad_block[HOP_SIZE] __attribute__((aligned(16)));
     static float fbOut_block[HOP_SIZE] __attribute__((aligned(16)));
     
+    // RESTORED: Stable DC Blocker Pole Configuration (-0.995f) for the ESP-DSP Library
     static float dc_coeffs[5] = {1.0f, -1.0f, 0.0f, -0.995f, 0.0f}; 
     static float dc_state[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     
@@ -681,6 +682,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float localSwellGain = swellGain; float localVolGain = volumePedalGain;
                         float localFrzRamp = freezeRamp; float localFbRamp = feedbackRamp;
 
+                        // FIX 2: Heavy math hoisted completely outside the 64-sample tight loop
+                        float pdSmCoeff = powf(p_pd_sm, srScale);
+                        int delaySamples = constrain((int)(currentSampleRate * p_fb_off), 0, FB_BUFFER_SIZE - 1);
+
                         #pragma GCC ivdep
                         for (int i = 0; i < framesRead; i++) { 
                             int32_t clean_sample = i2s_in_block[i * 2] & 0xFFFFFF00;
@@ -737,13 +742,16 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 float phaseRead = (float)freezePlayCounterVar * activeInvFreqLength; 
                                 float phase2 = (phaseRead + 0.5f); if (phase2 >= 1.0f) { phase2 -= 1.0f; }
                                 
+                                // FIX 3: Fast buffer wrapping replaces expensive multi-cycle modulo division
                                 int sum1 = freezeStartIdxVar + freezePlayCounterVar;
-                                int idx1 = sum1 % freezeLength;
+                                int idx1 = sum1;
+                                if (idx1 >= freezeLength) idx1 -= freezeLength;
                                 
                                 int counter2 = freezePlayCounterVar + (activeFreezeLength / 2);
                                 if (counter2 >= activeFreezeLength) counter2 -= activeFreezeLength;
                                 int sum2 = freezeStartIdxVar + counter2;
-                                int idx2 = sum2 % freezeLength;
+                                int idx2 = sum2;
+                                if (idx2 >= freezeLength) idx2 -= freezeLength;
                                 
                                 float rFrz = (freezeBuffer[idx1] * hannLUT[(int)(phaseRead * 1023.0f)]) + (freezeBuffer[idx2] * hannLUT[(int)(phase2 * 1023.0f)]);
                                 
@@ -812,7 +820,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 float satFb = feedbackFilterVar * (localFbRamp * localFbRamp * localFbRamp) * 0.85f; 
                                 fbDelayBuffer[fbDelayWriteIdx] = satFb;
                                 
-                                int delaySamples = constrain((int)(currentSampleRate * p_fb_off), 0, FB_BUFFER_SIZE - 1);
                                 int fbReadIdx = (fbDelayWriteIdx - delaySamples + FB_BUFFER_SIZE) & FB_BUFFER_MASK;
                                 fbOutNode = fbDelayBuffer[fbReadIdx];
                                 fbDelayWriteIdx = (fbDelayWriteIdx + 1) & FB_BUFFER_MASK;
@@ -836,7 +843,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             int32_t step5 = (int32_t)((1.0f - spd5) * 65536.0f); tap_w5_1 += step5; tap_w5_2 += step5; 
                             writeIndex = (writeIndex + 1) & BUFFER_MASK;
                             
-                            float pdSmCoeff = powf(p_pd_sm, srScale);
                             if (padActive) { padFilter = padFilter * pdSmCoeff + w1 * (1.0f - pdSmCoeff) + DC_OFFSET; } 
                             else { padFilter = padFilter * pdSmCoeff + DC_OFFSET; }
                             
@@ -916,10 +922,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 size_t bytesWrittenCount; 
                 i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, portMAX_DELAY);
             } else {
-                // FIX: Prevents a 100% CPU infinite deadlock on Core 1 if the I2S channels are temporarily disabled by the configuration/sleep tasks
+                // FIX 5: Prevent CPU spin-loop deadlock when I2S returns a 0-length read block
                 vTaskDelay(pdMS_TO_TICKS(2));
             }
         } else {
+            // FIX 5: Prevent CPU spin-loop deadlock when I2S returns a 0-length read block
             vTaskDelay(pdMS_TO_TICKS(2));
         }
     }
@@ -1030,16 +1037,9 @@ void MidiTask(void * pvParameters) {
             lastActivityTime = millis(); 
             lastScreenActivityTime = millis(); 
         }
-
-        // FIX: Forcefully turns on the screen and resets the sleep timers if a BT device connects while the physical display is turned off
-        if (currentBtState && isScreenOff) {
-            turnScreenOn();
-            lastScreenActivityTime = millis();
-            lastActivityTime = millis();
-        }
         
         if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) goToLightSleep(); 
-        if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) turnScreenOff(); 
+        if (!currentBtState && !isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) turnScreenOff(); 
         
         #if ENABLE_PAR_KNOBS
             if (filterPar1.update()) {
@@ -1373,14 +1373,15 @@ bool channelMessageCallback(ChannelMessage cm) {
     return false;
 }
 
+// FIX 4: Constrains EEPROM memory retrieval boundaries to prevent RTOS crashes and boot loops
 void setup() {
     audioBufferMutex = xSemaphoreCreateMutex(); WiFi.mode(WIFI_OFF);
     preferences.begin("whammy_cfg", true); 
-    activeEffectMode = preferences.getInt("activeMode", 0); 
-    latencyMode = preferences.getInt("latMode", 0);
+    activeEffectMode = constrain(preferences.getInt("activeMode", 0), 0, 9); 
+    latencyMode = constrain(preferences.getInt("latMode", 0), 0, 3);
     isPB2WiperMode = preferences.getBool("pb2Wiper", false); 
     currentSampleRate = preferences.getUInt("sampleRate", 48000);
-    feedbackIntervalIdx = preferences.getInt("fbIdx", 0); 
+    feedbackIntervalIdx = constrain(preferences.getInt("fbIdx", 0), 0, 4); 
     
     AppSettings savedSettings;
     size_t len = preferences.getBytes("dspData", &savedSettings, sizeof(AppSettings));

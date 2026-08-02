@@ -915,7 +915,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 
                 size_t bytesWrittenCount; 
                 i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, portMAX_DELAY);
+            } else {
+                // FIX: Prevents a 100% CPU infinite deadlock on Core 1 if the I2S channels are temporarily disabled by the configuration/sleep tasks
+                vTaskDelay(pdMS_TO_TICKS(2));
             }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(2));
         }
     }
 }
@@ -1022,9 +1027,15 @@ void MidiTask(void * pvParameters) {
         if (currentBtState != lastBtState) { 
             lastBtState = currentBtState; forceUIUpdate = true; 
             if (isScreenOff) turnScreenOn(); 
-            // FIX: Added lastScreenActivityTime update to prevent the screen from immediately turning off again when BT connects
             lastActivityTime = millis(); 
             lastScreenActivityTime = millis(); 
+        }
+
+        // FIX: Forcefully turns on the screen and resets the sleep timers if a BT device connects while the physical display is turned off
+        if (currentBtState && isScreenOff) {
+            turnScreenOn();
+            lastScreenActivityTime = millis();
+            lastActivityTime = millis();
         }
         
         if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) goToLightSleep(); 

@@ -31,21 +31,21 @@ private:
     int recoveryA = 0, recoveryB = 0, recoveryC = 0;
     int systemRecoveryFrames = 50;
 
-    // Debounce counters for auto-tracking to prevent single-frame EMI spike latching
-    int lowSpikeA = 0, highSpikeA = 0;
-    int lowSpikeB = 0, highSpikeB = 0;
-    int lowSpikeC = 0, highSpikeC = 0;
-
     int calA = CENTER_MIDI_VAL, calB = CENTER_MIDI_VAL, calC = CENTER_MIDI_VAL;
     int lastMidiA = CENTER_MIDI_VAL, lastMidiB = CENTER_MIDI_VAL, lastMidiC = CENTER_MIDI_VAL;
+
+    // Movement Pick-Up Lock states for PB3 (Whammy and Volume Modes)
+    bool pb3_whammy_lock = true;
+    int pb3_whammy_ref = -1;
+    
+    bool pb3_vol_lock = true;
+    int pb3_vol_ref = -1;
 
     analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
         int deadLower = center - dZone; 
         int deadUpper = center + dZone;
-        
-        const int BOUNDARY_SNAP = 20;
-        int effMin = rMin + PEDAL_OUTER_DEADZONE + BOUNDARY_SNAP; 
-        int effMax = rMax - PEDAL_OUTER_DEADZONE - BOUNDARY_SNAP;
+        int effMin = rMin + PEDAL_OUTER_DEADZONE; 
+        int effMax = rMax - PEDAL_OUTER_DEADZONE;
         
         // Prevent Integer Division-by-Zero Kernel Panic
         if (deadLower - effMin < 1) effMin = deadLower - 1; 
@@ -58,40 +58,38 @@ private:
         long mappedValue;
         if (raw < deadLower) { 
             mappedValue = map(raw, effMin, deadLower, MIN_MIDI_VAL, 8191); 
-            // Schmitt-Trigger Deadband: Requires > 4 ADC counts of motion to exit MIN_MIDI_VAL, killing 96kHz EMI jitter
-            if (mappedValue < 64) return MIN_MIDI_VAL; 
         } else { 
             mappedValue = map(raw, deadUpper, effMax, 8193, MAX_MIDI_VAL); 
-            if (mappedValue > MAX_MIDI_VAL - 64) return MAX_MIDI_VAL;
         }
         return constrain(mappedValue, MIN_MIDI_VAL, MAX_MIDI_VAL);
     }
 
     analog_t map_raw_expression(int raw, uint16_t rMin, uint16_t rMax, bool invert) {
-        int heelLockZone = 350 + 20; 
-        int toeLockZone = 300 + 20; 
-        int lowerLimit, upperLimit;
-        
+        int heelLockZone = 350; int toeLockZone = 300; int lowerLimit, upperLimit;
         if (!invert) {
             lowerLimit = rMin + heelLockZone; upperLimit = rMax - toeLockZone;
             if (lowerLimit >= upperLimit) { lowerLimit = rMin; upperLimit = rMax; }
             if (raw <= lowerLimit) return MIN_MIDI_VAL; if (raw >= upperLimit) return MAX_MIDI_VAL; 
-            long mapped = map(raw, lowerLimit, upperLimit, MIN_MIDI_VAL, MAX_MIDI_VAL);
-            if (mapped < 64) return MIN_MIDI_VAL;
-            if (mapped > MAX_MIDI_VAL - 64) return MAX_MIDI_VAL;
-            return mapped;
+            return map(raw, lowerLimit, upperLimit, MIN_MIDI_VAL, MAX_MIDI_VAL);
         } else {
             lowerLimit = rMin + toeLockZone; upperLimit = rMax - heelLockZone;
             if (lowerLimit >= upperLimit) { lowerLimit = rMin; upperLimit = rMax; }
             if (raw <= lowerLimit) return MAX_MIDI_VAL; if (raw >= upperLimit) return MIN_MIDI_VAL; 
-            long mapped = map(raw, lowerLimit, upperLimit, MAX_MIDI_VAL, MIN_MIDI_VAL);
-            if (mapped < 64) return MIN_MIDI_VAL;
-            if (mapped > MAX_MIDI_VAL - 64) return MAX_MIDI_VAL;
-            return mapped;
+            return map(raw, lowerLimit, upperLimit, MAX_MIDI_VAL, MIN_MIDI_VAL);
         }
     }
 
 public:
+    void lockPB3Whammy() {
+        pb3_whammy_lock = true;
+        pb3_whammy_ref = -1;
+    }
+
+    void lockPB3Volume() {
+        pb3_vol_lock = true;
+        pb3_vol_ref = -1;
+    }
+
     void setCenters(int cA, int cB, int cC) {
         pb1_center = (cA > 4000 || cA < 100) ? 2048 : cA;
         pb2_center = (cB > 4000 || cB < 100) ? 2048 : cB;
@@ -114,9 +112,6 @@ public:
         pb1_max = pb1_center + PEDAL_CENTER_FLEX;
         pb2_min = pb2_center - PEDAL_CENTER_FLEX;
         pb2_max = pb2_center + PEDAL_CENTER_FLEX;
-        lowSpikeA = highSpikeA = 0;
-        lowSpikeB = highSpikeB = 0;
-        lowSpikeC = highSpikeC = 0;
     }
 
     void resetToCenter() {
@@ -129,10 +124,10 @@ public:
     }
 
     void process(int rawA, int rawB, int rawC, bool isVolumeMode, bool invertPB3) {
-        // Continuous Exponential Moving Average (EMA) filter
-        if (stableRawA < 0) stableRawA = rawA; else stableRawA = (stableRawA * 3 + rawA) / 4;
-        if (stableRawB < 0) stableRawB = rawB; else stableRawB = (stableRawB * 3 + rawB) / 4;
-        if (stableRawC < 0) stableRawC = rawC; else stableRawC = (stableRawC * 3 + rawC) / 4;
+        // Fast delta smoothing filter restores ultra-responsive zero-latency tracking
+        if (stableRawA < 0) stableRawA = rawA; if (abs(rawA - stableRawA) > 6) stableRawA = rawA;
+        if (stableRawB < 0) stableRawB = rawB; if (abs(rawB - stableRawB) > 6) stableRawB = rawB;
+        if (stableRawC < 0) stableRawC = rawC; if (abs(rawC - stableRawC) > 16) stableRawC = rawC;
 
         // Unplug State Machine
         if (stableRawA > TRS_UNPLUGGED_VOLTAGE) unpluggedA = true;
@@ -146,58 +141,40 @@ public:
 
         if (systemRecoveryFrames > 0) systemRecoveryFrames--;
 
-        // Debounced PB1 Tracking & Recovery
+        // PB1 Tracking & Recovery
         if (unpluggedA) {
             recoveryA = TRS_INSERTION_LOCKOUT;
             pb1_min = pb1_center - PEDAL_CENTER_FLEX;
             pb1_max = pb1_center + PEDAL_CENTER_FLEX;
-            lowSpikeA = highSpikeA = 0;
         } else if (recoveryA > 0) {
             recoveryA--;
         } else if (systemRecoveryFrames == 0) {
-            if (stableRawA < pb1_min && stableRawA > 200) {
-                if (++lowSpikeA > 10) { pb1_min = stableRawA; lowSpikeA = 0; }
-            } else { lowSpikeA = 0; }
-
-            if (stableRawA > pb1_max && stableRawA <= 4095) {
-                if (++highSpikeA > 10) { pb1_max = stableRawA; highSpikeA = 0; }
-            } else { highSpikeA = 0; }
+            if (stableRawA < pb1_min && stableRawA > 200) pb1_min = stableRawA;
+            if (stableRawA > pb1_max && stableRawA <= 4095) pb1_max = stableRawA;
         }
 
-        // Debounced PB2 Tracking & Recovery
+        // PB2 Tracking & Recovery
         if (unpluggedB) {
             recoveryB = TRS_INSERTION_LOCKOUT;
             pb2_min = pb2_center - PEDAL_CENTER_FLEX;
             pb2_max = pb2_center + PEDAL_CENTER_FLEX;
-            lowSpikeB = highSpikeB = 0;
         } else if (recoveryB > 0) {
             recoveryB--;
         } else if (systemRecoveryFrames == 0) {
-            if (stableRawB < pb2_min && stableRawB > 200) {
-                if (++lowSpikeB > 10) { pb2_min = stableRawB; lowSpikeB = 0; }
-            } else { lowSpikeB = 0; }
-
-            if (stableRawB > pb2_max && stableRawB <= 4095) {
-                if (++highSpikeB > 10) { pb2_max = stableRawB; highSpikeB = 0; }
-            } else { highSpikeB = 0; }
+            if (stableRawB < pb2_min && stableRawB > 200) pb2_min = stableRawB;
+            if (stableRawB > pb2_max && stableRawB <= 4095) pb2_max = stableRawB;
         }
         
-        // Debounced PB3 Tracking & Recovery
+        // PB3 Tracking & Recovery
         if (unpluggedC) {
             recoveryC = TRS_INSERTION_LOCKOUT;
             pb3_min = PB3_DEFAULT_MIN;
             pb3_max = PB3_DEFAULT_MAX;
-            lowSpikeC = highSpikeC = 0;
         } else if (recoveryC > 0) {
             recoveryC--;
         } else if (systemRecoveryFrames == 0) {
-            if (stableRawC < pb3_min && stableRawC > 200) {
-                if (++lowSpikeC > 10) { pb3_min = stableRawC; lowSpikeC = 0; }
-            } else { lowSpikeC = 0; }
-
-            if (stableRawC > pb3_max && stableRawC <= 4095) {
-                if (++highSpikeC > 10) { pb3_max = stableRawC; highSpikeC = 0; }
-            } else { highSpikeC = 0; }
+            if (stableRawC < pb3_min && stableRawC > 200) pb3_min = stableRawC;
+            if (stableRawC > pb3_max && stableRawC <= 4095) pb3_max = stableRawC;
         }
 
         // Leaky boundary recovery to prevent permanent tracking glitches
@@ -217,6 +194,27 @@ public:
         calB = map_raw_deadzone(stableRawB, pb2_center, pb2_min, pb2_max, DEADZONE_SIZE);
         calC = map_raw_expression(stableRawC, pb3_min, pb3_max, invertPB3);
         
+        // Applies Movement Pick-Up Lock to force PB3 outputs to neutral states until physically moved
+        if (!isVolumeMode) {
+            if (pb3_whammy_lock) {
+                if (pb3_whammy_ref == -1) pb3_whammy_ref = calC;
+                if (abs(calC - pb3_whammy_ref) > 400) { 
+                    pb3_whammy_lock = false;
+                } else {
+                    calC = CENTER_MIDI_VAL; // Lock at Center (0 pitch shift)
+                }
+            }
+        } else {
+            if (pb3_vol_lock) {
+                if (pb3_vol_ref == -1) pb3_vol_ref = calC;
+                if (abs(calC - pb3_vol_ref) > 400) {
+                    pb3_vol_lock = false;
+                } else {
+                    calC = MAX_MIDI_VAL; // Lock at Toe Down (100% volume)
+                }
+            }
+        }
+
         // Override outputs to safe defaults during unplug/transient states
         if (unpluggedA || systemRecoveryFrames > 0 || recoveryA > 0) calA = CENTER_MIDI_VAL;
         if (unpluggedB || systemRecoveryFrames > 0 || recoveryB > 0) calB = CENTER_MIDI_VAL;

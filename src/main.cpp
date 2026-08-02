@@ -124,8 +124,7 @@ volatile bool globalAudioResetRequested = false; volatile bool clearBuffersReque
 
 unsigned long lastActivityTime = 0; unsigned long lastScreenActivityTime = 0;
 
-// USER TESTING TIMEOUTS APPLIED HERE 📌
-const unsigned long LIGHT_SLEEP_TIMEOUT = 45000; const unsigned long SCREEN_OFF_TIMEOUT = 15000;  
+const unsigned long LIGHT_SLEEP_TIMEOUT = 25000; const unsigned long SCREEN_OFF_TIMEOUT = 15000;  
 
 bool isScreenOff = false; volatile bool wakeupPending = false; volatile float core1_load = 0.0f; 
 volatile bool sleepRequested = false; volatile bool isSleeping = false;
@@ -133,6 +132,10 @@ const int BATTERY_PIN = 4;
 volatile int currentBatteryPercent = 100; 
 volatile float currentBatteryVoltage = 4.00f; 
 volatile bool isBatteryCharging = false;
+
+// --- ON-SCREEN DIAGNOSTIC MONITORING VARIABLES ---
+volatile int32_t diag_raw_max = 0;
+volatile float diag_dc_val = 0.0f;
 
 pin_t pinPB = 1; pin_t pinPB2 = 2; pin_t pinPB3 = 10;    
 const int BOOT_SENSE_PIN = 0; 
@@ -239,11 +242,34 @@ void toggleSampleRate() {
     i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); 
     vTaskDelay(pdMS_TO_TICKS(50)); 
     
+    // FIX: Hard teardown of I2S peripheral to guarantee pristine DMA bit alignment on 96kHz swaps
+    i2s_del_channel(tx_chan); 
+    i2s_del_channel(rx_chan);
+    
     if (currentSampleRate == 96000) currentSampleRate = 48000; else currentSampleRate = 96000;
-    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate);
-    i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg); i2s_channel_reconfig_std_clock(rx_chan, &clk_cfg);
+    
+    i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
+    i2sConfig.dma_desc_num = 8; i2sConfig.dma_frame_num = HOP_SIZE; i2sConfig.auto_clear = true;
+    i2s_new_channel(&i2sConfig, &tx_chan, &rx_chan);
+    
+    i2s_std_config_t stdConfig = { 
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate), 
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
+        .gpio_cfg = { .mclk = GPIO_NUM_43, .bclk = GPIO_NUM_44, .ws = GPIO_NUM_18, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } 
+    };
+    
+    i2s_channel_init_std_mode(tx_chan, &stdConfig); 
+    i2s_channel_init_std_mode(rx_chan, &stdConfig); 
+    
     freezeLength = currentSampleRate; lutNeedsUpdate = true;
+    
     i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); 
+    
+    size_t dummyBytes; static int32_t dummyBuf[HOP_SIZE * 2];
+    for(int k = 0; k < 10; k++) {
+        i2s_channel_read(rx_chan, dummyBuf, sizeof(dummyBuf), &dummyBytes, pdMS_TO_TICKS(5));
+    }
+
     hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
 
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
@@ -262,6 +288,9 @@ void goToLightSleep() {
 
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan);
+    // FIX: Hard teardown of I2S to fully release DMA buses prior to RTOS CPU Sleep
+    i2s_del_channel(tx_chan); 
+    i2s_del_channel(rx_chan);
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 
     int initA = filterPB.getValue(); int initB = filterPB2.getValue(); int initC = filterPB3.getValue();
@@ -274,8 +303,28 @@ void goToLightSleep() {
     }
 
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+    
+    // FIX: Rebuild pristine I2S connection to external ADC upon waking
+    i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
+    i2sConfig.dma_desc_num = 8; i2sConfig.dma_frame_num = HOP_SIZE; i2sConfig.auto_clear = true;
+    i2s_new_channel(&i2sConfig, &tx_chan, &rx_chan);
+    
+    i2s_std_config_t stdConfig = { 
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate), 
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
+        .gpio_cfg = { .mclk = GPIO_NUM_43, .bclk = GPIO_NUM_44, .ws = GPIO_NUM_18, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } 
+    };
+    
+    i2s_channel_init_std_mode(tx_chan, &stdConfig); 
+    i2s_channel_init_std_mode(rx_chan, &stdConfig); 
+    
     i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); 
     
+    size_t dummyBytes; static int32_t dummyBuf[HOP_SIZE * 2];
+    for(int k = 0; k < 10; k++) {
+        i2s_channel_read(rx_chan, dummyBuf, sizeof(dummyBuf), &dummyBytes, pdMS_TO_TICKS(5));
+    }
+
     hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
     globalAudioResetRequested = true;
     
@@ -519,16 +568,16 @@ void updateDisplay() {
 
     int statsRowY = 162; spr.setTextColor(TFT_LIGHTGREY, TFT_BLACK); spr.setTextDatum(ML_DATUM); 
     char cpuUsageBuffer[16]; sprintf(cpuUsageBuffer, "CPU:%2d%%", (int)core1_load); spr.drawString(cpuUsageBuffer, 25, statsRowY);
-    char internalSramBuffer[16]; sprintf(internalSramBuffer, "SRM:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024)); spr.drawString(internalSramBuffer, 85, statsRowY);
-    char psramBuffer[16]; sprintf(psramBuffer, "PSR:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024)); spr.drawString(psramBuffer, 150, statsRowY);
-
-    spr.setTextDatum(MC_DATUM); spr.setTextColor(TFT_WHITE); 
-    spr.drawRect(210, statsRowY - 7, 40, 14, TFT_DARKGREY);
-    spr.drawString((currentSampleRate == 96000) ? "96k" : "48k", 230, statsRowY);
     
-    spr.drawRect(255, statsRowY - 7, 40, 14, TFT_DARKGREY);
-    const char* latencyLabelStrings[] = {"U.Low", "Low", "Mid", "High"}; 
-    spr.drawString(latencyLabelStrings[latencyMode], 275, statsRowY);
+    // --- ON-SCREEN MONITORING TOOL ---
+    char diagStr[50];
+    sprintf(diagStr, "SR:%sk DC:%.3f R:0x%06X M:%d", 
+            (currentSampleRate == 96000) ? "96" : "48", 
+            diag_dc_val, 
+            (unsigned int)((diag_raw_max >> 8) & 0xFFFFFF), 
+            hardwareSyncMuteFrames);
+    spr.setTextColor(TFT_YELLOW, TFT_BLACK);
+    spr.drawString(diagStr, 85, statsRowY);
 
     spr.pushSprite(0, 0); updateMeters();
 }
@@ -554,7 +603,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static int32_t i2s_in_block[HOP_SIZE * 2] __attribute__((aligned(16)));
     static int32_t i2s_out_block[HOP_SIZE * 2] __attribute__((aligned(16)));
     
-    static float input_block[HOP_SIZE] __attribute__((aligned(16)));
     static float dc_block[HOP_SIZE] __attribute__((aligned(16)));
     static float mix_block[HOP_SIZE] __attribute__((aligned(16)));
     
@@ -566,8 +614,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float pad_block[HOP_SIZE] __attribute__((aligned(16)));
     static float fbOut_block[HOP_SIZE] __attribute__((aligned(16)));
     
-    static float dc_coeffs[5] = {1.0f, -1.0f, 0.0f, -0.995f, 0.0f}; 
-    static float dc_state[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    static float input_dc_offset = 0.0f;
     
     static float synthEnv = 0.0f; static float synthFilter = 0.0f;
     static float padFilter = 0.0f; static float padEnv = 0.0f;
@@ -592,20 +639,28 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
         
         if (bytesRead > 0) {
             int framesRead = bytesRead / 8; 
-            
-            // FIX 3: Bitwise mask forces strict 128-bit SIMD register alignment to prevent memory overwrite panics
-            framesRead &= ~3;
+            framesRead &= ~3; 
             
             if (framesRead > 0) {
                 
+                int32_t block_raw_max = 0;
+                for (int i = 0; i < framesRead; i++) {
+                    int32_t raw_s = i2s_in_block[i * 2];
+                    if (abs(raw_s) > abs(block_raw_max)) block_raw_max = raw_s;
+                }
+                diag_raw_max = block_raw_max;
+                diag_dc_val = input_dc_offset;
+
                 if (globalAudioResetRequested) {
                     synthEnv = 0.0f; synthFilter = 0.0f; padFilter = 0.0f; padEnv = 0.0f;
                     inputEnvelope = 0.0f; feedbackFilterVar = 0.0f; smoothedVolGain = volumePedalGain; currentPitch = 1.0f;
                     freezeWriteIdxVar = 0; freezePlayCounterVar = 0; freezeStartIdxVar = 0; activeFreezeLength = currentSampleRate;
                     fbDelayWriteIdx = 0; writeIndex = 0; apfNeedsClear = true;
-                    for(int j = 0; j < 4; j++) dc_state[j] = 0.0f; 
+                    input_dc_offset = 0.0f; 
                     ui_audio_level = 0.0f; ui_output_level = 0.0f; 
                     clearBuffersRequested = true; globalAudioResetRequested = false;
+                    
+                    if (hardwareSyncMuteFrames < 10) hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f; 
                 }
 
                 if (hardwareSyncMuteFrames > 0) {
@@ -613,18 +668,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
                     ui_audio_level = 0.0f; ui_output_level = 0.0f;
                     
-                    // FIX 1: Prevent IIR Filter Poisoning.
-                    // The ADC spits out violent MCLK PLL-lock noise during the first ~100ms of a sample rate switch or sleep wake. 
-                    // We only allow the DC Blocker to track the signal during the final 40 frames of the mute, 
-                    // ensuring it captures the clean, steady-state DC offset without absorbing the massive noise spikes.
-                    if (hardwareSyncMuteFrames < 40) {
-                        for (int i = 0; i < framesRead; i++) { 
-                            int32_t clean_sample = i2s_in_block[i * 2] & 0xFFFFFF00;
-                            input_block[i] = ((float)clean_sample * normFactor); 
-                        }
-                        dsps_biquad_f32(input_block, dc_block, framesRead, dc_coeffs, dc_state);
-                    } else {
-                        for(int j = 0; j < 4; j++) dc_state[j] = 0.0f; 
+                    for (int i = 0; i < framesRead; i++) { 
+                        int32_t clean_sample = i2s_in_block[i * 2] & 0xFFFFFF00;
+                        float raw_in = ((float)clean_sample * normFactor); 
+                        input_dc_offset = (input_dc_offset * 0.95f) + (raw_in * 0.05f); 
                     }
                     
                     size_t bytesWrittenCount; i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, portMAX_DELAY);
@@ -716,17 +763,20 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float pdSmCoeff = powf(p_pd_sm, srScale);
                         int delaySamples = constrain((int)(currentSampleRate * p_fb_off), 0, FB_BUFFER_SIZE - 1);
                         
-                        // FIX 3: Dynamically scale feedback IIR filters to prevent octave shifting and distortion changes at 96kHz
                         float fbHpfCoeff = (currentSampleRate == 96000) ? 0.025f : 0.05f;
                         float fbLpfCoeff = (currentSampleRate == 96000) ? 0.05f : 0.1f;
                         float fbLpfRetain = 1.0f - fbLpfCoeff;
 
+                        float dc_alpha = (currentSampleRate == 96000) ? 0.0005f : 0.001f;
+
                         #pragma GCC ivdep
                         for (int i = 0; i < framesRead; i++) { 
                             int32_t clean_sample = i2s_in_block[i * 2] & 0xFFFFFF00;
-                            input_block[i] = ((float)clean_sample * normFactor); 
+                            float raw_in = ((float)clean_sample * normFactor); 
+                            
+                            input_dc_offset = (input_dc_offset * (1.0f - dc_alpha)) + (raw_in * dc_alpha);
+                            dc_block[i] = raw_in - input_dc_offset; 
                         }
-                        dsps_biquad_f32(input_block, dc_block, framesRead, dc_coeffs, dc_state);
                         
                         for (int i = 0; i < framesRead; i++) {
                             currentPitch += pitchInc;
@@ -1074,8 +1124,6 @@ void MidiTask(void * pvParameters) {
         }
 
         if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) goToLightSleep(); 
-        
-        // FIX 2: Insomnia Screen-Override Block Removed entirely. 
         if (!isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) turnScreenOff(); 
         
         #if ENABLE_PAR_KNOBS

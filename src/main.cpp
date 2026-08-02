@@ -564,7 +564,6 @@ void updateDisplay() {
     char internalSramBuffer[16]; sprintf(internalSramBuffer, "SRM:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024)); spr.drawString(internalSramBuffer, 85, statsRowY);
     char psramBuffer[16]; sprintf(psramBuffer, "PSR:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024)); spr.drawString(psramBuffer, 150, statsRowY);
 
-    // FIX 3: Reclaimed TFT screen real estate and restored sample rate / latency readout visuals
     spr.setTextDatum(MC_DATUM); spr.setTextColor(TFT_WHITE); 
     spr.drawRect(210, statsRowY - 7, 40, 14, TFT_DARKGREY);
     spr.drawString((currentSampleRate == 96000) ? "96k" : "48k", 230, statsRowY);
@@ -617,6 +616,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float currentPitch = 1.0f; 
     
     static float fbOutNode = 0.0f;
+    static float smoothed_delay_samples = 0.0f;
     
     static int freezeWriteIdxVar = 0; static int freezePlayCounterVar = 0; 
     static int freezeStartIdxVar = 0; static int activeFreezeLength = 48000;
@@ -746,7 +746,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float localFrzRamp = freezeRamp; float localFbRamp = feedbackRamp;
 
                         float pdSmCoeff = powf(p_pd_sm, srScale);
-                        int delaySamples = constrain((int)(currentSampleRate * p_fb_off), 0, FB_BUFFER_SIZE - 1);
+                        
+                        float target_delay = constrain((float)(currentSampleRate * p_fb_off), 0.0f, (float)(FB_BUFFER_SIZE - 1));
+                        smoothed_delay_samples += (target_delay - smoothed_delay_samples) * 0.01f * srScale;
+                        int delaySamples = (int)smoothed_delay_samples;
                         
                         float fbHpfCoeff = (currentSampleRate == 96000) ? 0.025f : 0.05f;
                         float fbLpfCoeff = (currentSampleRate == 96000) ? 0.05f : 0.1f;
@@ -776,7 +779,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 if (inputEnvelope > p_sw_thr) { localSwellGain = fminf(1.0f, localSwellGain + (p_sw_att * srScale)); } 
                                 else { localSwellGain = fmaxf(0.0f, localSwellGain - (p_sw_rel * srScale)); }
                             } else { 
-                                // FIX 2: Swell bypass release ramp dynamically scaled
                                 if (localSwellGain < 1.0f) localSwellGain = fminf(1.0f, localSwellGain + (0.005f * srScale)); 
                                 else localSwellGain = 1.0f; 
                             }
@@ -961,7 +963,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             }
                         }
                         
-                        // FIX 2: Dynamic alpha scaling guarantees the physical expression pedal feels identical at 48k and 96k
                         float vol_alpha = 0.01f * srScale;
 
                         #pragma GCC ivdep
@@ -1256,8 +1257,6 @@ void MidiTask(void * pvParameters) {
                 }
                 
                 int newPercent = getBatteryPercentage(smoothedVoltage);
-                
-                // FIX 1: Forces immediate UI response when USB cable is plugged/unplugged
                 bool stateChanged = (newPercent != currentBatteryPercent) || (charging != isBatteryCharging);
                 
                 currentBatteryVoltage = smoothedVoltage;
@@ -1324,6 +1323,7 @@ bool channelMessageCallback(ChannelMessage cm) {
             } else {
                 pedals.lockPB3Volume();
                 lastActivePedal = 8192;
+                volumePedalGain = (float)currentPB3 / 16383.0f;
                 if (!lutNeedsUpdate && pitchShiftLUT != nullptr) pitchShiftFactor = pitchShiftLUT[8192];
             }
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
@@ -1532,13 +1532,16 @@ void setup() {
 }
 
 void loop() {
-    if (lutNeedsUpdate) { 
+    static unsigned long lastLutUpdate = 0;
+    if (lutNeedsUpdate && (millis() - lastLutUpdate > 40)) { 
         updateLUT(); 
         if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
         pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
         if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
         lutNeedsUpdate = false; 
+        lastLutUpdate = millis();
     }
+
     if (clearBuffersRequested) {
         if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, portMAX_DELAY) == pdTRUE) {
             memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(float)); memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(float)); memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(float));

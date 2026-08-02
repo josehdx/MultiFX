@@ -15,6 +15,8 @@
 #include <math.h>
 #include <Preferences.h>
 
+#include "PedalManager.h" // 🔒 The new locked hardware class
+
 // --- HARDWARE CONFIGURATION TOGGLES ---
 #define ENABLE_PAR_KNOBS false  
 
@@ -132,8 +134,6 @@ volatile int currentBatteryPercent = 100;
 volatile float currentBatteryVoltage = 4.00f; 
 volatile bool isBatteryCharging = false;
 
-volatile int systemRecoveryFrames = 50; // Global lockout for extreme limit tracking at boot/wake
-
 pin_t pinPB = 1; pin_t pinPB2 = 2; pin_t pinPB3 = 10;    
 const int BOOT_SENSE_PIN = 0; 
 
@@ -142,14 +142,6 @@ pin_t pinPar1 = 3; pin_t pinPar2 = 11; pin_t pinPar3 = 12; pin_t pinPar4 = 13; p
 uint16_t lastMidiSent = 8192; volatile uint16_t currentPB1 = 8192; volatile uint16_t currentPB2 = 8192;
 volatile uint16_t currentPB3 = 8192; volatile uint16_t currentCC11 = 0;
 volatile float ui_audio_level = 0.0f; volatile float ui_output_level = 0.0f;
-
-uint16_t PB1_raw_min = 1000; uint16_t PB1_raw_max = 3000; uint16_t PB1_raw_center = 2048;
-uint16_t PB2_raw_min = 1000; uint16_t PB2_raw_max = 3000; uint16_t PB2_raw_center = 2048;
-uint16_t PB3_raw_min = 1000; uint16_t PB3_raw_max = 3000; int deadzone_size = 400; 
-
-bool PB1_unplugged_at_boot = false;
-bool PB2_unplugged_at_boot = false;
-bool PB3_unplugged_at_boot = false;
 
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB = pinPB;
 FilteredAnalog<12, 2, uint32_t, uint32_t> filterPB2 = pinPB2;
@@ -162,6 +154,9 @@ FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar4 = pinPar4;
 FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar5 = pinPar5;
 
 BluetoothMIDI_Interface btmidi; USBMIDI_Interface usbmidi; MIDI_PipeFactory<4> pipes;
+
+// Global Pedal Manager Instance
+PedalManager pedals;
 
 void switchEffectMode(int newMode) {
     activeEffectMode = (newMode % 10 + 10) % 10;
@@ -200,10 +195,8 @@ void saveSettings() {
 
 int getBatteryPercentage(float voltage) {
     float clampedVolts = fmaxf(3.30f, fminf(4.15f, voltage));
-    
     if (clampedVolts >= 4.15f) return 100;
     if (clampedVolts <= 3.30f) return 0;
-    
     if (clampedVolts >= 4.00f) return 90 + (int)((clampedVolts - 4.00f) / 0.15f * 10.0f);
     if (clampedVolts >= 3.90f) return 80 + (int)((clampedVolts - 3.90f) / 0.10f * 10.0f);
     if (clampedVolts >= 3.80f) return 70 + (int)((clampedVolts - 3.80f) / 0.10f * 10.0f); 
@@ -216,30 +209,6 @@ int getBatteryPercentage(float voltage) {
     return (int)((clampedVolts - 3.30f) / 0.20f * 10.0f);
 }
 
-analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
-    int outerDeadzone = 150; 
-    int deadLower = center - dZone; int deadUpper = center + dZone;
-    int effMin = rMin + outerDeadzone; int effMax = rMax - outerDeadzone;
-    if (effMin >= deadLower) effMin = rMin + 50; if (effMax <= deadUpper) effMax = rMax - 50;
-    if (raw <= effMin) return 0; if (raw >= effMax) return 16383; if (raw >= deadLower && raw <= deadUpper) return 8192;
-    long mappedValue;
-    if (raw < deadLower) { mappedValue = map(raw, effMin, deadLower, 0, 8191); } else { mappedValue = map(raw, deadUpper, effMax, 8193, 16383); }
-    return constrain(mappedValue, 0, 16383);
-}
-
-analog_t map_raw_expression(int raw, uint16_t rMin, uint16_t rMax, bool invert) {
-    int heelLockZone = 350; int toeLockZone = 300; int lowerLimit, upperLimit;
-    if (!invert) {
-        lowerLimit = rMin + heelLockZone; upperLimit = rMax - toeLockZone;
-        if (lowerLimit >= upperLimit) { lowerLimit = rMin; upperLimit = rMax; }
-        if (raw <= lowerLimit) return 0; if (raw >= upperLimit) return 16383; return map(raw, lowerLimit, upperLimit, 0, 16383);
-    } else {
-        lowerLimit = rMin + toeLockZone; upperLimit = rMax - heelLockZone;
-        if (lowerLimit >= upperLimit) { lowerLimit = rMin; upperLimit = rMax; }
-        if (raw <= lowerLimit) return 16383; if (raw >= upperLimit) return 0; return map(raw, lowerLimit, upperLimit, 16383, 0);
-    }
-}
-
 void calibratePBs() {
     for (int i = 0; i < 50; i++) { filterPB.update(); filterPB2.update(); filterPB3.update(); delay(1); }
     long sum1 = 0; long sum2 = 0; long sum3 = 0;
@@ -248,22 +217,7 @@ void calibratePBs() {
         sum1 += filterPB.getValue(); sum2 += filterPB2.getValue(); sum3 += filterPB3.getValue();
         delay(1); 
     }
-    PB1_raw_center = sum1 / 250; PB2_raw_center = sum2 / 250; int PB3_raw_avg = sum3 / 250;
-    
-    if (PB1_raw_center > 4000) PB1_unplugged_at_boot = true;
-    if (PB2_raw_center > 4000) PB2_unplugged_at_boot = true;
-    if (PB3_raw_avg > 4000) PB3_unplugged_at_boot = true;
-
-    if (PB1_raw_center > 4000 || PB1_raw_center < 100) PB1_raw_center = 2048; 
-    if (PB2_raw_center > 4000 || PB2_raw_center < 100) PB2_raw_center = 2048;
-    
-    PB1_raw_min = PB1_raw_center - 200; 
-    PB1_raw_max = PB1_raw_center + 200; 
-    
-    PB2_raw_min = PB2_raw_center - 200; 
-    PB2_raw_max = PB2_raw_center + 200; 
-    
-    PB3_raw_min = 1000; PB3_raw_max = 3000; 
+    pedals.setCenters(sum1 / 250, sum2 / 250, sum3 / 250);
 }
 
 void toggleSampleRate() {
@@ -315,11 +269,7 @@ void goToLightSleep() {
     
     if (isScreenOff) turnScreenOn(); 
     
-    systemRecoveryFrames = 50; 
-    PB1_raw_min = PB1_raw_center - 200;
-    PB1_raw_max = PB1_raw_center + 200;
-    PB2_raw_min = PB2_raw_center - 200;
-    PB2_raw_max = PB2_raw_center + 200;
+    pedals.triggerSystemRecovery(); // Reset tracking boundaries after power surge
 
     lastActivityTime = millis();
     lastScreenActivityTime = millis(); 
@@ -1020,10 +970,10 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
 }
 
 void MidiTask(void * pvParameters) {
+    pedals.resetToCenter(); // Init pedal states safely
+
     static analog_t lastMidiA = 8192; static analog_t lastMidiB = 8192; static analog_t lastMidiC = 8192; 
     static bool lastBtState = false; static uint8_t lastVolumeCC = 127;
-    static int stableRawA = -1; static int stableRawB = -1; static int stableRawC = -1;
-    
     static int lastCcOut[5] = {-1, -1, -1, -1, -1};
     
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
@@ -1128,101 +1078,27 @@ void MidiTask(void * pvParameters) {
         filterPB.update(); filterPB2.update(); filterPB3.update();
         
         if (digitalRead(BOOT_SENSE_PIN) == HIGH) {
-            analog_t rawA = filterPB.getValue(); analog_t rawB = filterPB2.getValue(); analog_t rawC = filterPB3.getValue();
             
-            if (stableRawA < 0) stableRawA = rawA; if (abs((int)rawA - stableRawA) > 6) stableRawA = rawA;
-            if (stableRawB < 0) stableRawB = rawB; if (abs((int)rawB - stableRawB) > 6) stableRawB = rawB;
-            if (stableRawC < 0) stableRawC = rawC; if (abs((int)rawC - stableRawC) > 16) stableRawC = rawC;
-
-            static bool unpluggedA = PB1_unplugged_at_boot;
-            static bool unpluggedB = PB2_unplugged_at_boot;
-            static bool unpluggedC = PB3_unplugged_at_boot;
-
-            static int recoveryA = 0;
-            static int recoveryB = 0;
-            static int recoveryC = 0;
-
-            // BUG FIX 1: Absolute threshold detection avoids "slow float" capacitance bugs
-            if (stableRawA > 4050) unpluggedA = true;
-            else if (stableRawA < 3900) unpluggedA = false;
-
-            if (stableRawB > 4050) unpluggedB = true;
-            else if (stableRawB < 3900) unpluggedB = false;
+            pedals.process(filterPB.getValue(), filterPB2.getValue(), filterPB3.getValue(), isVolumeMode, INVERT_PB3);
             
-            if (stableRawC > 4050) unpluggedC = true;
-            else if (stableRawC < 3900) unpluggedC = false;
-
-            if (systemRecoveryFrames > 0) systemRecoveryFrames--;
-
-            if (unpluggedA) {
-                recoveryA = 300; 
-                PB1_raw_min = PB1_raw_center - 200;
-                PB1_raw_max = PB1_raw_center + 200;
-            } else if (recoveryA > 0) {
-                recoveryA--;
-            } else if (systemRecoveryFrames == 0) {
-                if (stableRawA < PB1_raw_min && stableRawA > 200) PB1_raw_min = stableRawA;
-                if (stableRawA > PB1_raw_max && stableRawA <= 4095) PB1_raw_max = stableRawA;
-            }
-
-            if (unpluggedB) {
-                recoveryB = 300;
-                PB2_raw_min = PB2_raw_center - 200;
-                PB2_raw_max = PB2_raw_center + 200;
-            } else if (recoveryB > 0) {
-                recoveryB--;
-            } else if (systemRecoveryFrames == 0) {
-                if (stableRawB < PB2_raw_min && stableRawB > 200) PB2_raw_min = stableRawB;
-                if (stableRawB > PB2_raw_max && stableRawB <= 4095) PB2_raw_max = stableRawB;
-            }
+            int calA = pedals.getCalA();
+            int calB = pedals.getCalB();
+            int calC = pedals.getCalC();
             
-            if (unpluggedC) {
-                recoveryC = 300;
-                PB3_raw_min = 1000;
-                PB3_raw_max = 3000;
-            } else if (recoveryC > 0) {
-                recoveryC--;
-            } else if (systemRecoveryFrames == 0) {
-                if (stableRawC < PB3_raw_min && stableRawC > 200) PB3_raw_min = stableRawC;
-                if (stableRawC > PB3_raw_max && stableRawC <= 4095) PB3_raw_max = stableRawC;
-            }
-            
-            analog_t calA = map_raw_deadzone(stableRawA, PB1_raw_center, PB1_raw_min, PB1_raw_max, deadzone_size);
-            
-            // NOTICE: PB2 will always be a self-centered device, either a Hall effect sensor 
-            // or a wiper potentiometer. It will never be a linear toe-to-heel expression pedal.
-            // Therefore, we permanently apply map_raw_deadzone here. (Not a bug)
-            analog_t calB = map_raw_deadzone(stableRawB, PB2_raw_center, PB2_raw_min, PB2_raw_max, deadzone_size);
-            
-            analog_t calC = map_raw_expression(stableRawC, PB3_raw_min, PB3_raw_max, INVERT_PB3);
-            
-            // BUG FIX 2: Force PB1 and PB2 to precisely 50% (8192) when unplugged so the UI meters center
-            if (unpluggedA || systemRecoveryFrames > 0 || recoveryA > 0) calA = 8192;
-            if (unpluggedB || systemRecoveryFrames > 0 || recoveryB > 0) calB = 8192;
-            
-            // BUG FIX 3: PB3 outputs 100% when volume is active (avoids muting), and 50% when whammy is active
-            if (unpluggedC || systemRecoveryFrames > 0 || recoveryC > 0) {
-                if (isVolumeMode) {
-                    calC = 16383; // 100% Volume
-                } else {
-                    calC = 8192;  // 50% Neutral Pitch/Whammy
-                }
-            }
-            
-            bool moveA = (abs((int)calA - (int)lastMidiA) > 12) || ((calA == 8192 || calA == 0 || calA == 16383) && calA != lastMidiA);
-            bool moveB = (abs((int)calB - (int)lastMidiB) > 12) || ((calB == 8192 || calB == 0 || calB == 16383) && calB != lastMidiB);
-            bool moveC = (abs((int)calC - (int)lastMidiC) >= 128) || ((calC == 0 || calC == 16383 || calC == 8192) && calC != lastMidiC);
+            bool moveA = pedals.hasMovedA();
+            bool moveB = pedals.hasMovedB();
+            bool moveC = pedals.hasMovedC();
             
             if (moveA || moveB || moveC) {
                 if (isScreenOff) turnScreenOn();
                 lastScreenActivityTime = millis();
                 lastActivityTime = millis();
                 
-                if (moveA) { Control_Surface.sendPitchBend(Channel_1, calA); lastMidiA = calA; currentPB1 = calA; }
-                if (moveB) { Control_Surface.sendPitchBend(Channel_2, calB); lastMidiB = calB; currentPB2 = calB; }
+                if (moveA) { Control_Surface.sendPitchBend(Channel_1, calA); pedals.updateLastMidiA(); currentPB1 = calA; }
+                if (moveB) { Control_Surface.sendPitchBend(Channel_2, calB); pedals.updateLastMidiB(); currentPB2 = calB; }
                 if (moveC) {
                     if (!isVolumeMode) Control_Surface.sendPitchBend(Channel_3, calC);
-                    lastMidiC = calC; currentPB3 = calC; 
+                    pedals.updateLastMidiC(); currentPB3 = calC; 
                 }
 
                 bool pitchChanged = false;
@@ -1245,21 +1121,19 @@ void MidiTask(void * pvParameters) {
                 forceUIUpdate = true;
             }
         } else {
-            if (lastMidiA != 8192 || lastMidiB != 8192 || lastMidiC != 8192) {
-                Control_Surface.sendPitchBend(Channel_1, 8192); Control_Surface.sendPitchBend(Channel_2, 8192); Control_Surface.sendPitchBend(Channel_3, 8192);
-                lastMidiA = 8192; lastMidiB = 8192; lastMidiC = 8192; 
-                currentPB1 = 8192; currentPB2 = 8192; currentPB3 = 8192; 
-                lastActivePedal = 8192;
-                
-                if (!lutNeedsUpdate) {
-                    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-                    pitchShiftFactor = pitchShiftLUT[8192]; 
-                    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
-                }
-                
-                if (isVolumeMode) volumePedalGain = 8192.0f / 16383.0f; 
-                forceUIUpdate = true;
+            // Global device kill-switch triggered
+            pedals.resetToCenter();
+            lastActivePedal = 8192;
+            
+            if (!lutNeedsUpdate) {
+                if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+                pitchShiftFactor = pitchShiftLUT[8192]; 
+                if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             }
+            
+            if (isVolumeMode) volumePedalGain = 8192.0f / 16383.0f; 
+            forceUIUpdate = true;
+            
             vTaskDelay(pdMS_TO_TICKS(250)); 
         }
         vTaskDelay(pdMS_TO_TICKS(5));
@@ -1294,11 +1168,6 @@ bool channelMessageCallback(ChannelMessage cm) {
 
         if (cm.data1 == 5 && cm.data2 >= 64) {
             isPB2WiperMode = !isPB2WiperMode; 
-            int newCenter = filterPB2.getValue();
-            if (newCenter < 4000 && newCenter > 100) PB2_raw_center = newCenter; 
-            else PB2_raw_center = 2048;
-            PB2_raw_min = PB2_raw_center - 200; 
-            PB2_raw_max = PB2_raw_center + 200; 
             forceUIUpdate = true; 
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();

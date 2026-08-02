@@ -217,6 +217,7 @@ void calibratePBs() {
         sum1 += filterPB.getValue(); sum2 += filterPB2.getValue(); sum3 += filterPB3.getValue();
         delay(1); 
     }
+    
     pedals.setCenters(sum1 / 250, sum2 / 250, sum3 / 250);
 }
 
@@ -678,6 +679,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             if (inputEnvelope > 0.005f) { synthEnv = fminf(1.0f, synthEnv + (p_sy_att * srScale)); } 
                             else { synthEnv = fmaxf(0.0f, synthEnv - (p_sy_rel * srScale)); }
                             
+                            // BUG FIX 3: Prevent NaN memory reads in synthesizer wave lookup
+                            if (isnan(procSample)) procSample = 0.0f;
                             int waveIdx = constrain((int)((procSample + 1.0f) * 1023.5f), 0, WAVE_LUT_SIZE - 1);
                             procSample = synthLUT[waveIdx]; 
                             float fltCoeff = fmaxf(0.001f, fminf(0.99f, (p_sy_flt + 0.6f * synthEnv) * srScale));
@@ -970,7 +973,7 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
 }
 
 void MidiTask(void * pvParameters) {
-    pedals.resetToCenter(); // Init pedal states safely
+    pedals.resetToCenter(); 
 
     static analog_t lastMidiA = 8192; static analog_t lastMidiB = 8192; static analog_t lastMidiC = 8192; 
     static bool lastBtState = false; static uint8_t lastVolumeCC = 127;
@@ -1121,7 +1124,6 @@ void MidiTask(void * pvParameters) {
                 forceUIUpdate = true;
             }
         } else {
-            // Global device kill-switch triggered
             pedals.resetToCenter();
             lastActivePedal = 8192;
             
@@ -1333,9 +1335,12 @@ void loop() {
             clearBuffersRequested = false; xSemaphoreGive(audioBufferMutex);
         }
     }
-    if (settingsNeedSaving && (millis() - lastParameterChangeTime > 1000)) { 
+    
+    // BUG FIX 5: Ensure Core 0 Flash Erase/Write operations do not stall live MIDI parameter changes
+    if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000) && (millis() - lastActivityTime > 2000)) { 
         saveSettings(); 
         settingsNeedSaving = false; 
     }
+    
     vTaskDelay(pdMS_TO_TICKS(10));
 }

@@ -166,6 +166,12 @@ void switchEffectMode(int newMode) {
     vibratoLfoPhase = 0.0f; 
     swellGain = 0.0f; 
     isWhammyActive = true; 
+    
+    // FIX 1: Clear all ghosted effects to prevent multi-patch DSP stacking
+    isFrozen = false; isFeedbackActive = false; isHarmonizerMode = false;
+    isSynthMode = false; isPadMode = false; isCapoMode = false;
+    isChorusMode = false; isSwellMode = false; isVibratoMode = false;
+
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
     
     lutNeedsUpdate = true; 
@@ -554,7 +560,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float pad_block[HOP_SIZE] __attribute__((aligned(16)));
     static float fbOut_block[HOP_SIZE] __attribute__((aligned(16)));
     
-    // RESTORED: Stable DC Blocker Pole Configuration (-0.995f) for the ESP-DSP Library
     static float dc_coeffs[5] = {1.0f, -1.0f, 0.0f, -0.995f, 0.0f}; 
     static float dc_state[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     
@@ -563,6 +568,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float inputEnvelope = 0.0f; static float feedbackFilterVar = 0.0f;
     static float smoothedVolGain = 1.0f;
     static float currentPitch = 1.0f; 
+    
+    // FIX 2: Static allocation outside the fast block loop correctly preserves feedback delay tail memory
+    static float fbOutNode = 0.0f;
     
     static int freezeWriteIdxVar = 0; static int freezePlayCounterVar = 0; 
     static int freezeStartIdxVar = 0; static int activeFreezeLength = 48000;
@@ -682,7 +690,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float localSwellGain = swellGain; float localVolGain = volumePedalGain;
                         float localFrzRamp = freezeRamp; float localFbRamp = feedbackRamp;
 
-                        // FIX 2: Heavy math hoisted completely outside the 64-sample tight loop
                         float pdSmCoeff = powf(p_pd_sm, srScale);
                         int delaySamples = constrain((int)(currentSampleRate * p_fb_off), 0, FB_BUFFER_SIZE - 1);
 
@@ -705,7 +712,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             if (swellActive) {
                                 if (inputEnvelope > p_sw_thr) { localSwellGain = fminf(1.0f, localSwellGain + (p_sw_att * srScale)); } 
                                 else { localSwellGain = fmaxf(0.0f, localSwellGain - (p_sw_rel * srScale)); }
-                            } else { localSwellGain = 1.0f; }
+                            } else { 
+                                // FIX 4: Smooth release ramp to prevent massive DC popping when bypassing Swell mid-envelope
+                                if (localSwellGain < 1.0f) localSwellGain = fminf(1.0f, localSwellGain + (0.005f * srScale)); 
+                                else localSwellGain = 1.0f; 
+                            }
                             
                             float procSample = inSample;
                             
@@ -742,7 +753,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 float phaseRead = (float)freezePlayCounterVar * activeInvFreqLength; 
                                 float phase2 = (phaseRead + 0.5f); if (phase2 >= 1.0f) { phase2 -= 1.0f; }
                                 
-                                // FIX 3: Fast buffer wrapping replaces expensive multi-cycle modulo division
                                 int sum1 = freezeStartIdxVar + freezePlayCounterVar;
                                 int idx1 = sum1;
                                 if (idx1 >= freezeLength) idx1 -= freezeLength;
@@ -792,7 +802,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             }
                             
                             float spd4 = 1.0f; float spd5 = 1.0f;
-                            float fbOutNode = 0.0f;
                             
                             if (feedbackActive || localFbRamp > 0.0f) { 
                                 feedbackLfoPhase += feedbackPhaseIncr; 
@@ -808,7 +817,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 } else { localFbRamp = fmaxf(0.0f, localFbRamp - (0.0001f * srScale)); }
                                 
                                 float mixV = fmaxf(0.0f, fminf((localFbRamp - 0.1f) * 2.0f, 1.0f));
-                                float feedInput = (frzActive && localFrzRamp > 0.0f) ? fzOut : (w4 * (1.0f - mixV)) + (w5 * mixV);
+                                
+                                // FIX 2: Restored mathematical feedback loop routing to guarantee infinite physical sustain
+                                float feedInput = (frzActive && localFrzRamp > 0.0f) ? fzOut : (w4 * (1.0f - mixV)) + (w5 * mixV) + (fbOutNode * 0.95f);
                                 
                                 fbHpfState += 0.05f * (feedInput - fbHpfState) + DC_OFFSET; 
                                 
@@ -884,7 +895,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 sMix += baseSignal * g_base; sMix += p_w2[i] * g_w2; sMix += p_w3[i] * g_w3;
                                 sMix += p_pad[i] * g_pad; sMix += p_fz[i] * g_frz; sMix += p_fb[i] * g_fb;
                                 sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
-                                p_mix[i] = sMix * (1.0f - (0.1f * sMix * sMix));
+                                // FIX 3: Attenuation scalar added to polynomial to guarantee mathematical safety against integer shearing
+                                p_mix[i] = sMix * (1.0f - (0.1f * sMix * sMix)) * 0.82f;
                             }
                         }
                         
@@ -922,11 +934,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 size_t bytesWrittenCount; 
                 i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, portMAX_DELAY);
             } else {
-                // FIX 5: Prevent CPU spin-loop deadlock when I2S returns a 0-length read block
                 vTaskDelay(pdMS_TO_TICKS(2));
             }
         } else {
-            // FIX 5: Prevent CPU spin-loop deadlock when I2S returns a 0-length read block
             vTaskDelay(pdMS_TO_TICKS(2));
         }
     }
@@ -1037,7 +1047,7 @@ void MidiTask(void * pvParameters) {
             lastActivityTime = millis(); 
             lastScreenActivityTime = millis(); 
         }
-        
+
         if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) goToLightSleep(); 
         if (!currentBtState && !isScreenOff && (millis() - lastScreenActivityTime > SCREEN_OFF_TIMEOUT)) turnScreenOff(); 
         
@@ -1373,7 +1383,6 @@ bool channelMessageCallback(ChannelMessage cm) {
     return false;
 }
 
-// FIX 4: Constrains EEPROM memory retrieval boundaries to prevent RTOS crashes and boot loops
 void setup() {
     audioBufferMutex = xSemaphoreCreateMutex(); WiFi.mode(WIFI_OFF);
     preferences.begin("whammy_cfg", true); 
@@ -1425,7 +1434,9 @@ void setup() {
     }
     for (int i = 0; i < 2048; i++) { synthLUT[i] = sinf((((float)i - 1024.0f) / 1024.0f) * 45.0f); }
     
-    FilteredAnalog<>::setupADC(); delay(500); calibratePBs(); updateLUT();
+    FilteredAnalog<>::setupADC(); delay(500); calibratePBs(); 
+    
+    updateLUT();
     
     Control_Surface >> pipes >> btmidi; Control_Surface >> pipes >> usbmidi; 
     usbmidi >> pipes >> Control_Surface; btmidi >> pipes >> Control_Surface;

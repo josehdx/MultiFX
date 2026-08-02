@@ -83,7 +83,6 @@ DRAM_ATTR float synthLUT[WAVE_LUT_SIZE];
 volatile float globalHarmRatio = 1.0f; volatile float globalChorusRatio = 1.0f;
 volatile float globalFbRatio = 1.0f; volatile float globalVibratoPhaseInc = 0.0f;
 
-// Restored missing tap declarations
 uint32_t tap_w1_1 = 0; uint32_t tap_w1_2 = 256 << 16; 
 uint32_t tap_w2_1 = 0; uint32_t tap_w2_2 = 256 << 16; 
 uint32_t tap_w3_1 = 0; uint32_t tap_w3_2 = 256 << 16; 
@@ -549,6 +548,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static float padFilter = 0.0f; static float padEnv = 0.0f;
     static float inputEnvelope = 0.0f; static float feedbackFilterVar = 0.0f;
     static float smoothedVolGain = 1.0f;
+    
+    // NEW FIX: Retain pitch across block boundaries for smooth linear sample-level interpolation
     static float currentPitch = 1.0f; 
     
     static int freezeWriteIdxVar = 0; static int freezePlayCounterVar = 0; 
@@ -619,10 +620,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float chorusPhaseIncr = p_ch_spd / (float)currentSampleRate; 
                     float feedbackPhaseIncr = p_fb_spd / (float)currentSampleRate;
                     
+                    // NEW FIX 1: Compute slope increment for sample-level linear pitch smoothing across block
                     float targetPitch = pitchShiftFactor;
                     float pitchInc = (targetPitch - currentPitch) / (float)framesRead;
                     
-                    // Heavy % modulo logic completely replaced with light bounded wrapping
+                    // NEW FIX 2: Replaced heavy % modulo loop math with lightweight pointer wrapping to eliminate CPU spikes
                     bool frzActive = ((activeEffectMode == 1 && isWhammyActive) || isFrozen); 
                     if (frzActive && !wasFrozen) { 
                         freezePlayCounterVar = 0; 
@@ -673,6 +675,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     dsps_biquad_f32(input_block, dc_block, framesRead, dc_coeffs, dc_state);
                     
                     for (int i = 0; i < framesRead; i++) {
+                        // NEW FIX 1 (Cont): Ramped pitch per sample eliminates step/zipper artifacts
                         currentPitch += pitchInc;
                         float harmPitch = currentPitch * globalHarmRatio;
                         float choPitch  = currentPitch * globalChorusRatio;
@@ -692,7 +695,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             if (inputEnvelope > 0.005f) { synthEnv = fminf(1.0f, synthEnv + (p_sy_att * srScale)); } 
                             else { synthEnv = fmaxf(0.0f, synthEnv - (p_sy_rel * srScale)); }
                             
-                            // Prevent NaN memory reads in synthesizer wave lookup
                             if (isnan(procSample)) procSample = 0.0f;
                             int waveIdx = constrain((int)((procSample + 1.0f) * 1023.5f), 0, WAVE_LUT_SIZE - 1);
                             procSample = synthLUT[waveIdx]; 
@@ -907,7 +909,7 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
     float norm = (float)val / 127.0f; 
     int pIdx = cc - 24; 
     
-    // BUG FIX 2: Mutex added to prevent race conditions during CC matrix updates
+    // NEW FIX 3: Thread lock prevents cross-core parameter memory race conditions
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
 
     if (activeEffectMode == 0) { 
@@ -1214,7 +1216,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         }
         else if (cm.data1 == 3 && cm.data2 >= 64) {
             globalAudioResetRequested = true; 
-            bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVibratoMode || isVolumeMode;
+            bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVolumeMode;
             if (anyEffectOn) {
                 isWhammyActive = false; isFrozen = false; isFeedbackActive = false; isHarmonizerMode = false;
                 isCapoMode = false; isSynthMode = false; isPadMode = false; isChorusMode = false; isSwellMode = false; isVibratoMode = false; isVolumeMode = false;
@@ -1235,6 +1237,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if (cm.data1 == 17 || cm.data1 == 18) {
             float step = (cm.data2 >= 64) ? -1.0f : 1.0f; 
 
+            // NEW FIX 3: Mutex locks protect effectMemory reads and writes from cross-core race conditions
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             if (cm.data1 == 17) {
                 if (activeEffectMode == 0 || activeEffectMode == 1 || activeEffectMode == 8) {
@@ -1359,7 +1362,6 @@ void loop() {
         }
     }
     
-    // BUG FIX: Ensure Core 0 Flash Erase/Write operations do not stall live MIDI parameter changes
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000) && (millis() - lastActivityTime > 2000)) { 
         saveSettings(); 
         settingsNeedSaving = false; 

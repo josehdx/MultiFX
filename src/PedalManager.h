@@ -146,7 +146,7 @@ public:
 
         if (systemRecoveryFrames > 0) systemRecoveryFrames--;
 
-        // Debounced PB1 Tracking & Recovery (requires 10 persistent frames to adjust min/max)
+        // Debounced PB1 Tracking & Recovery
         if (unpluggedA) {
             recoveryA = TRS_INSERTION_LOCKOUT;
             pb1_min = pb1_center - PEDAL_CENTER_FLEX;
@@ -164,7 +164,7 @@ public:
             } else { highSpikeA = 0; }
         }
 
-        // Debounced PB2 Tracking & Recovery (requires 10 persistent frames to adjust min/max)
+        // Debounced PB2 Tracking & Recovery
         if (unpluggedB) {
             recoveryB = TRS_INSERTION_LOCKOUT;
             pb2_min = pb2_center - PEDAL_CENTER_FLEX;

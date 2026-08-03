@@ -219,9 +219,9 @@ void switchEffectMode(int newMode) {
     }
     
     activeEffectMode = (newMode % 10 + 10) % 10;
-    chorusLfoPhase = 0.0f; 
-    feedbackLfoPhase = 0.0f; 
-    vibratoLfoPhase = 0.0f; 
+    
+    // FIX 3: Removed destructive LFO phase resets. 
+    // Free-running LFOs physically prevent audible waveform tearing/clicks on preset changes.
     
     isWhammyActive = true; 
     isFrozen = false; 
@@ -1332,7 +1332,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 apfNeedsClear = false;
                             }
                             
-                            // FIX 3: Linear crossfade eliminates the mechanical pop when Freeze is engaged
                             float delayIn = procSample; 
                             if (localFrzRamp > 0.0f) {
                                 delayIn = (procSample * (1.0f - localFrzRamp)) + fzOut;
@@ -1759,7 +1758,8 @@ void MidiTask(void * pvParameters) {
                 }
                 
                 if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-                if (isVolumeMode) volumePedalGain = 8192.0f / 16383.0f; 
+                // FIX 2: Prevent a catastrophic 50% volume drop if the hardware expression pedal is disconnected mid-gig
+                if (isVolumeMode) volumePedalGain = 1.0f; 
                 if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
                 
                 forceUIUpdate = true;
@@ -1816,7 +1816,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             currentCC11 = mappedCC; 
             currentPB3 = mappedCC; 
             
-            // FIX 3: Sync logical pointer to prevent pitch-snapping when parameters update
             lastActivePedal = mappedCC;
             
             if (isVolumeMode) { 
@@ -1892,7 +1891,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             globalAudioResetRequested = true; 
             
-            // FIX 2: State-saver preserves complex multi-effect presets during master bypass
             static uint16_t savedBypassState = 1; 
             
             bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVibratoMode || isVolumeMode;
@@ -2250,7 +2248,6 @@ void loop() {
     }
     
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) { 
-        // FIX 1: Clear flag BEFORE saving to guarantee concurrent NVS memory preservation
         settingsNeedSaving = false; 
         
         sleepRequested = true;

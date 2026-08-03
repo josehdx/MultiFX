@@ -456,7 +456,6 @@ void goToLightSleep() {
         filterPB2.update(); 
         filterPB3.update();
         
-        // FIX 2: Poll Control_Surface to ensure USB/BLE MIDI can wake the device from sleep
         Control_Surface.loop();
         if (millis() - lastActivityTime < 100) break; 
         
@@ -1073,7 +1072,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, pdMS_TO_TICKS(20));
                     continue; 
                 }
-
+                
                 uint32_t start_cycles = xthal_get_ccount(); 
                 
                 float srScale = 48000.0f / (float)currentSampleRate;
@@ -1434,6 +1433,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         
                         int fbReadIdx = (fbDelayWriteIdx - delaySamples + FB_BUFFER_SIZE) & FB_BUFFER_MASK;
                         fbOutNode = (float)fbDelayBuffer[fbReadIdx] * 3.0517578125e-5f;
+                        fbDelayWriteIdx = (fbDelayWriteIdx + 1) & FB_BUFFER_MASK;
+                    } else {
+                        fbDelayBuffer[fbDelayWriteIdx] = 0;
+                        fbOutNode = 0.0f;
                         fbDelayWriteIdx = (fbDelayWriteIdx + 1) & FB_BUFFER_MASK;
                     }
                     

@@ -260,15 +260,29 @@ void saveSettings() {
         }
     }
     
+    // FIX 1: Compressed all 10 scattered UI boolean toggles into a single 16-bit word for safe NVS persistence
+    uint16_t fxStates = 0;
+    if (isWhammyActive)   fxStates |= (1 << 0);
+    if (isFrozen)         fxStates |= (1 << 1);
+    if (isFeedbackActive) fxStates |= (1 << 2);
+    if (isHarmonizerMode) fxStates |= (1 << 3);
+    if (isCapoMode)       fxStates |= (1 << 4);
+    if (isSynthMode)      fxStates |= (1 << 5);
+    if (isPadMode)        fxStates |= (1 << 6);
+    if (isChorusMode)     fxStates |= (1 << 7);
+    if (isSwellMode)      fxStates |= (1 << 8);
+    if (isVibratoMode)    fxStates |= (1 << 9);
+    
     if (audioBufferMutex != NULL) {
         xSemaphoreGive(audioBufferMutex);
     }
 
     preferences.begin("whammy_cfg", false); 
-    preferences.putInt("activeMode", activeEffectMode); 
-    preferences.putInt("latMode", latencyMode);
+    preferences.putInt("activeMode", (int)activeEffectMode); 
+    preferences.putInt("latMode", (int)latencyMode);
     preferences.putBool("pb2Wiper", isPB2WiperMode); 
     preferences.putBool("volMode", isVolumeMode); 
+    preferences.putUShort("fxStates", fxStates);
     preferences.putUInt("sampleRate", currentSampleRate);
     preferences.putInt("fbIdx", constrain((int)feedbackIntervalIdx, 0, 4)); 
     preferences.putBytes("dspData", &currentSettings, sizeof(AppSettings));
@@ -352,7 +366,6 @@ void toggleSampleRate() {
     saveSettings(); 
     settingsNeedSaving = false;
     
-    // FIX 1: Pulled the LUT calculation out of the Mutex to prevent RTOS Deadlock
     updateLUT();
     lutNeedsUpdate = false;
     
@@ -1196,7 +1209,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float g_w2 = harmActive ? p_hr_mix : 0.0f;
                         float g_w3 = chorusActive ? p_ch_mix : 0.0f;
                         
-                        bool padIsAudible = padActive || (padFilter > 0.001f);
+                        // FIX 3: Replaced raw polarity evaluation with fabsf() amplitude magnitude check.
+                        // This prevents the pad from violently stuttering as it crosses the AC zero-crossing.
+                        bool padIsAudible = padActive || (fabsf(padFilter) > 0.001f);
                         float g_pad = padIsAudible ? p_pd_mix : 0.0f;
                         
                         float g_frz = (!frzActive && localFrzRamp > 0.0f) ? 0.5f : 0.0f;
@@ -1206,6 +1221,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         
                         float vol_alpha = 0.01f * srScale;
                         float meter_decay = (currentSampleRate == 96000) ? 0.999f : 0.998f;
+                        
+                        // FIX 2: Exponential Moving Average envelope scaled dynamically across frequencies.
+                        float envRetain = powf(0.99f, srScale);
+                        float envAttack = 1.0f - envRetain;
 
                         for (int i = 0; i < framesRead; i++) {
                             currentPitch += pitchInc;
@@ -1216,7 +1235,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             input_dc_offset = (input_dc_offset * (1.0f - dc_alpha)) + (raw_in * dc_alpha);
                             float inSample = raw_in - input_dc_offset; 
                             
-                            inputEnvelope = inputEnvelope * 0.99f + fabsf(inSample) * 0.01f + DC_OFFSET;
+                            // Dynamically tracks the actual AC voltage safely at 48kHz or 96kHz physical time
+                            inputEnvelope = inputEnvelope * envRetain + fabsf(inSample) * envAttack + DC_OFFSET;
                             
                             if (swellActive) {
                                 if (inputEnvelope > p_sw_thr) { 
@@ -1851,6 +1871,9 @@ bool channelMessageCallback(ChannelMessage cm) {
             
             if (sendCenterMidi) Control_Surface.sendPitchBend(Channel_3, 8192);
             forceUIUpdate = true; 
+            // FIX 1: Enforce background saving for Volume mode
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
         } else if (cm.data1 == 0 && cm.data2 >= 64) { 
             switchEffectMode(activeEffectMode - 1); 
         } else if (cm.data1 == 1 && cm.data2 >= 64) { 
@@ -1899,6 +1922,9 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (sendCenterMidi) Control_Surface.sendPitchBend(Channel_3, 8192);
             lutNeedsUpdate = true; 
             forceUIUpdate = true;
+            // FIX 1: Enforce background saving for Master Bypass states
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
         } else if (cm.data1 == 4 && cm.data2 >= 64) { 
             toggleSampleRate(); 
         } else if (cm.data1 == 8 && cm.data2 >= 64) { 
@@ -1908,6 +1934,8 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             
             forceUIUpdate = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
         } else if (cm.data1 == 9 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isFeedbackActive = !isFeedbackActive; 
@@ -1915,6 +1943,8 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             
             forceUIUpdate = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
         } else if (cm.data1 == 10 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isHarmonizerMode = !isHarmonizerMode; 
@@ -1922,6 +1952,8 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             
             forceUIUpdate = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
         } else if (cm.data1 == 12 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isCapoMode = !isCapoMode; 
@@ -1930,6 +1962,8 @@ bool channelMessageCallback(ChannelMessage cm) {
             
             lutNeedsUpdate = true; 
             forceUIUpdate = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
         } else if (cm.data1 == 13 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isSynthMode = !isSynthMode; 
@@ -1937,6 +1971,8 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             
             forceUIUpdate = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
         } else if (cm.data1 == 14 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isPadMode = !isPadMode; 
@@ -1944,6 +1980,8 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             
             forceUIUpdate = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
         } else if (cm.data1 == 15 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isChorusMode = !isChorusMode; 
@@ -1951,6 +1989,8 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             
             forceUIUpdate = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
         } else if (cm.data1 == 16 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isSwellMode = !isSwellMode; 
@@ -1958,6 +1998,8 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             
             forceUIUpdate = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
         } else if (cm.data1 == 7 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isVibratoMode = !isVibratoMode; 
@@ -1965,6 +2007,8 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
             
             forceUIUpdate = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
         } else if (cm.data1 == 17 || cm.data1 == 18) {
             float step = (cm.data2 >= 64) ? -1.0f : 1.0f; 
 
@@ -2007,9 +2051,7 @@ void setup() {
     activeEffectMode = constrain(preferences.getInt("activeMode", 0), 0, 9); 
     latencyMode = constrain(preferences.getInt("latMode", 0), 0, 3);
     isPB2WiperMode = preferences.getBool("pb2Wiper", false); 
-    
     isVolumeMode = preferences.getBool("volMode", false); 
-    
     currentSampleRate = preferences.getUInt("sampleRate", 48000);
     feedbackIntervalIdx = constrain(preferences.getInt("fbIdx", 0), 0, 4); 
     
@@ -2023,9 +2065,22 @@ void setup() {
             }
         }
     }
-    preferences.end();
     
-    switchEffectMode(activeEffectMode);
+    // FIX 1: Retrieve compressed bitmask and permanently map it to UI states 
+    // to preserve all background effects across hardware reboots.
+    uint16_t fxStates = preferences.getUShort("fxStates", 1); 
+    isWhammyActive = (fxStates & (1 << 0)) != 0;
+    isFrozen = (fxStates & (1 << 1)) != 0;
+    isFeedbackActive = (fxStates & (1 << 2)) != 0;
+    isHarmonizerMode = (fxStates & (1 << 3)) != 0;
+    isCapoMode = (fxStates & (1 << 4)) != 0;
+    isSynthMode = (fxStates & (1 << 5)) != 0;
+    isPadMode = (fxStates & (1 << 6)) != 0;
+    isChorusMode = (fxStates & (1 << 7)) != 0;
+    isSwellMode = (fxStates & (1 << 8)) != 0;
+    isVibratoMode = (fxStates & (1 << 9)) != 0;
+    
+    preferences.end();
 
     pinMode(BATTERY_PIN, INPUT);
     pinMode(38, OUTPUT); 

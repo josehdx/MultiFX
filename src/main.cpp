@@ -159,6 +159,9 @@ const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 
 volatile bool globalAudioResetRequested = false; 
 volatile bool clearBuffersRequested = false; 
+
+volatile bool isWritingFlash = false; 
+
 volatile int hardwareSyncMuteFrames = 0; 
 
 unsigned long lastActivityTime = 0; 
@@ -265,6 +268,7 @@ void saveSettings() {
     preferences.putInt("activeMode", activeEffectMode); 
     preferences.putInt("latMode", latencyMode);
     preferences.putBool("pb2Wiper", isPB2WiperMode); 
+    preferences.putBool("volMode", isVolumeMode); 
     preferences.putUInt("sampleRate", currentSampleRate);
     preferences.putInt("fbIdx", constrain((int)feedbackIntervalIdx, 0, 4)); 
     preferences.putBytes("dspData", &currentSettings, sizeof(AppSettings));
@@ -321,7 +325,6 @@ void toggleSampleRate() {
     globalAudioResetRequested = true; 
     int timeoutCounter = 0;
     
-    // 1. Safely put the DSP to sleep
     while (!isSleeping && timeoutCounter < 40) { 
         vTaskDelay(pdMS_TO_TICKS(5)); 
         timeoutCounter++; 
@@ -331,7 +334,6 @@ void toggleSampleRate() {
         xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     }
 
-    // 2. Disable and destroy current I2S hardware
     i2s_channel_disable(tx_chan); 
     i2s_channel_disable(rx_chan); 
     vTaskDelay(pdMS_TO_TICKS(50)); 
@@ -344,17 +346,18 @@ void toggleSampleRate() {
     } else {
         currentSampleRate = 96000;
     }
-
-    // FIX: Temporarily release the mutex and save directly to NVS while the hardware is dead.
-    // This permanently prevents the redundant 2-second delayed auto-save audio dropout.
+    
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
     
     saveSettings(); 
-    settingsNeedSaving = false; // Flag cleared to prevent the secondary drop
+    settingsNeedSaving = false;
+    
+    // FIX 1: Pulled the LUT calculation out of the Mutex to prevent RTOS Deadlock
+    updateLUT();
+    lutNeedsUpdate = false;
     
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     
-    // 3. Rebuild I2S hardware at the new sample rate
     i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
     i2sConfig.dma_desc_num = 8; 
     i2sConfig.dma_frame_num = HOP_SIZE; 
@@ -377,19 +380,16 @@ void toggleSampleRate() {
     i2s_channel_init_std_mode(rx_chan, &stdConfig); 
     
     freezeLength = currentSampleRate; 
-    lutNeedsUpdate = true;
     
     i2s_channel_enable(tx_chan); 
     i2s_channel_enable(rx_chan); 
     
-    // 4. Flush the corrupted DMA buffers
     size_t dummyBytes; 
     static int32_t dummyBuf[HOP_SIZE * 2];
     for (int k = 0; k < 10; k++) {
         i2s_channel_read(rx_chan, dummyBuf, sizeof(dummyBuf), &dummyBytes, pdMS_TO_TICKS(5));
     }
 
-    // 5. Arm the intentional 150ms anti-pop mute
     hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
 
     if (audioBufferMutex != NULL) {
@@ -400,8 +400,6 @@ void toggleSampleRate() {
 
     sleepRequested = false; 
     forceUIUpdate = true; 
-    
-    // Notice `settingsNeedSaving = true;` is removed here!
     lastParameterChangeTime = millis();
 }
 
@@ -528,7 +526,6 @@ inline float IRAM_ATTR processTap(uint32_t tapPhase, const int16_t* buffer, int 
     int idx2 = (idx1 - 1 + MAX_BUFFER_SIZE) & BUFFER_MASK; 
     int idx3 = (idx1 - 2 + MAX_BUFFER_SIZE) & BUFFER_MASK;
     
-    // Q15 expansion back to float range
     float y0 = (float)buffer[idx0] * 3.0517578125e-5f; 
     float y1 = (float)buffer[idx1] * 3.0517578125e-5f; 
     float y2 = (float)buffer[idx2] * 3.0517578125e-5f; 
@@ -613,7 +610,6 @@ void updateMeters() {
     meterSpr.pushSprite(spr.width() - 17, 31);
 }
 
-// --- UI HELPER: CIRCULAR GAUGES ---
 void drawCircularGauge(TFT_eSprite& sprite, int x, int y, int radius, float value, const char* label, const char* valStr, uint32_t color, int type) {
     int thickness = 3;
     sprite.drawArc(x, y, radius, radius - thickness, 210, 150, TFT_DARKGREY, TFT_BLACK, true);
@@ -661,7 +657,6 @@ struct GaugeDef {
 void updateDisplay() {
     spr.fillSprite(TFT_BLACK); 
     
-    // Thread-safe local snapshot prevents visual UI tearing during MIDI mode changes
     int renderMode = activeEffectMode; 
     
     char batStr[20];
@@ -927,6 +922,8 @@ void DisplayTask(void * pvParameters) {
             digitalWrite(15, HIGH); 
             tft.init(); 
             
+            tft.setRotation(1);
+            
             vTaskDelay(pdMS_TO_TICKS(120)); 
             
             pinMode(38, OUTPUT); 
@@ -985,7 +982,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     
     for (;;) {
         if (sleepRequested) { 
-            isSleeping = true; 
+            if (!isSleeping) {
+                memset(i2s_out_block, 0, sizeof(i2s_out_block));
+                size_t dummyBytes;
+                i2s_channel_write(tx_chan, i2s_out_block, sizeof(i2s_out_block), &dummyBytes, pdMS_TO_TICKS(20));
+                isSleeping = true; 
+            }
             vTaskDelay(pdMS_TO_TICKS(10)); 
             continue; 
         }
@@ -1042,11 +1044,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     }
                     
                     size_t bytesWrittenCount; 
-                    i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, portMAX_DELAY);
+                    i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, pdMS_TO_TICKS(20));
                     continue; 
                 }
 
-                bool blockIsMuted = clearBuffersRequested;
+                bool blockIsMuted = clearBuffersRequested || isWritingFlash;
+                
                 uint32_t start_cycles = xthal_get_ccount(); 
                 
                 float srScale = 48000.0f / (float)currentSampleRate;
@@ -1204,7 +1207,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float vol_alpha = 0.01f * srScale;
                         float meter_decay = (currentSampleRate == 96000) ? 0.999f : 0.998f;
 
-                        #pragma GCC ivdep
                         for (int i = 0; i < framesRead; i++) {
                             currentPitch += pitchInc;
                             
@@ -1486,7 +1488,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 core1_load = core1_load * 0.95f + fminf(100.0f, currentLoadPercentage) * 0.05f; 
                 
                 size_t bytesWrittenCount; 
-                i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, portMAX_DELAY);
+                i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, pdMS_TO_TICKS(20));
             } else {
                 vTaskDelay(pdMS_TO_TICKS(2));
             }
@@ -2005,6 +2007,9 @@ void setup() {
     activeEffectMode = constrain(preferences.getInt("activeMode", 0), 0, 9); 
     latencyMode = constrain(preferences.getInt("latMode", 0), 0, 3);
     isPB2WiperMode = preferences.getBool("pb2Wiper", false); 
+    
+    isVolumeMode = preferences.getBool("volMode", false); 
+    
     currentSampleRate = preferences.getUInt("sampleRate", 48000);
     feedbackIntervalIdx = constrain(preferences.getInt("fbIdx", 0), 0, 4); 
     
@@ -2019,6 +2024,8 @@ void setup() {
         }
     }
     preferences.end();
+    
+    switchEffectMode(activeEffectMode);
 
     pinMode(BATTERY_PIN, INPUT);
     pinMode(38, OUTPUT); 
@@ -2162,55 +2169,12 @@ void loop() {
     
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000) && (millis() - lastActivityTime > 2000)) { 
         
-        sleepRequested = true;
-        int timeoutCounter = 0;
-        while (!isSleeping && timeoutCounter < 40) {
-            vTaskDelay(pdMS_TO_TICKS(5));
-            timeoutCounter++;
-        }
-        
-        if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-        
-        i2s_channel_disable(tx_chan);
-        i2s_channel_disable(rx_chan);
-        
-        i2s_del_channel(tx_chan);
-        i2s_del_channel(rx_chan);
-        
-        if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+        isWritingFlash = true;
+        vTaskDelay(pdMS_TO_TICKS(15)); 
         
         saveSettings(); 
         
-        if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-        
-        i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
-        i2sConfig.dma_desc_num = 8; 
-        i2sConfig.dma_frame_num = HOP_SIZE; 
-        i2sConfig.auto_clear = true;
-        i2s_new_channel(&i2sConfig, &tx_chan, &rx_chan);
-        
-        i2s_std_config_t stdConfig = { 
-            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate), 
-            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
-            .gpio_cfg = { .mclk = GPIO_NUM_43, .bclk = GPIO_NUM_44, .ws = GPIO_NUM_18, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } 
-        };
-        
-        i2s_channel_init_std_mode(tx_chan, &stdConfig); 
-        i2s_channel_init_std_mode(rx_chan, &stdConfig); 
-        
-        i2s_channel_enable(tx_chan);
-        i2s_channel_enable(rx_chan);
-        
-        size_t dummyBytes; 
-        static int32_t dummyBuf[HOP_SIZE * 2];
-        for (int k = 0; k < 10; k++) {
-            i2s_channel_read(rx_chan, dummyBuf, sizeof(dummyBuf), &dummyBytes, pdMS_TO_TICKS(5));
-        }
-        
-        hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
-        if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
-
-        sleepRequested = false;
+        isWritingFlash = false;
         settingsNeedSaving = false; 
     }
     

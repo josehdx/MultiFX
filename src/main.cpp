@@ -167,7 +167,7 @@ unsigned long lastScreenActivityTime = 0;
 const unsigned long LIGHT_SLEEP_TIMEOUT = 25000; 
 const unsigned long SCREEN_OFF_TIMEOUT = 15000;  
 
-bool isScreenOff = false; 
+volatile bool isScreenOff = false; 
 volatile bool wakeupPending = false; 
 volatile float core1_load = 0.0f; 
 volatile bool sleepRequested = false; 
@@ -286,7 +286,7 @@ int getBatteryPercentage(float voltage) {
     if (clampedVolts >= 3.55f) return 20 + (int)((clampedVolts - 3.55f) / 0.05f * 10.0f);
     if (clampedVolts >= 3.50f) return 10 + (int)((clampedVolts - 3.50f) / 0.05f * 10.0f);
     
-    return (int)((clampedVolts - 3.30f) / 0.20f * 10.0f);
+    return (int)(fmaxf(0.0f, clampedVolts - 3.30f) / 0.20f * 10.0f);
 }
 
 void calibratePBs() {
@@ -321,6 +321,7 @@ void toggleSampleRate() {
     globalAudioResetRequested = true; 
     int timeoutCounter = 0;
     
+    // 1. Safely put the DSP to sleep
     while (!isSleeping && timeoutCounter < 40) { 
         vTaskDelay(pdMS_TO_TICKS(5)); 
         timeoutCounter++; 
@@ -330,6 +331,7 @@ void toggleSampleRate() {
         xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     }
 
+    // 2. Disable and destroy current I2S hardware
     i2s_channel_disable(tx_chan); 
     i2s_channel_disable(rx_chan); 
     vTaskDelay(pdMS_TO_TICKS(50)); 
@@ -342,7 +344,17 @@ void toggleSampleRate() {
     } else {
         currentSampleRate = 96000;
     }
+
+    // FIX: Temporarily release the mutex and save directly to NVS while the hardware is dead.
+    // This permanently prevents the redundant 2-second delayed auto-save audio dropout.
+    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
     
+    saveSettings(); 
+    settingsNeedSaving = false; // Flag cleared to prevent the secondary drop
+    
+    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+    
+    // 3. Rebuild I2S hardware at the new sample rate
     i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
     i2sConfig.dma_desc_num = 8; 
     i2sConfig.dma_frame_num = HOP_SIZE; 
@@ -370,12 +382,14 @@ void toggleSampleRate() {
     i2s_channel_enable(tx_chan); 
     i2s_channel_enable(rx_chan); 
     
+    // 4. Flush the corrupted DMA buffers
     size_t dummyBytes; 
     static int32_t dummyBuf[HOP_SIZE * 2];
     for (int k = 0; k < 10; k++) {
         i2s_channel_read(rx_chan, dummyBuf, sizeof(dummyBuf), &dummyBytes, pdMS_TO_TICKS(5));
     }
 
+    // 5. Arm the intentional 150ms anti-pop mute
     hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
 
     if (audioBufferMutex != NULL) {
@@ -386,7 +400,8 @@ void toggleSampleRate() {
 
     sleepRequested = false; 
     forceUIUpdate = true; 
-    settingsNeedSaving = true; 
+    
+    // Notice `settingsNeedSaving = true;` is removed here!
     lastParameterChangeTime = millis();
 }
 
@@ -1178,7 +1193,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float g_w2 = harmActive ? p_hr_mix : 0.0f;
                         float g_w3 = chorusActive ? p_ch_mix : 0.0f;
                         
-                        // RESTORED: Dynamic audible threshold prevents Pad filter tail leakage
                         bool padIsAudible = padActive || (padFilter > 0.001f);
                         float g_pad = padIsAudible ? p_pd_mix : 0.0f;
                         
@@ -1714,7 +1728,6 @@ void MidiTask(void * pvParameters) {
                 forceUIUpdate = true;
             }
         } else {
-            // RESTORED: One-shot execution latch prevents infinite TFT redraw thrashing
             static bool wasBypassed = false;
             if (!wasBypassed) {
                 pedals.resetToCenter();
@@ -1875,7 +1888,6 @@ bool channelMessageCallback(ChannelMessage cm) {
                     currentPB3 = 8192;
                 }
                 volumePedalGain = 1.0f; 
-                // RESTORED: Preserves active preset mode on master bypass
             } else { 
                 isWhammyActive = true; 
             }
@@ -2149,7 +2161,56 @@ void loop() {
     }
     
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000) && (millis() - lastActivityTime > 2000)) { 
+        
+        sleepRequested = true;
+        int timeoutCounter = 0;
+        while (!isSleeping && timeoutCounter < 40) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            timeoutCounter++;
+        }
+        
+        if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+        
+        i2s_channel_disable(tx_chan);
+        i2s_channel_disable(rx_chan);
+        
+        i2s_del_channel(tx_chan);
+        i2s_del_channel(rx_chan);
+        
+        if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+        
         saveSettings(); 
+        
+        if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+        
+        i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
+        i2sConfig.dma_desc_num = 8; 
+        i2sConfig.dma_frame_num = HOP_SIZE; 
+        i2sConfig.auto_clear = true;
+        i2s_new_channel(&i2sConfig, &tx_chan, &rx_chan);
+        
+        i2s_std_config_t stdConfig = { 
+            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate), 
+            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
+            .gpio_cfg = { .mclk = GPIO_NUM_43, .bclk = GPIO_NUM_44, .ws = GPIO_NUM_18, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } 
+        };
+        
+        i2s_channel_init_std_mode(tx_chan, &stdConfig); 
+        i2s_channel_init_std_mode(rx_chan, &stdConfig); 
+        
+        i2s_channel_enable(tx_chan);
+        i2s_channel_enable(rx_chan);
+        
+        size_t dummyBytes; 
+        static int32_t dummyBuf[HOP_SIZE * 2];
+        for (int k = 0; k < 10; k++) {
+            i2s_channel_read(rx_chan, dummyBuf, sizeof(dummyBuf), &dummyBytes, pdMS_TO_TICKS(5));
+        }
+        
+        hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
+        if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+
+        sleepRequested = false;
         settingsNeedSaving = false; 
     }
     

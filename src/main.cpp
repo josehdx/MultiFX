@@ -1055,6 +1055,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     continue; 
                 }
 
+                // FIX 3: Removed orphaned 'isWritingFlash' variable
                 bool blockIsMuted = clearBuffersRequested;
                 
                 uint32_t start_cycles = xthal_get_ccount(); 
@@ -1066,7 +1067,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     ui_audio_level = 0.0f; 
                     ui_output_level = 0.0f;
                 } else {
-                    if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(15)) == pdTRUE) {
+                    // FIX 2: Zero-wait mutex polling. If locked, the DSP re-uses cached parameters 
+                    // to instantly process audio without missing the 1.33ms DMA deadline.
+                    if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, 0) == pdTRUE) {
                         float targetWindow = LATENCY_WINDOWS[latencyMode];
                         if (currentWindowSize != targetWindow) { 
                             currentWindowSize = targetWindow; 
@@ -1755,14 +1758,12 @@ void MidiTask(void * pvParameters) {
                 }
                 
                 if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-                // FIX 2: Prevent a catastrophic 50% volume drop if the hardware expression pedal is disconnected mid-gig
                 if (isVolumeMode) volumePedalGain = 1.0f; 
                 if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
                 
                 forceUIUpdate = true;
                 wasBypassed = true;
             }
-            vTaskDelay(pdMS_TO_TICKS(5)); 
         }
 
         if (millis() - lastBatteryTime > 1000) {
@@ -1796,6 +1797,50 @@ void MidiTask(void * pvParameters) {
                 
                 if (stateChanged) forceUIUpdate = true;
             }
+        }
+
+        // FIX 1: The native loop() polling blocks are now correctly pinned exclusively to Core 0
+        static unsigned long lastLutUpdate = 0;
+        if (lutNeedsUpdate && (millis() - lastLutUpdate > 40)) { 
+            lutNeedsUpdate = false; 
+            
+            updateLUT(); 
+            
+            if (audioBufferMutex != NULL) {
+                xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+            }
+            pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
+            if (audioBufferMutex != NULL) {
+                xSemaphoreGive(audioBufferMutex);
+            }
+            
+            lastLutUpdate = millis();
+        }
+
+        if (clearBuffersRequested) {
+            if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, portMAX_DELAY) == pdTRUE) {
+                memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
+                memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); 
+                memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
+                
+                clearBuffersRequested = false; 
+                xSemaphoreGive(audioBufferMutex);
+            }
+        }
+        
+        if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) { 
+            settingsNeedSaving = false; 
+            
+            sleepRequested = true;
+            int timeoutCounter = 0;
+            while (!isSleeping && timeoutCounter < 40) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                timeoutCounter++;
+            }
+            
+            saveSettings(); 
+            
+            sleepRequested = false;
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));
@@ -2216,49 +2261,6 @@ void setup() {
 }
 
 void loop() {
-    static unsigned long lastLutUpdate = 0;
-    if (lutNeedsUpdate && (millis() - lastLutUpdate > 40)) { 
-        lutNeedsUpdate = false; 
-        
-        updateLUT(); 
-        
-        if (audioBufferMutex != NULL) {
-            xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-        }
-        pitchShiftFactor = pitchShiftLUT[constrain(lastActivePedal, 0, 16383)]; 
-        if (audioBufferMutex != NULL) {
-            xSemaphoreGive(audioBufferMutex);
-        }
-        
-        lastLutUpdate = millis();
-    }
-
-    if (clearBuffersRequested) {
-        if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, portMAX_DELAY) == pdTRUE) {
-            memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
-            memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); 
-            memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
-            
-            clearBuffersRequested = false; 
-            xSemaphoreGive(audioBufferMutex);
-        }
-    }
-    
-    if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) { 
-        // FIX 1: Clear flag BEFORE saving to guarantee concurrent NVS memory preservation
-        settingsNeedSaving = false; 
-        
-        sleepRequested = true;
-        int timeoutCounter = 0;
-        while (!isSleeping && timeoutCounter < 40) {
-            vTaskDelay(pdMS_TO_TICKS(5));
-            timeoutCounter++;
-        }
-        
-        saveSettings(); 
-        
-        sleepRequested = false;
-    }
-    
-    vTaskDelay(pdMS_TO_TICKS(10));
+    // FIX 1: Permanently kill the default Arduino loop task to guarantee 100% Core 1 isolation for DSP
+    vTaskDelete(NULL);
 }

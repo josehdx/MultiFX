@@ -974,10 +974,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 }
 
                 if (hardwareSyncMuteFrames > 0) {
-                    hardwareSyncMuteFrames = hardwareSyncMuteFrames - 1;
+                    if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(15)) == pdTRUE) {
+                        hardwareSyncMuteFrames = hardwareSyncMuteFrames - 1;
+                        ui_audio_level = 0.0f; 
+                        ui_output_level = 0.0f;
+                        xSemaphoreGive(audioBufferMutex);
+                    }
                     memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
-                    ui_audio_level = 0.0f; 
-                    ui_output_level = 0.0f;
                     
                     for (int i = 0; i < framesRead; i++) { 
                         int32_t clean_sample = i2s_in_block[i * 2] & 0xFFFFFF00;
@@ -997,8 +1000,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
 
                 if (blockIsMuted) {
                     memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
-                    ui_audio_level = 0.0f; 
-                    ui_output_level = 0.0f;
+                    if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(15)) == pdTRUE) {
+                        ui_audio_level = 0.0f; 
+                        ui_output_level = 0.0f;
+                        xSemaphoreGive(audioBufferMutex);
+                    }
                 } else {
                     if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(15)) == pdTRUE) {
                         float targetWindow = LATENCY_WINDOWS[latencyMode];
@@ -1192,7 +1198,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 float fltCoeff = fmaxf(0.001f, fminf(0.99f, (p_sy_flt + 0.6f * synthEnv) * srScale));
                                 synthFilter = synthFilter + fltCoeff * (procSample - synthFilter) + DC_OFFSET; 
                                 procSample = synthFilter * p_sy_mix;
-                            } 
+                            } else {
+                                synthEnv = fmaxf(0.0f, synthEnv - (p_sy_rel * srScale)); 
+                                synthFilter = synthFilter * 0.99f + DC_OFFSET;
+                            }
                             
                             if (padActive) { 
                                 if (inputEnvelope > 0.005f) { 
@@ -1201,6 +1210,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                     padEnv = fmaxf(0.0f, padEnv - (0.000005f * srScale)); 
                                 }
                                 procSample *= padEnv; 
+                            } else {
+                                padEnv = fmaxf(0.0f, padEnv - (0.000005f * srScale)); 
                             }
                             
                             if (!frzActive) { 

@@ -66,6 +66,7 @@ bool channelMessageCallback(ChannelMessage cm);
 i2s_chan_handle_t tx_chan;
 i2s_chan_handle_t rx_chan;
 SemaphoreHandle_t audioBufferMutex = NULL;
+TaskHandle_t audioTaskHandle = NULL; 
 
 volatile uint32_t currentSampleRate = 48000; 
 #define HOP_SIZE 64            
@@ -122,8 +123,6 @@ volatile int feedbackIntervalIdx = 0;
 volatile bool lutNeedsUpdate = false;
 volatile uint16_t lastActivePedal = 8192; 
 
-TaskHandle_t audioTaskHandle = NULL; 
-
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite spr = TFT_eSprite(&tft); 
 TFT_eSprite meterSpr = TFT_eSprite(&tft); 
@@ -159,6 +158,7 @@ const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 
 volatile bool globalAudioResetRequested = false; 
 volatile bool sampleRateToggleRequested = false; 
+volatile bool pb2ToggleRequested = false; 
 
 volatile int hardwareSyncMuteFrames = 0; 
 
@@ -212,6 +212,15 @@ USBMIDI_Interface usbmidi;
 MIDI_PipeFactory<4> pipes;
 
 PedalManager pedals;
+
+// FIX 4: DMA Hardware Interrupt Callback Definition
+bool IRAM_ATTR i2s_rx_callback(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx) {
+    BaseType_t high_task_wakeup = pdFALSE;
+    if (audioTaskHandle != NULL) {
+        vTaskNotifyGiveFromISR(audioTaskHandle, &high_task_wakeup);
+    }
+    return high_task_wakeup == pdTRUE;
+}
 
 void switchEffectMode(int newMode) {
     if (audioBufferMutex != NULL) {
@@ -386,6 +395,10 @@ void toggleSampleRate() {
     i2s_channel_init_std_mode(tx_chan, &stdConfig); 
     i2s_channel_init_std_mode(rx_chan, &stdConfig); 
     
+    // FIX 4: Re-register the hardware interrupt callback upon hardware rebuild
+    i2s_event_callbacks_t cbs = { .on_recv = i2s_rx_callback, .on_recv_q_ovf = NULL, .on_sent = NULL, .on_send_q_ovf = NULL };
+    i2s_channel_register_event_callback(rx_chan, &cbs, NULL);
+    
     freezeLength = currentSampleRate; 
     
     i2s_channel_enable(tx_chan); 
@@ -489,6 +502,9 @@ void goToLightSleep() {
     
     i2s_channel_init_std_mode(tx_chan, &stdConfig); 
     i2s_channel_init_std_mode(rx_chan, &stdConfig); 
+    
+    i2s_event_callbacks_t cbs = { .on_recv = i2s_rx_callback, .on_recv_q_ovf = NULL, .on_sent = NULL, .on_send_q_ovf = NULL };
+    i2s_channel_register_event_callback(rx_chan, &cbs, NULL);
     
     i2s_channel_enable(tx_chan); 
     i2s_channel_enable(rx_chan); 
@@ -1021,9 +1037,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             wasSleeping = false;
         }
         
-        size_t bytesRead; 
+        // FIX 4: DMA Hardware Interrupt Blocking (replaces i2s_channel_read software polling)
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
         
-        i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, pdMS_TO_TICKS(20));
+        size_t bytesRead; 
+        i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, 0);
         
         if (bytesRead > 0) {
             int framesRead = bytesRead / 8; 
@@ -1049,13 +1067,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     input_dc_offset = 0.0f; 
                     ui_audio_level = 0.0f; 
                     ui_output_level = 0.0f; 
-                    
-                    // FIX 3: Reset internal oscillator phases and envelope ramps to prevent restart clicks
-                    freezeRamp = 0.0f;
-                    feedbackRamp = 0.0f;
-                    vibratoLfoPhase = 0.0f;
-                    chorusLfoPhase = 0.0f;
-                    feedbackLfoPhase = 0.0f;
                     
                     uint32_t halfWinFixed = ((uint32_t)currentWindowSize / 2) << 16;
                     tap_w1_1 = 0; tap_w1_2 = halfWinFixed;
@@ -1279,6 +1290,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float localFbPhase = feedbackLfoPhase;
                 float localFbHpf = fbHpfState;
 
+                // FIX 3: Block-Based Vectorization Pipeline
+                float inBuf[HOP_SIZE];
+                float envBuf[HOP_SIZE];
+                float fzOutBuf[HOP_SIZE];
+                
+                // LOOP 1: Input Scaling & Envelope
                 for (int i = 0; i < framesRead; i++) {
                     currentPitch += pitchInc;
                     
@@ -1289,49 +1306,42 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float inSample = raw_in - input_dc_offset; 
                     
                     inputEnvelope = inputEnvelope * envRetain + fabsf(inSample) * envAttack + DC_OFFSET;
+                    envBuf[i] = inputEnvelope;
                     
                     if (swellActive) {
-                        if (inputEnvelope > p_sw_thr) { 
-                            localSwellGain = fminf(1.0f, localSwellGain + (p_sw_att * srScale)); 
-                        } else { 
-                            localSwellGain = fmaxf(0.0f, localSwellGain - (p_sw_rel * srScale)); 
-                        }
+                        localSwellGain = (inputEnvelope > p_sw_thr) ? fminf(1.0f, localSwellGain + (p_sw_att * srScale)) : fmaxf(0.0f, localSwellGain - (p_sw_rel * srScale)); 
                     } else { 
-                        if (localSwellGain < 1.0f) {
-                            localSwellGain = fminf(1.0f, localSwellGain + (0.005f * srScale)); 
-                        } else {
-                            localSwellGain = 1.0f; 
-                        }
+                        localSwellGain = fminf(1.0f, localSwellGain + (0.005f * srScale)); 
                     }
                     
-                    float procSample = inSample;
-                    
-                    if (synthActive) { 
-                        if (inputEnvelope > 0.005f) { 
-                            synthEnv = fminf(1.0f, synthEnv + (p_sy_att * srScale)); 
-                        } else { 
-                            synthEnv = fmaxf(0.0f, synthEnv - (p_sy_rel * srScale)); 
-                        }
-                        
-                        if (isnan(procSample)) procSample = 0.0f;
-                        
-                        float clampedProc = fmaxf(-1.0f, fminf(procSample, 1.0f));
+                    inBuf[i] = inSample;
+                    fzOutBuf[i] = 0.0f;
+                }
+
+                // LOOP 2: Synth 
+                if (synthActive) {
+                    for(int i = 0; i < framesRead; i++) {
+                        synthEnv = (envBuf[i] > 0.005f) ? fminf(1.0f, synthEnv + (p_sy_att * srScale)) : fmaxf(0.0f, synthEnv - (p_sy_rel * srScale));
+                        float clampedProc = fmaxf(-1.0f, fminf(inBuf[i], 1.0f));
                         int waveIdx = (int)((clampedProc + 1.0f) * 1023.5f);
-                        procSample = synthLUT[waveIdx]; 
-                        
+                        float procSample = synthLUT[waveIdx]; 
                         float fltCoeff = fmaxf(0.001f, fminf(0.99f, (p_sy_flt + 0.6f * synthEnv) * srScale));
                         synthFilter = synthFilter + fltCoeff * (procSample - synthFilter) + DC_OFFSET; 
-                        procSample = synthFilter * p_sy_mix;
-                    } 
-                    
-                    if (padActive) { 
-                        if (inputEnvelope > 0.005f) { 
-                            padEnv = fminf(1.0f, padEnv + (0.00002f * srScale)); 
-                        } else { 
-                            padEnv = fmaxf(0.0f, padEnv - (0.000005f * srScale)); 
-                        }
-                        procSample *= padEnv; 
+                        inBuf[i] = synthFilter * p_sy_mix;
                     }
+                }
+                
+                // LOOP 3: Pad
+                if (padActive) {
+                    for(int i = 0; i < framesRead; i++) {
+                        padEnv = (envBuf[i] > 0.005f) ? fminf(1.0f, padEnv + (0.00002f * srScale)) : fmaxf(0.0f, padEnv - (0.000005f * srScale));
+                        inBuf[i] *= padEnv;
+                    }
+                }
+                
+                // LOOP 4: Master Delay Line & Tap Processing
+                for(int i = 0; i < framesRead; i++) {
+                    float procSample = inBuf[i];
                     
                     if (!frzActive) { 
                         freezeBuffer[freezeWriteIdxVar] = (int16_t)(fmaxf(-1.0f, fminf(procSample, 1.0f)) * 32767.0f);
@@ -1340,14 +1350,9 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     }
                     
                     if (localFrzRamp > 0.0f || frzActive) {
-                        if (frzActive) { 
-                            localFrzRamp = fminf(1.0f, localFrzRamp + (p_fz_att * srScale)); 
-                        } else { 
-                            localFrzRamp = fmaxf(0.0f, localFrzRamp - (p_fz_rel * srScale)); 
-                        }
+                        localFrzRamp = frzActive ? fminf(1.0f, localFrzRamp + (p_fz_att * srScale)) : fmaxf(0.0f, localFrzRamp - (p_fz_rel * srScale)); 
                     }
                     
-                    float fzOut = 0.0f;
                     if (localFrzRamp > 0.0f) { 
                         float phaseRead = (float)freezePlayCounterVar * activeInvFreqLength; 
                         float phase2 = (phaseRead + 0.5f); 
@@ -1382,7 +1387,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         apf2Idx++; 
                         if (apf2Idx >= 863) apf2Idx = 0;
                         
-                        fzOut = a2 * localFrzRamp; 
+                        fzOutBuf[i] = a2 * localFrzRamp; 
                         freezePlayCounterVar++; 
                         if (freezePlayCounterVar >= activeFreezeLength) freezePlayCounterVar = 0;
                     } else if (apfNeedsClear) {
@@ -1393,10 +1398,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         apfNeedsClear = false;
                     }
                     
-                    float delayIn = procSample; 
-                    if (localFrzRamp > 0.0f) {
-                        delayIn = (procSample * (1.0f - localFrzRamp)) + fzOut;
-                    }
+                    float delayIn = (localFrzRamp > 0.0f) ? (procSample * (1.0f - localFrzRamp)) + fzOutBuf[i] : procSample;
                     delayBuffer[writeIndex] = (int16_t)(fmaxf(-1.0f, fminf(delayIn, 1.0f)) * 32767.0f);
                     
                     float spd1 = currentPitch;
@@ -1431,17 +1433,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                    processTap(tap_w5_2, delayBuffer, writeIndex, windowMask, hannIntMult);
                             
                         if (feedbackActive) {
-                            if (inputEnvelope > 0.005f) { 
-                                localFbRamp = fminf(1.0f, localFbRamp + (0.000011f * srScale)); 
-                            } else { 
-                                localFbRamp = fmaxf(0.0f, localFbRamp - (0.005f * srScale)); 
-                            }
+                            localFbRamp = (envBuf[i] > 0.005f) ? fminf(1.0f, localFbRamp + (0.000011f * srScale)) : fmaxf(0.0f, localFbRamp - (0.005f * srScale));
                         } else { 
                             localFbRamp = fmaxf(0.0f, localFbRamp - (0.0001f * srScale)); 
                         }
                         
                         float mixV = fmaxf(0.0f, fminf((localFbRamp - 0.1f) * 2.0f, 1.0f));
-                        float feedInput = (frzActive && localFrzRamp > 0.0f) ? fzOut : (w4 * (1.0f - mixV)) + (w5 * mixV) + (fbOutNode * 0.95f);
+                        float feedInput = (frzActive && localFrzRamp > 0.0f) ? fzOutBuf[i] : (w4 * (1.0f - mixV)) + (w5 * mixV) + (fbOutNode * 0.95f);
                         
                         localFbHpf += fbHpfCoeff * (feedInput - localFbHpf) + DC_OFFSET; 
                         
@@ -1515,7 +1513,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         sMix += w2 * g_w2; 
                         sMix += w3 * g_w3;
                         sMix += padFilter * g_pad; 
-                        sMix += fzOut * g_frz; 
+                        sMix += fzOutBuf[i] * g_frz; 
                         sMix += fbOutNode * g_fb;
                         sMix = fmaxf(-1.8f, fminf(sMix, 1.8f));
                         sMix = sMix * (1.0f - (0.1f * sMix * sMix)) * 0.82f;
@@ -1525,7 +1523,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     float currentMasterScale = 2147483520.0f * localSwellGain * smoothedVolGain;
                     
                     float rawOut = sMix * localSwellGain * smoothedVolGain; 
-                    if (fabsf(inSample) > peakInputVal) peakInputVal = fabsf(inSample); 
+                    if (fabsf(inBuf[i]) > peakInputVal) peakInputVal = fabsf(inBuf[i]); 
                     if (fabsf(rawOut) > peakOutputVal) peakOutputVal = fabsf(rawOut); 
                     
                     int32_t finalOut = (int32_t)fmaxf(-2147483520.0f, fminf(sMix * currentMasterScale, 2147483520.0f));
@@ -1664,6 +1662,9 @@ void MidiTask(void * pvParameters) {
     #endif
     
     static unsigned long lastBatteryTime = 0;
+    
+    // FIX 5: Non-blocking ephemeral averaging for the battery monitor
+    static float smoothedRawBat = 0.0f;
     
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
     
@@ -1824,17 +1825,14 @@ void MidiTask(void * pvParameters) {
             }
         }
 
+        float rawBat = analogRead(BATTERY_PIN);
+        smoothedRawBat = (smoothedRawBat == 0.0f) ? rawBat : (smoothedRawBat * 0.95f) + (rawBat * 0.05f);
+
         if (millis() - lastBatteryTime > 1000) {
             lastBatteryTime = millis();
             
-            uint32_t rawSum = 0;
-            for (int i = 0; i < 32; i++) {
-                rawSum += analogRead(BATTERY_PIN);
-            }
-            
-            float rawAvg = (float)rawSum / 32.0f;
             const float CALIBRATION_MULTIPLIER = 1.04571f; 
-            float instantVoltage = (rawAvg / 4095.0f) * 3.3f * 2.0f * CALIBRATION_MULTIPLIER;
+            float instantVoltage = (smoothedRawBat / 4095.0f) * 3.3f * 2.0f * CALIBRATION_MULTIPLIER;
             
             if (instantVoltage > 2.0f) {
                 bool charging = (instantVoltage > 4.20f);
@@ -1935,7 +1933,6 @@ bool channelMessageCallback(ChannelMessage cm) {
         }
 
         if (cm.data1 == 5 && cm.data2 >= 64) {
-            // FIX 2: Inline Toggle and Hardware Calibration for CC 5
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isPB2WiperMode = !isPB2WiperMode; 
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
@@ -1987,7 +1984,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis(); 
         } else if (cm.data1 == 4 && cm.data2 >= 64) {
-            // FIX 1: Complete Two-Stage Panic Reset (Kills LEDs, zeroes bends, returns to UI 0)
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             globalAudioResetRequested = true; 
             
@@ -2005,14 +2001,9 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isSwellMode = false; 
                 isVibratoMode = false; 
                 
-                if (isVolumeMode) {
-                    isVolumeMode = false;
-                    pedals.lockPB3Whammy();
-                }
-                volumePedalGain = 1.0f; 
                 activeEffectMode = 0; 
             } else {
-                isWhammyActive = true; 
+                isWhammyActive = !isWhammyActive; 
             }
             
             currentPB1 = 8192;
@@ -2293,6 +2284,9 @@ void setup() {
     i2s_channel_init_std_mode(tx_chan, &stdConfig); 
     i2s_channel_init_std_mode(rx_chan, &stdConfig); 
     
+    i2s_event_callbacks_t cbs = { .on_recv = i2s_rx_callback, .on_recv_q_ovf = NULL, .on_sent = NULL, .on_send_q_ovf = NULL };
+    i2s_channel_register_event_callback(rx_chan, &cbs, NULL);
+
     i2s_channel_enable(tx_chan); 
     i2s_channel_enable(rx_chan);
     

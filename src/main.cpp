@@ -155,7 +155,7 @@ volatile float feedbackRamp = 0.0f;
 float fbHpfState = 0.0f; 
 float feedbackFilter = 0.0f;
 volatile int latencyMode = 0; 
-const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
+DRAM_ATTR const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 
 volatile bool globalAudioResetRequested = false; 
 volatile bool clearBuffersRequested = false; 
@@ -334,35 +334,15 @@ void toggleSampleRate() {
     i2s_channel_disable(rx_chan); 
     vTaskDelay(pdMS_TO_TICKS(50)); 
     
-    i2s_del_channel(tx_chan); 
-    i2s_del_channel(rx_chan);
-    
     if (currentSampleRate == 96000) {
         currentSampleRate = 48000;
     } else {
         currentSampleRate = 96000;
     }
     
-    i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
-    i2sConfig.dma_desc_num = 8; 
-    i2sConfig.dma_frame_num = HOP_SIZE; 
-    i2sConfig.auto_clear = true;
-    i2s_new_channel(&i2sConfig, &tx_chan, &rx_chan);
-    
-    i2s_std_config_t stdConfig = { 
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate), 
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
-        .gpio_cfg = { 
-            .mclk = GPIO_NUM_43, 
-            .bclk = GPIO_NUM_44, 
-            .ws = GPIO_NUM_18, 
-            .dout = GPIO_NUM_16, 
-            .din = GPIO_NUM_17 
-        } 
-    };
-    
-    i2s_channel_init_std_mode(tx_chan, &stdConfig); 
-    i2s_channel_init_std_mode(rx_chan, &stdConfig); 
+    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate);
+    ESP_ERROR_CHECK(i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg));
+    ESP_ERROR_CHECK(i2s_channel_reconfig_std_clock(rx_chan, &clk_cfg));
     
     freezeLength = currentSampleRate; 
     lutNeedsUpdate = true;
@@ -420,8 +400,6 @@ void goToLightSleep() {
     
     i2s_channel_disable(tx_chan); 
     i2s_channel_disable(rx_chan);
-    i2s_del_channel(tx_chan); 
-    i2s_del_channel(rx_chan);
     
     if (audioBufferMutex != NULL) {
         xSemaphoreGive(audioBufferMutex);
@@ -445,27 +423,6 @@ void goToLightSleep() {
     if (audioBufferMutex != NULL) {
         xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     }
-    
-    i2s_chan_config_t i2sConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
-    i2sConfig.dma_desc_num = 8; 
-    i2sConfig.dma_frame_num = HOP_SIZE; 
-    i2sConfig.auto_clear = true;
-    i2s_new_channel(&i2sConfig, &tx_chan, &rx_chan);
-    
-    i2s_std_config_t stdConfig = { 
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate), 
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
-        .gpio_cfg = { 
-            .mclk = GPIO_NUM_43, 
-            .bclk = GPIO_NUM_44, 
-            .ws = GPIO_NUM_18, 
-            .dout = GPIO_NUM_16, 
-            .din = GPIO_NUM_17 
-        } 
-    };
-    
-    i2s_channel_init_std_mode(tx_chan, &stdConfig); 
-    i2s_channel_init_std_mode(rx_chan, &stdConfig); 
     
     i2s_channel_enable(tx_chan); 
     i2s_channel_enable(rx_chan); 
@@ -931,8 +888,10 @@ void DisplayTask(void * pvParameters) {
                 updateMeters(); 
                 metersNeedClear = true; 
             } else if (metersNeedClear) { 
+                if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
                 ui_audio_level = 0.0f; 
                 ui_output_level = 0.0f; 
+                if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
                 updateMeters(); 
                 metersNeedClear = false; 
             }
@@ -1149,7 +1108,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float localFrzRamp = freezeRamp; 
                         float localFbRamp = feedbackRamp;
 
-                        float pdSmCoeff = powf(p_pd_sm, srScale);
+                        float pdSmCoeff = (currentSampleRate == 96000) ? sqrtf(p_pd_sm) : p_pd_sm;
                         
                         float target_delay = constrain((float)(currentSampleRate * p_fb_off), 0.0f, (float)(FB_BUFFER_SIZE - 1));
                         smoothed_delay_samples += (target_delay - smoothed_delay_samples) * 0.01f * srScale + DC_OFFSET;
@@ -2138,14 +2097,11 @@ void loop() {
     }
 
     if (clearBuffersRequested) {
-        if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, portMAX_DELAY) == pdTRUE) {
-            memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
-            memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); 
-            memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
-            
-            clearBuffersRequested = false; 
-            xSemaphoreGive(audioBufferMutex);
-        }
+        memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
+        memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); 
+        memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
+        
+        clearBuffersRequested = false; 
     }
     
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000) && (millis() - lastActivityTime > 2000)) { 

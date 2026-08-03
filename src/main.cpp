@@ -160,8 +160,6 @@ const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 volatile bool globalAudioResetRequested = false; 
 volatile bool clearBuffersRequested = false; 
 
-volatile bool isWritingFlash = false; 
-
 volatile int hardwareSyncMuteFrames = 0; 
 
 unsigned long lastActivityTime = 0; 
@@ -260,7 +258,6 @@ void saveSettings() {
         }
     }
     
-    // FIX 1: Compressed all 10 scattered UI boolean toggles into a single 16-bit word for safe NVS persistence
     uint16_t fxStates = 0;
     if (isWhammyActive)   fxStates |= (1 << 0);
     if (isFrozen)         fxStates |= (1 << 1);
@@ -1061,7 +1058,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     continue; 
                 }
 
-                bool blockIsMuted = clearBuffersRequested || isWritingFlash;
+                bool blockIsMuted = clearBuffersRequested;
                 
                 uint32_t start_cycles = xthal_get_ccount(); 
                 
@@ -1209,8 +1206,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float g_w2 = harmActive ? p_hr_mix : 0.0f;
                         float g_w3 = chorusActive ? p_ch_mix : 0.0f;
                         
-                        // FIX 3: Replaced raw polarity evaluation with fabsf() amplitude magnitude check.
-                        // This prevents the pad from violently stuttering as it crosses the AC zero-crossing.
                         bool padIsAudible = padActive || (fabsf(padFilter) > 0.001f);
                         float g_pad = padIsAudible ? p_pd_mix : 0.0f;
                         
@@ -1222,7 +1217,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float vol_alpha = 0.01f * srScale;
                         float meter_decay = (currentSampleRate == 96000) ? 0.999f : 0.998f;
                         
-                        // FIX 2: Exponential Moving Average envelope scaled dynamically across frequencies.
                         float envRetain = powf(0.99f, srScale);
                         float envAttack = 1.0f - envRetain;
 
@@ -1235,7 +1229,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                             input_dc_offset = (input_dc_offset * (1.0f - dc_alpha)) + (raw_in * dc_alpha);
                             float inSample = raw_in - input_dc_offset; 
                             
-                            // Dynamically tracks the actual AC voltage safely at 48kHz or 96kHz physical time
                             inputEnvelope = inputEnvelope * envRetain + fabsf(inSample) * envAttack + DC_OFFSET;
                             
                             if (swellActive) {
@@ -1339,7 +1332,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 apfNeedsClear = false;
                             }
                             
-                            float delayIn = (frzActive && localFrzRamp > 0.0f) ? fzOut : procSample; 
+                            // FIX 3: Linear crossfade eliminates the mechanical pop when Freeze is engaged
+                            float delayIn = procSample; 
+                            if (localFrzRamp > 0.0f) {
+                                delayIn = (procSample * (1.0f - localFrzRamp)) + fzOut;
+                            }
                             delayBuffer[writeIndex] = (int16_t)(fmaxf(-1.0f, fminf(delayIn, 1.0f)) * 32767.0f);
                             
                             float spd1 = currentPitch;
@@ -1871,7 +1868,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             
             if (sendCenterMidi) Control_Surface.sendPitchBend(Channel_3, 8192);
             forceUIUpdate = true; 
-            // FIX 1: Enforce background saving for Volume mode
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();
         } else if (cm.data1 == 0 && cm.data2 >= 64) { 
@@ -1922,7 +1918,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (sendCenterMidi) Control_Surface.sendPitchBend(Channel_3, 8192);
             lutNeedsUpdate = true; 
             forceUIUpdate = true;
-            // FIX 1: Enforce background saving for Master Bypass states
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();
         } else if (cm.data1 == 4 && cm.data2 >= 64) { 
@@ -2066,8 +2061,6 @@ void setup() {
         }
     }
     
-    // FIX 1: Retrieve compressed bitmask and permanently map it to UI states 
-    // to preserve all background effects across hardware reboots.
     uint16_t fxStates = preferences.getUShort("fxStates", 1); 
     isWhammyActive = (fxStates & (1 << 0)) != 0;
     isFrozen = (fxStates & (1 << 1)) != 0;
@@ -2222,14 +2215,20 @@ void loop() {
         }
     }
     
-    if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000) && (millis() - lastActivityTime > 2000)) { 
+    // FIX 1 & 2: Gently sleep the DSP task (flushing absolute zero to the DAC) 
+    // to protect the cache during NVS writes. Removed pedal-blocking timeout.
+    if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) { 
         
-        isWritingFlash = true;
-        vTaskDelay(pdMS_TO_TICKS(15)); 
+        sleepRequested = true;
+        int timeoutCounter = 0;
+        while (!isSleeping && timeoutCounter < 40) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            timeoutCounter++;
+        }
         
         saveSettings(); 
         
-        isWritingFlash = false;
+        sleepRequested = false;
         settingsNeedSaving = false; 
     }
     

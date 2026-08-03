@@ -220,9 +220,6 @@ void switchEffectMode(int newMode) {
     
     activeEffectMode = (newMode % 10 + 10) % 10;
     
-    // FIX 3: Removed destructive LFO phase resets. 
-    // Free-running LFOs physically prevent audible waveform tearing/clicks on preset changes.
-    
     isWhammyActive = true; 
     isFrozen = false; 
     isFeedbackActive = false; 
@@ -2248,6 +2245,7 @@ void loop() {
     }
     
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) { 
+        // FIX 1: Clear flag BEFORE saving to guarantee concurrent NVS memory preservation
         settingsNeedSaving = false; 
         
         sleepRequested = true;

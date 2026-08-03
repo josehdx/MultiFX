@@ -544,7 +544,8 @@ inline float IRAM_ATTR processTap(uint32_t tapPhase, const int16_t* buffer, int 
     float c2 = y0 - y1 + c1 - c3;
     
     float sample = ((c3 * frac + c2) * frac + c1) * frac + c0; 
-    int lutIdx = (T * hannIntMult) >> 16;
+    
+    int lutIdx = ((uint32_t)(T * hannIntMult) >> 16) & 1023;
     
     return sample * hannLUT[lutIdx];
 }
@@ -1055,7 +1056,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     continue; 
                 }
 
-                // FIX 3: Removed orphaned 'isWritingFlash' variable
                 bool blockIsMuted = clearBuffersRequested;
                 
                 uint32_t start_cycles = xthal_get_ccount(); 
@@ -1067,8 +1067,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     ui_audio_level = 0.0f; 
                     ui_output_level = 0.0f;
                 } else {
-                    // FIX 2: Zero-wait mutex polling. If locked, the DSP re-uses cached parameters 
-                    // to instantly process audio without missing the 1.33ms DMA deadline.
                     if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, 0) == pdTRUE) {
                         float targetWindow = LATENCY_WINDOWS[latencyMode];
                         if (currentWindowSize != targetWindow) { 
@@ -1220,6 +1218,11 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         float envRetain = powf(0.99f, srScale);
                         float envAttack = 1.0f - envRetain;
 
+                        if (isnan(synthFilter) || isinf(synthFilter)) synthFilter = 0.0f;
+                        if (isnan(padFilter) || isinf(padFilter)) padFilter = 0.0f;
+                        if (isnan(feedbackFilterVar) || isinf(feedbackFilterVar)) feedbackFilterVar = 0.0f;
+                        if (isnan(fbHpfState) || isinf(fbHpfState)) fbHpfState = 0.0f;
+
                         for (int i = 0; i < framesRead; i++) {
                             currentPitch += pitchInc;
                             
@@ -1294,18 +1297,19 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                                 if (phase2 >= 1.0f) phase2 -= 1.0f;
                                 
                                 int sum1 = freezeStartIdxVar + freezePlayCounterVar;
-                                int idx1 = sum1;
-                                if (idx1 >= freezeLength) idx1 -= freezeLength;
-                                
-                                int counter2 = freezePlayCounterVar + (activeFreezeLength / 2);
-                                if (counter2 >= activeFreezeLength) counter2 -= activeFreezeLength;
-                                
+                                int idx1 = (freezeLength > 0) ? (sum1 % freezeLength) : 0;
+
+                                int activeLen = (activeFreezeLength >= 64) ? activeFreezeLength : freezeLength;
+                                int counter2 = (activeLen > 0) ? ((freezePlayCounterVar + (activeLen / 2)) % activeLen) : 0;
+
                                 int sum2 = freezeStartIdxVar + counter2;
-                                int idx2 = sum2;
-                                if (idx2 >= freezeLength) idx2 -= freezeLength;
-                                
-                                float rFrz = ((float)freezeBuffer[idx1] * 3.0517578125e-5f * hannLUT[(int)(phaseRead * 1023.0f)]) + 
-                                             ((float)freezeBuffer[idx2] * 3.0517578125e-5f * hannLUT[(int)(phase2 * 1023.0f)]);
+                                int idx2 = (freezeLength > 0) ? (sum2 % freezeLength) : 0;
+
+                                int lutIdx1 = (int)(phaseRead * 1023.0f) & 1023;
+                                int lutIdx2 = (int)(phase2 * 1023.0f) & 1023;
+
+                                float rFrz = ((float)freezeBuffer[idx1] * 3.0517578125e-5f * hannLUT[lutIdx1]) + 
+                                             ((float)freezeBuffer[idx2] * 3.0517578125e-5f * hannLUT[lutIdx2]);
                                 
                                 float d1 = apf1Buffer[apf1Idx]; 
                                 float next_apf1 = rFrz + p_fz_apf * d1 + DC_OFFSET; 
@@ -1758,6 +1762,7 @@ void MidiTask(void * pvParameters) {
                 }
                 
                 if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+                // FIX 2: Default to 1.0f (Unity Gain) when hardware is disconnected, NOT 50% volume
                 if (isVolumeMode) volumePedalGain = 1.0f; 
                 if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
                 
@@ -1799,7 +1804,6 @@ void MidiTask(void * pvParameters) {
             }
         }
 
-        // FIX 1: The native loop() polling blocks are now correctly pinned exclusively to Core 0
         static unsigned long lastLutUpdate = 0;
         if (lutNeedsUpdate && (millis() - lastLutUpdate > 40)) { 
             lutNeedsUpdate = false; 
@@ -1829,6 +1833,7 @@ void MidiTask(void * pvParameters) {
         }
         
         if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) { 
+            // FIX 1: Clear flag BEFORE saving to guarantee concurrent NVS memory preservation
             settingsNeedSaving = false; 
             
             sleepRequested = true;
@@ -1933,6 +1938,7 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             globalAudioResetRequested = true; 
             
+            // FIX 2: State-saver preserves complex multi-effect presets during master bypass
             static uint16_t savedBypassState = 1; 
             
             bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVibratoMode || isVolumeMode;
@@ -2120,7 +2126,10 @@ void setup() {
     activeEffectMode = constrain(preferences.getInt("activeMode", 0), 0, 9); 
     latencyMode = constrain(preferences.getInt("latMode", 0), 0, 3);
     isPB2WiperMode = preferences.getBool("pb2Wiper", false); 
-    isVolumeMode = preferences.getBool("volMode", false); 
+    
+    // Ignore NVS configuration for PB3 and Master DSP to ensure "Always Hot" live boot
+    isVolumeMode = false; 
+    
     currentSampleRate = preferences.getUInt("sampleRate", 48000);
     feedbackIntervalIdx = constrain(preferences.getInt("fbIdx", 0), 0, 4); 
     
@@ -2136,7 +2145,10 @@ void setup() {
     }
     
     uint16_t fxStates = preferences.getUShort("fxStates", 1); 
-    isWhammyActive = (fxStates & (1 << 0)) != 0;
+    
+    // Ignore NVS bitmask for Whammy to ensure "Always Hot" live boot
+    isWhammyActive = true;
+    
     isFrozen = (fxStates & (1 << 1)) != 0;
     isFeedbackActive = (fxStates & (1 << 2)) != 0;
     isHarmonizerMode = (fxStates & (1 << 3)) != 0;
@@ -2261,6 +2273,5 @@ void setup() {
 }
 
 void loop() {
-    // FIX 1: Permanently kill the default Arduino loop task to guarantee 100% Core 1 isolation for DSP
     vTaskDelete(NULL);
 }

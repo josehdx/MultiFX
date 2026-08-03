@@ -554,6 +554,10 @@ inline float IRAM_ATTR processTap(uint32_t tapPhase, const int16_t* buffer, int 
 }
 
 void updateLUT() {
+    static volatile bool lutBusy = false;
+    if (lutBusy) return;
+    lutBusy = true;
+
     if (audioBufferMutex != NULL) {
         xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     }
@@ -604,6 +608,8 @@ void updateLUT() {
     if (audioBufferMutex != NULL) {
         xSemaphoreGive(audioBufferMutex);
     }
+    
+    lutBusy = false;
 }
 
 void updateMeters() {
@@ -1997,9 +2003,9 @@ bool channelMessageCallback(ChannelMessage cm) {
                     pedals.lockPB3Whammy();
                 }
                 volumePedalGain = 1.0f; 
-                activeEffectMode = 0;
+                activeEffectMode = 0; 
             } else {
-                isWhammyActive = true; 
+                isWhammyActive = !isWhammyActive; 
             }
             
             currentPB1 = 8192;
@@ -2018,73 +2024,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             lutNeedsUpdate = true; 
             forceUIUpdate = true;
             settingsNeedSaving = true;
-            lastParameterChangeTime = millis();
-        } else if (cm.data1 == 20 && cm.data2 >= 64) {
-            bool sendCenterMidi = false;
-            
-            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-            globalAudioResetRequested = true; 
-            
-            static uint16_t savedBypassState = 1; 
-            
-            bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVibratoMode || isVolumeMode;
-            if (anyEffectOn) {
-                savedBypassState = 0;
-                if (isWhammyActive)   savedBypassState |= (1 << 0);
-                if (isFrozen)         savedBypassState |= (1 << 1);
-                if (isFeedbackActive) savedBypassState |= (1 << 2);
-                if (isHarmonizerMode) savedBypassState |= (1 << 3);
-                if (isCapoMode)       savedBypassState |= (1 << 4);
-                if (isSynthMode)      savedBypassState |= (1 << 5);
-                if (isPadMode)        savedBypassState |= (1 << 6);
-                if (isChorusMode)     savedBypassState |= (1 << 7);
-                if (isSwellMode)      savedBypassState |= (1 << 8);
-                if (isVibratoMode)    savedBypassState |= (1 << 9);
-                if (isVolumeMode)     savedBypassState |= (1 << 10);
-
-                isWhammyActive = false; 
-                isFrozen = false; 
-                isFeedbackActive = false; 
-                isHarmonizerMode = false;
-                isCapoMode = false; 
-                isSynthMode = false; 
-                isPadMode = false; 
-                isChorusMode = false; 
-                isSwellMode = false; 
-                isVibratoMode = false; 
-                
-                if (isVolumeMode) {
-                    isVolumeMode = false;
-                    pedals.lockPB3Whammy();
-                    sendCenterMidi = true;
-                    currentPB3 = 8192;
-                }
-                volumePedalGain = 1.0f; 
-            } else { 
-                isWhammyActive   = (savedBypassState & (1 << 0)) != 0;
-                isFrozen         = (savedBypassState & (1 << 1)) != 0;
-                isFeedbackActive = (savedBypassState & (1 << 2)) != 0;
-                isHarmonizerMode = (savedBypassState & (1 << 3)) != 0;
-                isCapoMode       = (savedBypassState & (1 << 4)) != 0;
-                isSynthMode      = (savedBypassState & (1 << 5)) != 0;
-                isPadMode        = (savedBypassState & (1 << 6)) != 0;
-                isChorusMode     = (savedBypassState & (1 << 7)) != 0;
-                isSwellMode      = (savedBypassState & (1 << 8)) != 0;
-                isVibratoMode    = (savedBypassState & (1 << 9)) != 0;
-
-                if ((savedBypassState & (1 << 10)) != 0) {
-                    isVolumeMode = true;
-                    pedals.lockPB3Volume();
-                    volumePedalGain = (float)currentPB3 / 16383.0f;
-                }
-            }
-            
-            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
-            
-            if (sendCenterMidi) Control_Surface.sendPitchBend(Channel_3, 8192);
-            lutNeedsUpdate = true; 
-            forceUIUpdate = true;
-            settingsNeedSaving = true; 
             lastParameterChangeTime = millis();
         } else if (cm.data1 == 8 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);

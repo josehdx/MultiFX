@@ -1816,6 +1816,9 @@ bool channelMessageCallback(ChannelMessage cm) {
             currentCC11 = mappedCC; 
             currentPB3 = mappedCC; 
             
+            // FIX 3: Sync logical pointer to prevent pitch-snapping when parameters update
+            lastActivePedal = mappedCC;
+            
             if (isVolumeMode) { 
                 if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
                 volumePedalGain = (float)mappedCC / 16383.0f; 
@@ -1889,8 +1892,24 @@ bool channelMessageCallback(ChannelMessage cm) {
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             globalAudioResetRequested = true; 
             
+            // FIX 2: State-saver preserves complex multi-effect presets during master bypass
+            static uint16_t savedBypassState = 1; 
+            
             bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVibratoMode || isVolumeMode;
             if (anyEffectOn) {
+                savedBypassState = 0;
+                if (isWhammyActive)   savedBypassState |= (1 << 0);
+                if (isFrozen)         savedBypassState |= (1 << 1);
+                if (isFeedbackActive) savedBypassState |= (1 << 2);
+                if (isHarmonizerMode) savedBypassState |= (1 << 3);
+                if (isCapoMode)       savedBypassState |= (1 << 4);
+                if (isSynthMode)      savedBypassState |= (1 << 5);
+                if (isPadMode)        savedBypassState |= (1 << 6);
+                if (isChorusMode)     savedBypassState |= (1 << 7);
+                if (isSwellMode)      savedBypassState |= (1 << 8);
+                if (isVibratoMode)    savedBypassState |= (1 << 9);
+                if (isVolumeMode)     savedBypassState |= (1 << 10);
+
                 isWhammyActive = false; 
                 isFrozen = false; 
                 isFeedbackActive = false; 
@@ -1910,7 +1929,22 @@ bool channelMessageCallback(ChannelMessage cm) {
                 }
                 volumePedalGain = 1.0f; 
             } else { 
-                isWhammyActive = true; 
+                isWhammyActive   = (savedBypassState & (1 << 0)) != 0;
+                isFrozen         = (savedBypassState & (1 << 1)) != 0;
+                isFeedbackActive = (savedBypassState & (1 << 2)) != 0;
+                isHarmonizerMode = (savedBypassState & (1 << 3)) != 0;
+                isCapoMode       = (savedBypassState & (1 << 4)) != 0;
+                isSynthMode      = (savedBypassState & (1 << 5)) != 0;
+                isPadMode        = (savedBypassState & (1 << 6)) != 0;
+                isChorusMode     = (savedBypassState & (1 << 7)) != 0;
+                isSwellMode      = (savedBypassState & (1 << 8)) != 0;
+                isVibratoMode    = (savedBypassState & (1 << 9)) != 0;
+
+                if ((savedBypassState & (1 << 10)) != 0) {
+                    isVolumeMode = true;
+                    pedals.lockPB3Volume();
+                    volumePedalGain = (float)currentPB3 / 16383.0f;
+                }
             }
             
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
@@ -2215,9 +2249,9 @@ void loop() {
         }
     }
     
-    // FIX 1 & 2: Gently sleep the DSP task (flushing absolute zero to the DAC) 
-    // to protect the cache during NVS writes. Removed pedal-blocking timeout.
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) { 
+        // FIX 1: Clear flag BEFORE saving to guarantee concurrent NVS memory preservation
+        settingsNeedSaving = false; 
         
         sleepRequested = true;
         int timeoutCounter = 0;
@@ -2229,7 +2263,6 @@ void loop() {
         saveSettings(); 
         
         sleepRequested = false;
-        settingsNeedSaving = false; 
     }
     
     vTaskDelay(pdMS_TO_TICKS(10));

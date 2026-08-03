@@ -158,6 +158,7 @@ volatile int latencyMode = 0;
 const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 
 volatile bool globalAudioResetRequested = false; 
+volatile bool sampleRateToggleRequested = false; 
 
 volatile int hardwareSyncMuteFrames = 0; 
 
@@ -391,7 +392,7 @@ void toggleSampleRate() {
     i2s_channel_enable(rx_chan); 
     
     size_t dummyBytes; 
-    static int32_t dummyBuf[HOP_SIZE * 2];
+    int32_t dummyBuf[HOP_SIZE * 2];
     for (int k = 0; k < 10; k++) {
         i2s_channel_read(rx_chan, dummyBuf, sizeof(dummyBuf), &dummyBytes, pdMS_TO_TICKS(5));
     }
@@ -493,7 +494,7 @@ void goToLightSleep() {
     i2s_channel_enable(rx_chan); 
     
     size_t dummyBytes; 
-    static int32_t dummyBuf[HOP_SIZE * 2];
+    int32_t dummyBuf[HOP_SIZE * 2];
     for (int k = 0; k < 10; k++) {
         i2s_channel_read(rx_chan, dummyBuf, sizeof(dummyBuf), &dummyBytes, pdMS_TO_TICKS(5));
     }
@@ -1043,6 +1044,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     ui_audio_level = 0.0f; 
                     ui_output_level = 0.0f; 
                     
+                    uint32_t halfWinFixed = ((uint32_t)currentWindowSize / 2) << 16;
+                    tap_w1_1 = 0; tap_w1_2 = halfWinFixed;
+                    tap_w2_1 = 0; tap_w2_2 = halfWinFixed;
+                    tap_w3_1 = 0; tap_w3_2 = halfWinFixed;
+                    tap_w4_1 = 0; tap_w4_2 = halfWinFixed;
+                    tap_w5_1 = 0; tap_w5_2 = halfWinFixed;
+
                     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
                     memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); 
                     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
@@ -1072,7 +1080,7 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     i2s_channel_write(tx_chan, i2s_out_block, framesRead * 8, &bytesWrittenCount, pdMS_TO_TICKS(20));
                     continue; 
                 }
-                
+
                 uint32_t start_cycles = xthal_get_ccount(); 
                 
                 float srScale = 48000.0f / (float)currentSampleRate;
@@ -1294,7 +1302,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                         
                         if (isnan(procSample)) procSample = 0.0f;
                         
-                        int waveIdx = constrain((int)((procSample + 1.0f) * 1023.5f), 0, WAVE_LUT_SIZE - 1);
+                        float clampedProc = fmaxf(-1.0f, fminf(procSample, 1.0f));
+                        int waveIdx = (int)((clampedProc + 1.0f) * 1023.5f);
                         procSample = synthLUT[waveIdx]; 
                         
                         float fltCoeff = fmaxf(0.001f, fminf(0.99f, (p_sy_flt + 0.6f * synthEnv) * srScale));
@@ -1867,6 +1876,11 @@ void MidiTask(void * pvParameters) {
             sleepRequested = false;
         }
 
+        if (sampleRateToggleRequested) {
+            sampleRateToggleRequested = false;
+            toggleSampleRate();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
@@ -1908,7 +1922,13 @@ bool channelMessageCallback(ChannelMessage cm) {
         }
 
         if (cm.data1 == 5 && cm.data2 >= 64) {
+            // FIX 2: Synchronous toggle and calibration ensures UI and variables are immediately bound
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isPB2WiperMode = !isPB2WiperMode; 
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+            
+            calibratePBs();
+            
             forceUIUpdate = true; 
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();
@@ -1943,6 +1963,8 @@ bool channelMessageCallback(ChannelMessage cm) {
         } else if (cm.data1 == 1 && cm.data2 >= 64) { 
             switchEffectMode(activeEffectMode + 1); 
         } else if (cm.data1 == 2 && cm.data2 >= 64) { 
+            sampleRateToggleRequested = true;
+        } else if (cm.data1 == 3 && cm.data2 >= 64) {
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             latencyMode = (latencyMode + 1) % 4; 
             globalAudioResetRequested = true; 
@@ -1951,7 +1973,53 @@ bool channelMessageCallback(ChannelMessage cm) {
             forceUIUpdate = true; 
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis(); 
-        } else if (cm.data1 == 3 && cm.data2 >= 64) {
+        } else if (cm.data1 == 4 && cm.data2 >= 64) {
+            // FIX 1: Complete Two-Stage Panic Reset - strictly zero-out UI, audio loops, and MIDI pitch offsets
+            if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+            globalAudioResetRequested = true; 
+            
+            bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVibratoMode;
+            
+            if (anyEffectOn || activeEffectMode != 0) {
+                isWhammyActive = false; 
+                isFrozen = false; 
+                isFeedbackActive = false; 
+                isHarmonizerMode = false;
+                isCapoMode = false; 
+                isSynthMode = false; 
+                isPadMode = false; 
+                isChorusMode = false; 
+                isSwellMode = false; 
+                isVibratoMode = false; 
+                
+                if (isVolumeMode) {
+                    isVolumeMode = false;
+                    pedals.lockPB3Whammy();
+                }
+                volumePedalGain = 1.0f; 
+                activeEffectMode = 0;
+            } else {
+                isWhammyActive = true; 
+            }
+            
+            currentPB1 = 8192;
+            currentPB2 = 8192;
+            currentPB3 = 8192;
+            lastActivePedal = 8192;
+            
+            if (!lutNeedsUpdate && pitchShiftLUT != nullptr) pitchShiftFactor = pitchShiftLUT[8192];
+            
+            if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
+            
+            Control_Surface.sendPitchBend(Channel_1, 8192);
+            Control_Surface.sendPitchBend(Channel_2, 8192);
+            Control_Surface.sendPitchBend(Channel_3, 8192);
+            
+            lutNeedsUpdate = true; 
+            forceUIUpdate = true;
+            settingsNeedSaving = true;
+            lastParameterChangeTime = millis();
+        } else if (cm.data1 == 20 && cm.data2 >= 64) {
             bool sendCenterMidi = false;
             
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
@@ -2018,8 +2086,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             forceUIUpdate = true;
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();
-        } else if (cm.data1 == 4 && cm.data2 >= 64) { 
-            toggleSampleRate(); 
         } else if (cm.data1 == 8 && cm.data2 >= 64) { 
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isFrozen = !isFrozen; 
@@ -2143,9 +2209,8 @@ void setup() {
     preferences.begin("whammy_cfg", true); 
     activeEffectMode = constrain(preferences.getInt("activeMode", 0), 0, 9); 
     latencyMode = constrain(preferences.getInt("latMode", 0), 0, 3);
-    isPB2WiperMode = preferences.getBool("pb2Wiper", false); 
     
-    // Ignore NVS configuration for PB3 and Master DSP to ensure "Always Hot" live boot
+    isPB2WiperMode = preferences.getBool("pb2Wiper", false); 
     isVolumeMode = false; 
     
     currentSampleRate = preferences.getUInt("sampleRate", 48000);
@@ -2164,7 +2229,6 @@ void setup() {
     
     uint16_t fxStates = preferences.getUShort("fxStates", 1); 
     
-    // Ignore NVS bitmask for Whammy to ensure "Always Hot" live boot
     isWhammyActive = true;
     
     isFrozen = (fxStates & (1 << 1)) != 0;

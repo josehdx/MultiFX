@@ -158,7 +158,6 @@ volatile int latencyMode = 0;
 const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 
 volatile bool globalAudioResetRequested = false; 
-volatile bool clearBuffersRequested = false; 
 
 volatile int hardwareSyncMuteFrames = 0; 
 
@@ -456,6 +455,10 @@ void goToLightSleep() {
         filterPB.update(); 
         filterPB2.update(); 
         filterPB3.update();
+        
+        // FIX 2: Poll Control_Surface to ensure USB/BLE MIDI can wake the device from sleep
+        Control_Surface.loop();
+        if (millis() - lastActivityTime < 100) break; 
         
         if (abs((int)filterPB.getValue() - initA) > 150) break;
         if (abs((int)filterPB2.getValue() - initB) > 150) break;
@@ -985,6 +988,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     static int freezeStartIdxVar = 0; 
     static int activeFreezeLength = 48000;
     
+    static bool wasSleeping = false;
+    
     const float normFactor = 1.0f / 2147483648.0f; 
     const float DC_OFFSET = 1e-9f;
     
@@ -996,11 +1001,20 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 i2s_channel_write(tx_chan, i2s_out_block, sizeof(i2s_out_block), &dummyBytes, pdMS_TO_TICKS(20));
                 isSleeping = true; 
             }
+            wasSleeping = true;
             vTaskDelay(pdMS_TO_TICKS(10)); 
             continue; 
         }
         
         isSleeping = false; 
+        
+        if (wasSleeping) {
+            size_t dummyBytes; 
+            int32_t flushBuf[HOP_SIZE * 2];
+            while (i2s_channel_read(rx_chan, flushBuf, sizeof(flushBuf), &dummyBytes, 0) == ESP_OK && dummyBytes > 0) {}
+            wasSleeping = false;
+        }
+        
         size_t bytesRead; 
         
         i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, pdMS_TO_TICKS(20));
@@ -1030,7 +1044,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     ui_audio_level = 0.0f; 
                     ui_output_level = 0.0f; 
                     
-                    // FIX 1: Safely clear buffers directly from the DSP thread to prevent Core 0 memory tearing
                     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
                     memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); 
                     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
@@ -1241,7 +1254,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 if (isnan(feedbackFilterVar) || isinf(feedbackFilterVar)) feedbackFilterVar = 0.0f;
                 if (isnan(fbHpfState) || isinf(fbHpfState)) fbHpfState = 0.0f;
 
-                // FIX 2: Locally cache volatile phase accumulators to leverage high-speed CPU registers
                 float localVibPhase = vibratoLfoPhase;
                 float localChoPhase = chorusLfoPhase;
                 float localFbPhase = feedbackLfoPhase;

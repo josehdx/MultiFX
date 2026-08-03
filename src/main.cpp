@@ -1050,6 +1050,13 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     ui_audio_level = 0.0f; 
                     ui_output_level = 0.0f; 
                     
+                    // FIX 3: Reset internal oscillator phases and envelope ramps to prevent restart clicks
+                    freezeRamp = 0.0f;
+                    feedbackRamp = 0.0f;
+                    vibratoLfoPhase = 0.0f;
+                    chorusLfoPhase = 0.0f;
+                    feedbackLfoPhase = 0.0f;
+                    
                     uint32_t halfWinFixed = ((uint32_t)currentWindowSize / 2) << 16;
                     tap_w1_1 = 0; tap_w1_2 = halfWinFixed;
                     tap_w2_1 = 0; tap_w2_2 = halfWinFixed;
@@ -1928,7 +1935,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         }
 
         if (cm.data1 == 5 && cm.data2 >= 64) {
-            // FIX 2: Synchronous toggle and calibration ensures UI and variables are immediately bound
+            // FIX 2: Inline Toggle and Hardware Calibration for CC 5
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             isPB2WiperMode = !isPB2WiperMode; 
             if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
@@ -1980,7 +1987,7 @@ bool channelMessageCallback(ChannelMessage cm) {
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis(); 
         } else if (cm.data1 == 4 && cm.data2 >= 64) {
-            // FIX 1: Complete Two-Stage Panic Reset - strictly zero-out UI, audio loops, and MIDI pitch offsets
+            // FIX 1: Complete Two-Stage Panic Reset (Kills LEDs, zeroes bends, returns to UI 0)
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
             globalAudioResetRequested = true; 
             
@@ -2005,7 +2012,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 volumePedalGain = 1.0f; 
                 activeEffectMode = 0; 
             } else {
-                isWhammyActive = !isWhammyActive; 
+                isWhammyActive = true; 
             }
             
             currentPB1 = 8192;

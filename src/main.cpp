@@ -156,9 +156,11 @@ float feedbackFilter = 0.0f;
 volatile int latencyMode = 0; 
 const float LATENCY_WINDOWS[] = {512.0f, 1024.0f, 2048.0f, 4096.0f};
 
+// FIX 1: Single source of truth for global volatile execution flags
 volatile bool globalAudioResetRequested = false; 
 volatile bool sampleRateToggleRequested = false; 
 volatile bool pb2ToggleRequested = false; 
+volatile bool panicResetRequested = false; 
 
 volatile int hardwareSyncMuteFrames = 0; 
 
@@ -213,7 +215,6 @@ MIDI_PipeFactory<4> pipes;
 
 PedalManager pedals;
 
-// FIX 4: DMA Hardware Interrupt Callback Definition
 bool IRAM_ATTR i2s_rx_callback(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx) {
     BaseType_t high_task_wakeup = pdFALSE;
     if (audioTaskHandle != NULL) {
@@ -339,7 +340,6 @@ void calibratePBs() {
 
 void toggleSampleRate() {
     sleepRequested = true; 
-    globalAudioResetRequested = true; 
     int timeoutCounter = 0;
     
     while (!isSleeping && timeoutCounter < 40) { 
@@ -395,7 +395,6 @@ void toggleSampleRate() {
     i2s_channel_init_std_mode(tx_chan, &stdConfig); 
     i2s_channel_init_std_mode(rx_chan, &stdConfig); 
     
-    // FIX 4: Re-register the hardware interrupt callback upon hardware rebuild
     i2s_event_callbacks_t cbs = { .on_recv = i2s_rx_callback, .on_recv_q_ovf = NULL, .on_sent = NULL, .on_send_q_ovf = NULL };
     i2s_channel_register_event_callback(rx_chan, &cbs, NULL);
     
@@ -410,7 +409,8 @@ void toggleSampleRate() {
         i2s_channel_read(rx_chan, dummyBuf, sizeof(dummyBuf), &dummyBytes, pdMS_TO_TICKS(5));
     }
 
-    hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
+    // FIX 2: Let AudioDSPTask internally handle hardwareSyncMuteFrames when detecting the reset request
+    globalAudioResetRequested = true; 
 
     if (audioBufferMutex != NULL) {
         xSemaphoreGive(audioBufferMutex);
@@ -505,7 +505,7 @@ void goToLightSleep() {
     
     i2s_event_callbacks_t cbs = { .on_recv = i2s_rx_callback, .on_recv_q_ovf = NULL, .on_sent = NULL, .on_send_q_ovf = NULL };
     i2s_channel_register_event_callback(rx_chan, &cbs, NULL);
-    
+
     i2s_channel_enable(tx_chan); 
     i2s_channel_enable(rx_chan); 
     
@@ -515,7 +515,7 @@ void goToLightSleep() {
         i2s_channel_read(rx_chan, dummyBuf, sizeof(dummyBuf), &dummyBytes, pdMS_TO_TICKS(5));
     }
 
-    hardwareSyncMuteFrames = (currentSampleRate / HOP_SIZE) * 0.15f;
+    // FIX 2: Let AudioDSPTask internally handle hardwareSyncMuteFrames when detecting the reset request
     globalAudioResetRequested = true;
     
     if (audioBufferMutex != NULL) {
@@ -570,10 +570,7 @@ inline float IRAM_ATTR processTap(uint32_t tapPhase, const int16_t* buffer, int 
 }
 
 void updateLUT() {
-    static volatile bool lutBusy = false;
-    if (lutBusy) return;
-    lutBusy = true;
-
+    // FIX 3: Removed redundant lutBusy lock to free CPU cycles
     if (audioBufferMutex != NULL) {
         xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     }
@@ -624,8 +621,6 @@ void updateLUT() {
     if (audioBufferMutex != NULL) {
         xSemaphoreGive(audioBufferMutex);
     }
-    
-    lutBusy = false;
 }
 
 void updateMeters() {
@@ -1012,6 +1007,8 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
     
     static bool wasSleeping = false;
     
+    extern volatile bool panicResetRequested;
+    
     const float normFactor = 1.0f / 2147483648.0f; 
     const float DC_OFFSET = 1e-9f;
     
@@ -1037,7 +1034,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             wasSleeping = false;
         }
         
-        // FIX 4: DMA Hardware Interrupt Blocking (replaces i2s_channel_read software polling)
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
         
         size_t bytesRead; 
@@ -1048,6 +1044,40 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
             framesRead &= ~3; 
             
             if (framesRead > 0) {
+                if (panicResetRequested) {
+                    synthEnv = 0.0f; 
+                    synthFilter = 0.0f; 
+                    padFilter = 0.0f; 
+                    padEnv = 0.0f;
+                    inputEnvelope = 0.0f; 
+                    feedbackFilterVar = 0.0f; 
+                    currentPitch = 1.0f;
+                    freezeWriteIdxVar = 0; 
+                    freezePlayCounterVar = 0; 
+                    freezeStartIdxVar = 0; 
+                    activeFreezeLength = currentSampleRate;
+                    fbDelayWriteIdx = 0; 
+                    apfNeedsClear = true;
+                    
+                    freezeRamp = 0.0f;
+                    feedbackRamp = 0.0f;
+                    vibratoLfoPhase = 0.0f;
+                    chorusLfoPhase = 0.0f;
+                    feedbackLfoPhase = 0.0f;
+                    
+                    uint32_t halfWinFixed = ((uint32_t)currentWindowSize / 2) << 16;
+                    tap_w1_1 = 0; tap_w1_2 = halfWinFixed;
+                    tap_w2_1 = 0; tap_w2_2 = halfWinFixed;
+                    tap_w3_1 = 0; tap_w3_2 = halfWinFixed;
+                    tap_w4_1 = 0; tap_w4_2 = halfWinFixed;
+                    tap_w5_1 = 0; tap_w5_2 = halfWinFixed;
+
+                    memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); 
+                    memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
+                    
+                    panicResetRequested = false;
+                }
+
                 if (globalAudioResetRequested) {
                     synthEnv = 0.0f; 
                     synthFilter = 0.0f; 
@@ -1067,6 +1097,12 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     input_dc_offset = 0.0f; 
                     ui_audio_level = 0.0f; 
                     ui_output_level = 0.0f; 
+                    
+                    freezeRamp = 0.0f;
+                    feedbackRamp = 0.0f;
+                    vibratoLfoPhase = 0.0f;
+                    chorusLfoPhase = 0.0f;
+                    feedbackLfoPhase = 0.0f;
                     
                     uint32_t halfWinFixed = ((uint32_t)currentWindowSize / 2) << 16;
                     tap_w1_1 = 0; tap_w1_2 = halfWinFixed;
@@ -1290,12 +1326,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float localFbPhase = feedbackLfoPhase;
                 float localFbHpf = fbHpfState;
 
-                // FIX 3: Block-Based Vectorization Pipeline
                 float inBuf[HOP_SIZE];
                 float envBuf[HOP_SIZE];
                 float fzOutBuf[HOP_SIZE];
                 
-                // LOOP 1: Input Scaling & Envelope
                 for (int i = 0; i < framesRead; i++) {
                     currentPitch += pitchInc;
                     
@@ -1318,7 +1352,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     fzOutBuf[i] = 0.0f;
                 }
 
-                // LOOP 2: Synth 
                 if (synthActive) {
                     for(int i = 0; i < framesRead; i++) {
                         synthEnv = (envBuf[i] > 0.005f) ? fminf(1.0f, synthEnv + (p_sy_att * srScale)) : fmaxf(0.0f, synthEnv - (p_sy_rel * srScale));
@@ -1331,7 +1364,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     }
                 }
                 
-                // LOOP 3: Pad
                 if (padActive) {
                     for(int i = 0; i < framesRead; i++) {
                         padEnv = (envBuf[i] > 0.005f) ? fminf(1.0f, padEnv + (0.00002f * srScale)) : fmaxf(0.0f, padEnv - (0.000005f * srScale));
@@ -1339,7 +1371,6 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                     }
                 }
                 
-                // LOOP 4: Master Delay Line & Tap Processing
                 for(int i = 0; i < framesRead; i++) {
                     float procSample = inBuf[i];
                     
@@ -1662,8 +1693,6 @@ void MidiTask(void * pvParameters) {
     #endif
     
     static unsigned long lastBatteryTime = 0;
-    
-    // FIX 5: Non-blocking ephemeral averaging for the battery monitor
     static float smoothedRawBat = 0.0f;
     
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
@@ -1985,7 +2014,6 @@ bool channelMessageCallback(ChannelMessage cm) {
             lastParameterChangeTime = millis(); 
         } else if (cm.data1 == 4 && cm.data2 >= 64) {
             if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-            globalAudioResetRequested = true; 
             
             bool anyEffectOn = isWhammyActive || isFrozen || isFeedbackActive || isHarmonizerMode || isCapoMode || isSynthMode || isPadMode || isChorusMode || isSwellMode || isVibratoMode;
             
@@ -2002,9 +2030,16 @@ bool channelMessageCallback(ChannelMessage cm) {
                 isVibratoMode = false; 
                 
                 activeEffectMode = 0; 
+                panicResetRequested = true; 
             } else {
-                isWhammyActive = !isWhammyActive; 
+                isWhammyActive = true; 
             }
+            
+            if (isVolumeMode) {
+                isVolumeMode = false;
+                pedals.lockPB3Whammy();
+            }
+            volumePedalGain = 1.0f; 
             
             currentPB1 = 8192;
             currentPB2 = 8192;

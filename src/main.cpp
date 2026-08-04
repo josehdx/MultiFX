@@ -250,7 +250,6 @@ void fetchADCDMA() {
             break;
         } 
         else if (err == ESP_ERR_INVALID_STATE) {
-            // FIX 1: C++20 volatile explicit modification
             adc_overflow_count = adc_overflow_count + 1;
             Serial.printf("[ADC MONITOR] DMA Ringbuffer Overflow (Count: %lu)! Auto-Recovering...\n", adc_overflow_count);
             adc_continuous_stop(multifx_adc_handle);
@@ -1080,7 +1079,8 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
         ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(20));
         
         size_t bytesRead; 
-        i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, 0);
+        // 🚀 FIX 2: Block-enforced hardware transfer prevents partial-read channel swapping
+        i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, pdMS_TO_TICKS(10));
         
         if (bytesRead > 0) {
             int framesRead = bytesRead / 8; 
@@ -1385,7 +1385,8 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
                         localSwellGain = __builtin_fminf(1.0f, localSwellGain + (0.005f * srScale)); 
                     }
                     
-                    smoothedVolGain = smoothedVolGain * (1.0f - vol_alpha) + localVolGain * vol_alpha;
+                    // 🚀 FIX 3: DC Offset added to prevent FPU Subnormal Traps
+                    smoothedVolGain = smoothedVolGain * (1.0f - vol_alpha) + localVolGain * vol_alpha + DC_OFFSET;
                     masterGainBuf[i] = 2147483520.0f * localSwellGain * smoothedVolGain;
                     
                     inBuf[i] = inSample;
@@ -1939,19 +1940,22 @@ void MidiTask(void * pvParameters) {
             lastLutUpdate = millis();
         }
 
+        // 🚀 FIX 1: Only execute NVS save during true musical silence
         if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) { 
-            settingsNeedSaving = false; 
-            
-            sleepRequested = true;
-            int timeoutCounter = 0;
-            while (!isSleeping && timeoutCounter < 40) {
-                vTaskDelay(pdMS_TO_TICKS(5));
-                timeoutCounter++;
+            if (ui_audio_level < 0.01f) { 
+                settingsNeedSaving = false; 
+                
+                sleepRequested = true;
+                int timeoutCounter = 0;
+                while (!isSleeping && timeoutCounter < 40) {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    timeoutCounter++;
+                }
+                
+                saveSettings(); 
+                
+                sleepRequested = false;
             }
-            
-            saveSettings(); 
-            
-            sleepRequested = false;
         }
 
         if (sampleRateToggleRequested) {
@@ -2232,7 +2236,6 @@ void setup() {
     dig_cfg.conv_mode = ADC_CONV_SINGLE_UNIT_1;
     dig_cfg.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
 
-    // 🚀 FIX 2: Updated deprecated ADC_ATTEN_DB_11 macros to ADC_ATTEN_DB_12
     adc_digi_pattern_config_t adc_pattern[4] = {
         { .atten = ADC_ATTEN_DB_12, .channel = ADC_CHANNEL_0, .unit = ADC_UNIT_1, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH }, 
         { .atten = ADC_ATTEN_DB_12, .channel = ADC_CHANNEL_1, .unit = ADC_UNIT_1, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH }, 

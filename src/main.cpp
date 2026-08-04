@@ -479,7 +479,6 @@ void goToLightSleep() {
     int initB = latestPB2; 
     int initC = latestPB3;
     
-    // FIX 1: Unlocked Mutex during polling loop to prevent MIDI task deadlocks
     while (digitalRead(BOOT_SENSE_PIN) == HIGH) {
         vTaskDelay(pdMS_TO_TICKS(50));
         fetchADCDMA();
@@ -555,7 +554,8 @@ void goToLightSleep() {
     lastScreenActivityTime = millis(); 
 }
 
-inline float IRAM_ATTR processTap(uint32_t tapPhase, const int16_t* buffer, int currentWriteIdx, uint32_t windowMask, uint32_t hannIntMult) {
+// 🚀 FIX 3: Tightly coupled I-Cache Way-Locking attributes
+inline float IRAM_ATTR __attribute__((hot)) processTap(uint32_t tapPhase, const int16_t* buffer, int currentWriteIdx, uint32_t windowMask, uint32_t hannIntMult) {
     int T = (tapPhase >> 16) & windowMask; 
     float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
     int effTap = T + 2; 
@@ -613,7 +613,6 @@ void updateLUT() {
         }
     }
     
-    // FIX 2: Atomic pointer swapping secured within mutex region
     if (audioBufferMutex != NULL) {
         xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     }
@@ -995,7 +994,8 @@ void DisplayTask(void * pvParameters) {
     }
 }
 
-void IRAM_ATTR AudioDSPTask(void * pvParameters) {
+// 🚀 FIX 3: Tightly coupled I-Cache Way-Locking attributes
+void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
     static int32_t i2s_in_block[HOP_SIZE * 2] __attribute__((aligned(16)));
     static int32_t i2s_out_block[HOP_SIZE * 2] __attribute__((aligned(16)));
     
@@ -1350,6 +1350,10 @@ void IRAM_ATTR AudioDSPTask(void * pvParameters) {
                 float dryBuf[HOP_SIZE] __attribute__((aligned(16)));
                 float fbOutBuf[HOP_SIZE] __attribute__((aligned(16)));
                 float sMixBuf[HOP_SIZE] __attribute__((aligned(16)));
+                
+                // 🚀 FIX 2: Xtensa LX7 Hardware Data Prefetching (PSRAM -> L1 Cache)
+                __builtin_prefetch(&delayBuffer[(writeIndex + 128) & BUFFER_MASK], 1, 3); 
+                __builtin_prefetch(&fbDelayBuffer[(fbDelayWriteIdx + 128) & FB_BUFFER_MASK], 1, 3); 
                 
                 for (int i = 0; i < framesRead; i++) {
                     currentPitch += pitchInc;

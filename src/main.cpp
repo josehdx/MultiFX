@@ -16,7 +16,7 @@
 #include <math.h>
 #include <Preferences.h>
 
-#include "PedalManager.h" // 馃敀 Locked hardware class
+#include "PedalManager.h" // Locked hardware class
 
 // --- HARDWARE CONFIGURATION TOGGLES ---
 #define ENABLE_PAR_KNOBS false  
@@ -168,11 +168,10 @@ volatile int hardwareSyncMuteFrames = 0;
 unsigned long lastActivityTime = 0; 
 unsigned long lastScreenActivityTime = 0;
 
-// --- DYNAMIC OVERLAY TIMERS ---
+// --- DYNAMIC ERROR OVERLAY TIMERS ---
 volatile unsigned long lastAdcErrorTime = 0;
-volatile unsigned long lastAdcDataTime = 0;
 volatile esp_err_t lastAdcErrCode = 0;
-// ------------------------------
+// ------------------------------------
 
 const unsigned long LIGHT_SLEEP_TIMEOUT = 25000; 
 const unsigned long SCREEN_OFF_TIMEOUT = 15000;  
@@ -255,7 +254,7 @@ void fetchADCDMA() {
         else if (err == ESP_ERR_TIMEOUT) {
             break;
         } 
-        else { 
+        else { // Catch ALL faults (including ESP_ERR_INVALID_STATE)
             adc_overflow_count = adc_overflow_count + 1;
             lastAdcErrCode = err;
             lastAdcErrorTime = millis();
@@ -963,51 +962,33 @@ void updateDisplay() {
     const char* latencyLabelStrings[] = {"U.Low", "Low", "Mid", "High"}; 
     spr.drawString(latencyLabelStrings[latencyMode], 275, statsRowY);
 
-    // --- NEW DYNAMIC ADC/PB OVERLAY ---
+    // --- STRICT ESP-IDF ERROR OVERLAY (15 SECONDS) ---
     unsigned long now = millis();
-    bool showError = (now - lastAdcErrorTime < 3000) && (lastAdcErrorTime > 0);
-    bool showData = (now - lastAdcDataTime < 1000) && (lastAdcDataTime > 0);
+    bool showError = (now - lastAdcErrorTime < 15000) && (lastAdcErrorTime > 0);
 
-    if (showError || showData) {
+    if (showError) {
         // Draw a large centered background panel
         spr.fillRect(40, 60, 240, 110, TFT_BLACK);
-        spr.drawRect(40, 60, 240, 110, showError ? TFT_RED : TFT_CYAN);
+        spr.drawRect(40, 60, 240, 110, TFT_RED);
         
         spr.setTextDatum(MC_DATUM);
         
-        if (showError) {
-            // Persists for 3 seconds
-            spr.setTextSize(3);
-            spr.setTextColor(TFT_RED, TFT_BLACK);
-            spr.drawString("ADC ERROR!", 160, 85);
-            
-            char errCnt[16];
-            snprintf(errCnt, sizeof(errCnt), "Count: %lu", adc_overflow_count);
-            spr.setTextSize(2);
-            spr.setTextColor(TFT_WHITE, TFT_BLACK);
-            spr.drawString(errCnt, 160, 115);
+        spr.setTextSize(3);
+        spr.setTextColor(TFT_RED, TFT_BLACK);
+        spr.drawString("ADC ERROR!", 160, 85);
+        
+        char errCnt[16];
+        snprintf(errCnt, sizeof(errCnt), "Count: %lu", adc_overflow_count);
+        spr.setTextSize(2);
+        spr.setTextColor(TFT_WHITE, TFT_BLACK);
+        spr.drawString(errCnt, 160, 115);
 
-            char hexStr[16];
-            snprintf(hexStr, sizeof(hexStr), "Code: 0x%X", lastAdcErrCode);
-            spr.setTextColor(TFT_YELLOW, TFT_BLACK);
-            spr.drawString(hexStr, 160, 140);
-        } else {
-            // Persists for 1 second
-            spr.setTextSize(3);
-            spr.setTextColor(TFT_CYAN, TFT_BLACK);
-            spr.drawString("PB DATA", 160, 85);
-            
-            char valStr[32];
-            snprintf(valStr, sizeof(valStr), "1:%d 2:%d", currentPB1, currentPB2);
-            spr.setTextSize(2);
-            spr.setTextColor(TFT_WHITE, TFT_BLACK);
-            spr.drawString(valStr, 160, 120);
-            
-            snprintf(valStr, sizeof(valStr), "3:%d", currentPB3);
-            spr.drawString(valStr, 160, 145);
-        }
+        char hexStr[16];
+        snprintf(hexStr, sizeof(hexStr), "Code: 0x%X", lastAdcErrCode);
+        spr.setTextColor(TFT_YELLOW, TFT_BLACK);
+        spr.drawString(hexStr, 160, 140);
     }
-    // ----------------------------------
+    // -------------------------------------------------
 
     if (audioBufferMutex != NULL) {
         xSemaphoreGive(audioBufferMutex);
@@ -1019,7 +1000,7 @@ void updateDisplay() {
 
 void DisplayTask(void * pvParameters) {
     bool metersNeedClear = false;
-    bool overlayWasActive = false; // Tracks overlay state for auto-hide
+    bool overlayWasActive = false; // Tracks error overlay state for 15s auto-hide
 
     for (;;) {
         if (wakeupPending) { 
@@ -1039,17 +1020,16 @@ void DisplayTask(void * pvParameters) {
             forceUIUpdate = true; 
         }
 
-        // --- NEW AUTO-HIDE TIMEOUT CHECK ---
+        // --- 15-SECOND AUTO-HIDE TIMEOUT CHECK ---
         unsigned long now = millis();
-        bool overlayIsActive = ((now - lastAdcErrorTime < 3000) && lastAdcErrorTime > 0) || 
-                               ((now - lastAdcDataTime < 1000) && lastAdcDataTime > 0);
+        bool overlayIsActive = (now - lastAdcErrorTime < 15000) && (lastAdcErrorTime > 0);
         
-        // If the overlay state changed (e.g., timer expired), force a redraw to hide it
+        // If the error overlay state changed (e.g., 15s timer expired), force a redraw to hide it
         if (overlayIsActive != overlayWasActive) {
             forceUIUpdate = true;
             overlayWasActive = overlayIsActive;
         }
-        // -----------------------------------
+        // ------------------------------------------
         
         if (forceUIUpdate) { 
             forceUIUpdate = false; 
@@ -1142,7 +1122,6 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
             wasSleeping = false;
         }
         
-        // FIX: Clear stale task notifications
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
         
         size_t bytesRead; 
@@ -1809,6 +1788,10 @@ void MidiTask(void * pvParameters) {
     static float smoothedRawBat = 0.0f;
     
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
+
+    // Initialize timers on task start to ensure clean timeout calculations
+    lastActivityTime = millis();
+    lastScreenActivityTime = millis();
     
     for (;;) {
         Control_Surface.loop(); 
@@ -1822,11 +1805,6 @@ void MidiTask(void * pvParameters) {
             
             lastActivityTime = millis(); 
             lastScreenActivityTime = millis(); 
-        }
-
-        if (ui_audio_level > 0.05f) {
-            lastActivityTime = millis();
-            lastScreenActivityTime = millis();
         }
 
         if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) {
@@ -1901,7 +1879,6 @@ void MidiTask(void * pvParameters) {
                 if (isScreenOff) turnScreenOn();
                 lastScreenActivityTime = millis();
                 lastActivityTime = millis();
-                lastAdcDataTime = millis(); // Force overlay trigger for ADC data
                 
                 if (moveA) { 
                     Control_Surface.sendPitchBend(Channel_1, calA); 
@@ -2006,7 +1983,7 @@ void MidiTask(void * pvParameters) {
             lastLutUpdate = millis();
         }
 
-        // 馃殌 FIX 1: Only execute NVS save during true musical silence
+        // Only execute NVS save during true musical silence
         if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) { 
             if (ui_audio_level < 0.01f) { 
                 settingsNeedSaving = false; 

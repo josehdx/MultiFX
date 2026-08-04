@@ -479,6 +479,7 @@ void goToLightSleep() {
     int initB = latestPB2; 
     int initC = latestPB3;
     
+    // FIX: Lock-Free UI loop allows MIDI interrupt wakeups to function during sleep wait
     while (digitalRead(BOOT_SENSE_PIN) == HIGH) {
         vTaskDelay(pdMS_TO_TICKS(50));
         fetchADCDMA();
@@ -554,7 +555,6 @@ void goToLightSleep() {
     lastScreenActivityTime = millis(); 
 }
 
-// 🚀 FIX 3: Tightly coupled I-Cache Way-Locking attributes
 inline float IRAM_ATTR __attribute__((hot)) processTap(uint32_t tapPhase, const int16_t* buffer, int currentWriteIdx, uint32_t windowMask, uint32_t hannIntMult) {
     int T = (tapPhase >> 16) & windowMask; 
     float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
@@ -583,10 +583,6 @@ inline float IRAM_ATTR __attribute__((hot)) processTap(uint32_t tapPhase, const 
 }
 
 void updateLUT() {
-    if (audioBufferMutex != NULL) {
-        xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-    }
-    
     float basePitch = 0.0f; 
     if (isCapoMode || (activeEffectMode == 4 && isWhammyActive)) {
         basePitch += effectMemory[4]; 
@@ -598,10 +594,6 @@ void updateLUT() {
     float chorusRatioMem = effectMemory[7];
     float vibHzMem = effectMemory[9];
     int fbIntervalIdxLocal = feedbackIntervalIdx;
-    
-    if (audioBufferMutex != NULL) {
-        xSemaphoreGive(audioBufferMutex);
-    }
 
     for (int i = 0; i < 16384; i++) {
         float normalizedThrow = (i >= 8192) ? ((float)(i - 8192) / 8191.0f) : ((float)(i - 8192) / 8192.0f);
@@ -613,6 +605,7 @@ void updateLUT() {
         }
     }
     
+    // FIX: Atomic pointer swapping secured within mutex region
     if (audioBufferMutex != NULL) {
         xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     }
@@ -994,7 +987,6 @@ void DisplayTask(void * pvParameters) {
     }
 }
 
-// 🚀 FIX 3: Tightly coupled I-Cache Way-Locking attributes
 void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
     static int32_t i2s_in_block[HOP_SIZE * 2] __attribute__((aligned(16)));
     static int32_t i2s_out_block[HOP_SIZE * 2] __attribute__((aligned(16)));
@@ -1031,6 +1023,19 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
     
     const float normFactor = 1.0f / 2147483648.0f; 
     const float DC_OFFSET = 1e-9f;
+
+    // FIX 1: SIMD Vectors mapped to strictly parent-scoped aligned stack arrays
+    float inBuf[HOP_SIZE] __attribute__((aligned(16)));
+    float envBuf[HOP_SIZE] __attribute__((aligned(16)));
+    float fzOutBuf[HOP_SIZE] __attribute__((aligned(16)));
+    float masterGainBuf[HOP_SIZE] __attribute__((aligned(16)));
+    float w1Buf[HOP_SIZE] __attribute__((aligned(16)));
+    float w2Buf[HOP_SIZE] __attribute__((aligned(16)));
+    float w3Buf[HOP_SIZE] __attribute__((aligned(16)));
+    float padFilterBuf[HOP_SIZE] __attribute__((aligned(16)));
+    float dryBuf[HOP_SIZE] __attribute__((aligned(16)));
+    float fbOutBuf[HOP_SIZE] __attribute__((aligned(16)));
+    float sMixBuf[HOP_SIZE] __attribute__((aligned(16)));
     
     for (;;) {
         if (sleepRequested) { 
@@ -1338,20 +1343,7 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
                 float localChoPhase = chorusLfoPhase;
                 float localFbPhase = feedbackLfoPhase;
                 float localFbHpf = fbHpfState;
-
-                float inBuf[HOP_SIZE] __attribute__((aligned(16)));
-                float envBuf[HOP_SIZE] __attribute__((aligned(16)));
-                float fzOutBuf[HOP_SIZE] __attribute__((aligned(16)));
-                float masterGainBuf[HOP_SIZE] __attribute__((aligned(16)));
-                float w1Buf[HOP_SIZE] __attribute__((aligned(16)));
-                float w2Buf[HOP_SIZE] __attribute__((aligned(16)));
-                float w3Buf[HOP_SIZE] __attribute__((aligned(16)));
-                float padFilterBuf[HOP_SIZE] __attribute__((aligned(16)));
-                float dryBuf[HOP_SIZE] __attribute__((aligned(16)));
-                float fbOutBuf[HOP_SIZE] __attribute__((aligned(16)));
-                float sMixBuf[HOP_SIZE] __attribute__((aligned(16)));
                 
-                // 🚀 FIX 2: Xtensa LX7 Hardware Data Prefetching (PSRAM -> L1 Cache)
                 __builtin_prefetch(&delayBuffer[(writeIndex + 128) & BUFFER_MASK], 1, 3); 
                 __builtin_prefetch(&fbDelayBuffer[(fbDelayWriteIdx + 128) & FB_BUFFER_MASK], 1, 3); 
                 

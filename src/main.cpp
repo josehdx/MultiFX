@@ -168,6 +168,12 @@ volatile int hardwareSyncMuteFrames = 0;
 unsigned long lastActivityTime = 0; 
 unsigned long lastScreenActivityTime = 0;
 
+// --- DYNAMIC OVERLAY TIMERS ---
+volatile unsigned long lastAdcErrorTime = 0;
+volatile unsigned long lastAdcDataTime = 0;
+volatile esp_err_t lastAdcErrCode = 0;
+// ------------------------------
+
 const unsigned long LIGHT_SLEEP_TIMEOUT = 25000; 
 const unsigned long SCREEN_OFF_TIMEOUT = 15000;  
 
@@ -249,16 +255,16 @@ void fetchADCDMA() {
         else if (err == ESP_ERR_TIMEOUT) {
             break;
         } 
-        else if (err == ESP_ERR_INVALID_STATE) {
+        else { 
             adc_overflow_count = adc_overflow_count + 1;
-            Serial.printf("[ADC MONITOR] DMA Ringbuffer Overflow (Count: %lu)! Auto-Recovering...\n", adc_overflow_count);
+            lastAdcErrCode = err;
+            lastAdcErrorTime = millis();
+            forceUIUpdate = true;
+            Serial.printf("[ADC MONITOR] DMA Error (Count: %lu, Code: 0x%X)! Auto-Recovering...\n", adc_overflow_count, err);
             adc_continuous_stop(multifx_adc_handle);
             adc_continuous_start(multifx_adc_handle);
             break;
         } 
-        else {
-            break; 
-        }
     }
 }
 
@@ -957,6 +963,52 @@ void updateDisplay() {
     const char* latencyLabelStrings[] = {"U.Low", "Low", "Mid", "High"}; 
     spr.drawString(latencyLabelStrings[latencyMode], 275, statsRowY);
 
+    // --- NEW DYNAMIC ADC/PB OVERLAY ---
+    unsigned long now = millis();
+    bool showError = (now - lastAdcErrorTime < 3000) && (lastAdcErrorTime > 0);
+    bool showData = (now - lastAdcDataTime < 1000) && (lastAdcDataTime > 0);
+
+    if (showError || showData) {
+        // Draw a large centered background panel
+        spr.fillRect(40, 60, 240, 110, TFT_BLACK);
+        spr.drawRect(40, 60, 240, 110, showError ? TFT_RED : TFT_CYAN);
+        
+        spr.setTextDatum(MC_DATUM);
+        
+        if (showError) {
+            // Persists for 3 seconds
+            spr.setTextSize(3);
+            spr.setTextColor(TFT_RED, TFT_BLACK);
+            spr.drawString("ADC ERROR!", 160, 85);
+            
+            char errCnt[16];
+            snprintf(errCnt, sizeof(errCnt), "Count: %lu", adc_overflow_count);
+            spr.setTextSize(2);
+            spr.setTextColor(TFT_WHITE, TFT_BLACK);
+            spr.drawString(errCnt, 160, 115);
+
+            char hexStr[16];
+            snprintf(hexStr, sizeof(hexStr), "Code: 0x%X", lastAdcErrCode);
+            spr.setTextColor(TFT_YELLOW, TFT_BLACK);
+            spr.drawString(hexStr, 160, 140);
+        } else {
+            // Persists for 1 second
+            spr.setTextSize(3);
+            spr.setTextColor(TFT_CYAN, TFT_BLACK);
+            spr.drawString("PB DATA", 160, 85);
+            
+            char valStr[32];
+            snprintf(valStr, sizeof(valStr), "1:%d 2:%d", currentPB1, currentPB2);
+            spr.setTextSize(2);
+            spr.setTextColor(TFT_WHITE, TFT_BLACK);
+            spr.drawString(valStr, 160, 120);
+            
+            snprintf(valStr, sizeof(valStr), "3:%d", currentPB3);
+            spr.drawString(valStr, 160, 145);
+        }
+    }
+    // ----------------------------------
+
     if (audioBufferMutex != NULL) {
         xSemaphoreGive(audioBufferMutex);
     }
@@ -967,6 +1019,8 @@ void updateDisplay() {
 
 void DisplayTask(void * pvParameters) {
     bool metersNeedClear = false;
+    bool overlayWasActive = false; // Tracks overlay state for auto-hide
+
     for (;;) {
         if (wakeupPending) { 
             pinMode(15, OUTPUT); 
@@ -984,6 +1038,18 @@ void DisplayTask(void * pvParameters) {
             wakeupPending = false; 
             forceUIUpdate = true; 
         }
+
+        // --- NEW AUTO-HIDE TIMEOUT CHECK ---
+        unsigned long now = millis();
+        bool overlayIsActive = ((now - lastAdcErrorTime < 3000) && lastAdcErrorTime > 0) || 
+                               ((now - lastAdcDataTime < 1000) && lastAdcDataTime > 0);
+        
+        // If the overlay state changed (e.g., timer expired), force a redraw to hide it
+        if (overlayIsActive != overlayWasActive) {
+            forceUIUpdate = true;
+            overlayWasActive = overlayIsActive;
+        }
+        // -----------------------------------
         
         if (forceUIUpdate) { 
             forceUIUpdate = false; 
@@ -1076,10 +1142,10 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
             wasSleeping = false;
         }
         
+        // FIX: Clear stale task notifications
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
         
         size_t bytesRead; 
-        // 馃殌 FIX 2: Block-enforced hardware transfer prevents partial-read channel swapping
         i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, pdMS_TO_TICKS(10));
         
         if (bytesRead > 0) {
@@ -1385,7 +1451,6 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
                         localSwellGain = __builtin_fminf(1.0f, localSwellGain + (0.005f * srScale)); 
                     }
                     
-                    // 馃殌 FIX 3: DC Offset added to prevent FPU Subnormal Traps
                     smoothedVolGain = smoothedVolGain * (1.0f - vol_alpha) + localVolGain * vol_alpha + DC_OFFSET;
                     masterGainBuf[i] = 2147483520.0f * localSwellGain * smoothedVolGain;
                     
@@ -1836,6 +1901,7 @@ void MidiTask(void * pvParameters) {
                 if (isScreenOff) turnScreenOn();
                 lastScreenActivityTime = millis();
                 lastActivityTime = millis();
+                lastAdcDataTime = millis(); // Force overlay trigger for ADC data
                 
                 if (moveA) { 
                     Control_Surface.sendPitchBend(Channel_1, calA); 
@@ -1973,7 +2039,8 @@ void MidiTask(void * pvParameters) {
             lastParameterChangeTime = millis();
         }
 
-        vTaskDelay(pdMS_TO_TICKS(5));
+        // BLE Safe TX Rate (~66Hz)
+        vTaskDelay(pdMS_TO_TICKS(15));
     }
 }
 
@@ -2249,7 +2316,10 @@ void setup() {
     ESP_ERROR_CHECK(adc_continuous_start(multifx_adc_handle));
 
     preferences.begin("whammy_cfg", true); 
-    activeEffectMode = constrain(preferences.getInt("activeMode", 0), 0, 9); 
+    
+    activeEffectMode = 0; // Force Whammy effect (Mode 0) to display on boot
+    int dummyModeLoad = preferences.getInt("activeMode", 0); // Clear pointer buffer
+    
     latencyMode = constrain(preferences.getInt("latMode", 0), 0, 3);
     
     isPB2WiperMode = preferences.getBool("pb2Wiper", false); 

@@ -177,7 +177,6 @@ volatile float core1_load = 0.0f;
 volatile bool sleepRequested = false; 
 volatile bool isSleeping = false;
 
-// FIX 1: Safely rename custom handle to prevent Arduino core namespace pollution
 adc_continuous_handle_t multifx_adc_handle = NULL;
 volatile int latestPB1 = 2048;
 volatile int latestPB2 = 2048;
@@ -232,7 +231,6 @@ void fetchADCDMA() {
     uint8_t result[256];
     uint32_t ret_num = 0;
     
-    // FIX 2: Continuously flush the DMA read queue to guarantee zero-latency pedal response
     while (adc_continuous_read(multifx_adc_handle, result, sizeof(result), &ret_num, 0) == ESP_OK && ret_num > 0) {
         for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
             adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result[i];
@@ -481,6 +479,7 @@ void goToLightSleep() {
     int initB = latestPB2; 
     int initC = latestPB3;
     
+    // FIX 1: Unlocked Mutex during polling loop to prevent MIDI task deadlocks
     while (digitalRead(BOOT_SENSE_PIN) == HIGH) {
         vTaskDelay(pdMS_TO_TICKS(50));
         fetchADCDMA();
@@ -614,6 +613,7 @@ void updateLUT() {
         }
     }
     
+    // FIX 2: Atomic pointer swapping secured within mutex region
     if (audioBufferMutex != NULL) {
         xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     }

@@ -187,6 +187,8 @@ volatile int currentBatteryPercent = 100;
 volatile float currentBatteryVoltage = 4.00f; 
 volatile bool isBatteryCharging = false;
 
+volatile uint32_t adc_overflow_count = 0;
+
 const int BATTERY_PIN = 4; 
 pin_t pinPB = 1; 
 pin_t pinPB2 = 2; 
@@ -230,14 +232,33 @@ bool IRAM_ATTR i2s_rx_callback(i2s_chan_handle_t handle, i2s_event_data_t *event
 void fetchADCDMA() {
     uint8_t result[256];
     uint32_t ret_num = 0;
+    esp_err_t err;
     
-    while (adc_continuous_read(multifx_adc_handle, result, sizeof(result), &ret_num, 0) == ESP_OK && ret_num > 0) {
-        for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
-            adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result[i];
-            if (p->type2.channel == ADC_CHANNEL_0) latestPB1 = p->type2.data;      
-            if (p->type2.channel == ADC_CHANNEL_1) latestPB2 = p->type2.data;      
-            if (p->type2.channel == ADC_CHANNEL_9) latestPB3 = p->type2.data;      
-            if (p->type2.channel == ADC_CHANNEL_3) latestBat = p->type2.data;      
+    while (true) {
+        err = adc_continuous_read(multifx_adc_handle, result, sizeof(result), &ret_num, 0);
+        
+        if (err == ESP_OK && ret_num > 0) {
+            for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
+                adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result[i];
+                if (p->type2.channel == ADC_CHANNEL_0) latestPB1 = p->type2.data;      
+                if (p->type2.channel == ADC_CHANNEL_1) latestPB2 = p->type2.data;      
+                if (p->type2.channel == ADC_CHANNEL_9) latestPB3 = p->type2.data;      
+                if (p->type2.channel == ADC_CHANNEL_3) latestBat = p->type2.data;      
+            }
+        } 
+        else if (err == ESP_ERR_TIMEOUT) {
+            break;
+        } 
+        else if (err == ESP_ERR_INVALID_STATE) {
+            // FIX 1: C++20 volatile explicit modification
+            adc_overflow_count = adc_overflow_count + 1;
+            Serial.printf("[ADC MONITOR] DMA Ringbuffer Overflow (Count: %lu)! Auto-Recovering...\n", adc_overflow_count);
+            adc_continuous_stop(multifx_adc_handle);
+            adc_continuous_start(multifx_adc_handle);
+            break;
+        } 
+        else {
+            break; 
         }
     }
 }
@@ -479,7 +500,6 @@ void goToLightSleep() {
     int initB = latestPB2; 
     int initC = latestPB3;
     
-    // FIX: Lock-Free UI loop allows MIDI interrupt wakeups to function during sleep wait
     while (digitalRead(BOOT_SENSE_PIN) == HIGH) {
         vTaskDelay(pdMS_TO_TICKS(50));
         fetchADCDMA();
@@ -555,7 +575,7 @@ void goToLightSleep() {
     lastScreenActivityTime = millis(); 
 }
 
-inline float IRAM_ATTR __attribute__((hot)) processTap(uint32_t tapPhase, const int16_t* buffer, int currentWriteIdx, uint32_t windowMask, uint32_t hannIntMult) {
+inline float IRAM_ATTR __attribute__((hot)) __attribute__((always_inline)) processTap(uint32_t tapPhase, const int16_t* buffer, int currentWriteIdx, uint32_t windowMask, uint32_t hannIntMult) {
     int T = (tapPhase >> 16) & windowMask; 
     float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
     int effTap = T + 2; 
@@ -605,7 +625,6 @@ void updateLUT() {
         }
     }
     
-    // FIX: Atomic pointer swapping secured within mutex region
     if (audioBufferMutex != NULL) {
         xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
     }
@@ -988,43 +1007,42 @@ void DisplayTask(void * pvParameters) {
 }
 
 void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
-    static int32_t i2s_in_block[HOP_SIZE * 2] __attribute__((aligned(16)));
-    static int32_t i2s_out_block[HOP_SIZE * 2] __attribute__((aligned(16)));
+    int32_t i2s_in_block[HOP_SIZE * 2] __attribute__((aligned(16)));
+    int32_t i2s_out_block[HOP_SIZE * 2] __attribute__((aligned(16)));
     
-    static float input_dc_offset = 0.0f;
-    static float synthEnv = 0.0f; 
-    static float synthFilter = 0.0f;
-    static float padFilter = 0.0f; 
-    static float padEnv = 0.0f;
-    static float inputEnvelope = 0.0f; 
-    static float feedbackFilterVar = 0.0f;
-    static float smoothedVolGain = 1.0f;
-    static float currentPitch = 1.0f; 
+    float input_dc_offset = 0.0f;
+    float synthEnv = 0.0f; 
+    float synthFilter = 0.0f;
+    float padFilter = 0.0f; 
+    float padEnv = 0.0f;
+    float inputEnvelope = 0.0f; 
+    float feedbackFilterVar = 0.0f;
+    float smoothedVolGain = 1.0f;
+    float currentPitch = 1.0f; 
     
-    static float fbOutNode = 0.0f;
-    static float smoothed_delay_samples = 0.0f;
-    static bool wasFeedbackActive = false;
+    float fbOutNode = 0.0f;
+    float smoothed_delay_samples = 0.0f;
+    bool wasFeedbackActive = false;
     
-    static int freezeWriteIdxVar = 0; 
-    static int freezePlayCounterVar = 0; 
-    static int freezeStartIdxVar = 0; 
-    static int activeFreezeLength = 48000;
+    int freezeWriteIdxVar = 0; 
+    int freezePlayCounterVar = 0; 
+    int freezeStartIdxVar = 0; 
+    int activeFreezeLength = 48000;
     
-    static bool wasSleeping = false;
+    bool wasSleeping = false;
     
-    static float c_fx[10][5];
-    static int c_lat = 0;
-    static int c_act = 0;
-    static bool c_w=true, c_fz=false, c_fb=false, c_hr=false, c_cp=false, c_sy=false, c_pd=false, c_ch=false, c_sw=false, c_vb=false;
-    static float c_pt = 1.0f;
-    static float c_vg = 1.0f;
+    float c_fx[10][5];
+    int c_lat = 0;
+    int c_act = 0;
+    bool c_w=true, c_fz=false, c_fb=false, c_hr=false, c_cp=false, c_sy=false, c_pd=false, c_ch=false, c_sw=false, c_vb=false;
+    float c_pt = 1.0f;
+    float c_vg = 1.0f;
     
     extern volatile bool panicResetRequested;
     
     const float normFactor = 1.0f / 2147483648.0f; 
     const float DC_OFFSET = 1e-9f;
 
-    // FIX 1: SIMD Vectors mapped to strictly parent-scoped aligned stack arrays
     float inBuf[HOP_SIZE] __attribute__((aligned(16)));
     float envBuf[HOP_SIZE] __attribute__((aligned(16)));
     float fzOutBuf[HOP_SIZE] __attribute__((aligned(16)));
@@ -1059,7 +1077,7 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
             wasSleeping = false;
         }
         
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+        ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(20));
         
         size_t bytesRead; 
         i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, 0);
@@ -1344,8 +1362,10 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
                 float localFbPhase = feedbackLfoPhase;
                 float localFbHpf = fbHpfState;
                 
-                __builtin_prefetch(&delayBuffer[(writeIndex + 128) & BUFFER_MASK], 1, 3); 
-                __builtin_prefetch(&fbDelayBuffer[(fbDelayWriteIdx + 128) & FB_BUFFER_MASK], 1, 3); 
+                int prefetchIdxW1 = (writeIndex - halfWindow + MAX_BUFFER_SIZE) & BUFFER_MASK;
+                int prefetchIdxFB = (fbDelayWriteIdx - delaySamples + FB_BUFFER_SIZE) & FB_BUFFER_MASK;
+                __builtin_prefetch(&delayBuffer[prefetchIdxW1], 0, 3); 
+                __builtin_prefetch(&fbDelayBuffer[prefetchIdxFB], 0, 3); 
                 
                 for (int i = 0; i < framesRead; i++) {
                     currentPitch += pitchInc;
@@ -1738,6 +1758,11 @@ void MidiTask(void * pvParameters) {
             lastScreenActivityTime = millis(); 
         }
 
+        if (ui_audio_level > 0.05f) {
+            lastActivityTime = millis();
+            lastScreenActivityTime = millis();
+        }
+
         if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) {
             goToLightSleep(); 
         }
@@ -2006,7 +2031,7 @@ bool channelMessageCallback(ChannelMessage cm) {
             } else {
                 pedals.lockPB3Volume();
                 lastActivePedal = 8192;
-                volumePedalGain = (float)currentPB3 / 16383.0f;
+                volumePedalGain = 1.0f; 
                 if (!lutNeedsUpdate && pitchShiftLUT != nullptr) pitchShiftFactor = pitchShiftLUT[8192];
             }
             
@@ -2198,8 +2223,8 @@ void setup() {
     WiFi.mode(WIFI_OFF);
     
     adc_continuous_handle_cfg_t adc_config = {};
-    adc_config.max_store_buf_size = 1024;
-    adc_config.conv_frame_size = 256;
+    adc_config.max_store_buf_size = 16384;
+    adc_config.conv_frame_size = 1024;
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &multifx_adc_handle));
 
     adc_continuous_config_t dig_cfg = {};
@@ -2207,11 +2232,12 @@ void setup() {
     dig_cfg.conv_mode = ADC_CONV_SINGLE_UNIT_1;
     dig_cfg.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
 
+    // 🚀 FIX 2: Updated deprecated ADC_ATTEN_DB_11 macros to ADC_ATTEN_DB_12
     adc_digi_pattern_config_t adc_pattern[4] = {
-        { .atten = ADC_ATTEN_DB_11, .channel = ADC_CHANNEL_0, .unit = ADC_UNIT_1, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH }, 
-        { .atten = ADC_ATTEN_DB_11, .channel = ADC_CHANNEL_1, .unit = ADC_UNIT_1, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH }, 
-        { .atten = ADC_ATTEN_DB_11, .channel = ADC_CHANNEL_9, .unit = ADC_UNIT_1, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH }, 
-        { .atten = ADC_ATTEN_DB_11, .channel = ADC_CHANNEL_3, .unit = ADC_UNIT_1, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH }  
+        { .atten = ADC_ATTEN_DB_12, .channel = ADC_CHANNEL_0, .unit = ADC_UNIT_1, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH }, 
+        { .atten = ADC_ATTEN_DB_12, .channel = ADC_CHANNEL_1, .unit = ADC_UNIT_1, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH }, 
+        { .atten = ADC_ATTEN_DB_12, .channel = ADC_CHANNEL_9, .unit = ADC_UNIT_1, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH }, 
+        { .atten = ADC_ATTEN_DB_12, .channel = ADC_CHANNEL_3, .unit = ADC_UNIT_1, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH }  
     };
     dig_cfg.pattern_num = 4;
     dig_cfg.adc_pattern = adc_pattern;
@@ -2368,7 +2394,7 @@ void setup() {
     settingsNeedSaving = false;
     
     xTaskCreatePinnedToCore(DisplayTask, "UI", 8192, NULL, 1, NULL, 0); 
-    xTaskCreatePinnedToCore(MidiTask, "Midi", 8192, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(MidiTask, "Midi", 8192, NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES - 1, &audioTaskHandle, 1);
 }
 

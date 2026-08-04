@@ -62,10 +62,8 @@ volatile bool isScreenOff=false, wakeupPending=false, sleepRequested=false, isSl
 
 adc_continuous_handle_t multifx_adc_handle = NULL; volatile int latestPB1=2048, latestPB2=2048, latestPB3=2048, latestBat=2048, currentBatteryPercent=100; volatile float currentBatteryVoltage=4.00f; volatile bool isBatteryCharging=false;
 const int BATTERY_PIN=4, BOOT_SENSE_PIN=0; pin_t pinPB=1, pinPB2=2, pinPB3=10, pinPar1=3, pinPar2=11, pinPar3=12, pinPar4=13, pinPar5=14;
-uint16_t lastMidiSent=8192; volatile uint16_t currentPB1=8192, currentPB2=8192, currentPB3=8192, currentCC11=0; volatile float ui_audio_level=0.0f, ui_output_level=0.0f; volatile uint32_t ui_debug_raw_rx=0; volatile float ui_debug_dc_offset=0.0f;
+uint16_t lastMidiSent=8192; volatile uint16_t currentPB1=8192, currentPB2=8192, currentPB3=8192, currentCC11=0; volatile float ui_audio_level=0.0f, ui_output_level=0.0f;
 
-#define HW_UART_TX_PIN 21
-#define HW_UART_RX_PIN -1
 FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar1=pinPar1, filterPar2=pinPar2, filterPar3=pinPar3, filterPar4=pinPar4, filterPar5=pinPar5;
 BluetoothMIDI_Interface btmidi; USBMIDI_Interface usbmidi; MIDI_PipeFactory<4> pipes; PedalManager pedals;
 
@@ -99,9 +97,11 @@ void saveSettings() {
     AppSettings cs;
     for(int i=0; i<10; i++) { cs.fxMem[i]=effectMemory[i]; for(int p=0; p<5; p++) cs.params[i][p]=fxParams[i][p]; }
     uint16_t fxStates=0; if(isWhammyActive) fxStates|=(1<<0); if(isFrozen) fxStates|=(1<<1); if(isFeedbackActive) fxStates|=(1<<2); if(isHarmonizerMode) fxStates|=(1<<3); if(isCapoMode) fxStates|=(1<<4); if(isSynthMode) fxStates|=(1<<5); if(isPadMode) fxStates|=(1<<6); if(isChorusMode) fxStates|=(1<<7); if(isSwellMode) fxStates|=(1<<8); if(isVibratoMode) fxStates|=(1<<9);
-    
-    preferences.begin("whammy_cfg", false); preferences.putInt("activeMode", (int)activeEffectMode); preferences.putInt("latMode", (int)latencyMode); preferences.putBool("pb2Wiper", isPB2WiperMode); preferences.putBool("volMode", isVolumeMode); preferences.putUShort("fxStates", fxStates); preferences.putUInt("sampleRate", currentSampleRate); preferences.putInt("fbIdx", constrain((int)feedbackIntervalIdx,0,4)); preferences.putBytes("dspData", &cs, sizeof(AppSettings)); preferences.end();
+    int modeCopy = (int)activeEffectMode, latCopy = (int)latencyMode, fbCopy = constrain((int)feedbackIntervalIdx,0,4);
+    bool pb2Copy = isPB2WiperMode, volCopy = isVolumeMode; uint32_t srCopy = currentSampleRate;
     if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex);
+
+    preferences.begin("whammy_cfg", false); preferences.putInt("activeMode", modeCopy); preferences.putInt("latMode", latCopy); preferences.putBool("pb2Wiper", pb2Copy); preferences.putBool("volMode", volCopy); preferences.putUShort("fxStates", fxStates); preferences.putUInt("sampleRate", srCopy); preferences.putInt("fbIdx", fbCopy); preferences.putBytes("dspData", &cs, sizeof(AppSettings)); preferences.end();
 }
 
 int getBatteryPercentage(float voltage) {
@@ -123,30 +123,27 @@ void toggleSampleRate() {
     }
     vTaskDelay(pdMS_TO_TICKS(20));
     
+    // Completely tear down I2S to force external ADC to cleanly resync
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-    i2s_channel_disable(tx_chan); 
-    i2s_channel_disable(rx_chan); 
+    i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); 
+    i2s_del_channel(tx_chan); i2s_del_channel(rx_chan);
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
 
-    vTaskDelay(pdMS_TO_TICKS(10)); 
-    
     currentSampleRate = (currentSampleRate == 96000) ? 48000 : 96000;
-    
-    i2s_std_config_t stdConfig = { 
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate), 
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
-        .gpio_cfg = { .mclk = GPIO_NUM_43, .bclk = GPIO_NUM_44, .ws = GPIO_NUM_18, .dout = GPIO_NUM_16, .din = GPIO_NUM_17 } 
-    };
-    stdConfig.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
-    
-    if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-    i2s_channel_init_std_mode(tx_chan, &stdConfig); 
-    i2s_channel_init_std_mode(rx_chan, &stdConfig);
-    if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
     
     saveSettings(); settingsNeedSaving = false; updateLUT(); lutNeedsUpdate = false;
     
     if (audioBufferMutex != NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+    
+    i2s_chan_config_t i2sConfig=I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); 
+    i2sConfig.dma_desc_num=8; 
+    i2sConfig.dma_frame_num=HOP_SIZE; i2sConfig.auto_clear=true; i2s_new_channel(&i2sConfig, &tx_chan, &rx_chan);
+    
+    i2s_std_config_t stdConfig={ .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate), .slot_cfg=I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), .gpio_cfg={ .mclk=GPIO_NUM_43, .bclk=GPIO_NUM_44, .ws=GPIO_NUM_18, .dout=GPIO_NUM_16, .din=GPIO_NUM_17 } };
+    stdConfig.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384; 
+    i2s_channel_init_std_mode(tx_chan, &stdConfig); i2s_channel_init_std_mode(rx_chan, &stdConfig);
+    i2s_event_callbacks_t cbs={ .on_recv=i2s_rx_callback, .on_recv_q_ovf=NULL, .on_sent=NULL, .on_send_q_ovf=NULL }; i2s_channel_register_event_callback(rx_chan, &cbs, NULL);
+    
     freezeLength = currentSampleRate; 
     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
     memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); 
@@ -155,6 +152,8 @@ void toggleSampleRate() {
     vTaskDelay(pdMS_TO_TICKS(30)); 
     i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); 
     globalAudioResetRequested = true; 
+    
+    hardwareSyncMuteFrames = (currentSampleRate/HOP_SIZE)*0.40f; 
     if (audioBufferMutex != NULL) xSemaphoreGive(audioBufferMutex);
     
     pedals.triggerSystemRecovery(); sleepRequested = false; forceUIUpdate = true; lastParameterChangeTime = millis();
@@ -260,9 +259,6 @@ void updateDisplay() {
     int statsRowY=162; spr.setTextColor(TFT_LIGHTGREY, TFT_BLACK); spr.setTextDatum(ML_DATUM);
     char cpuUsageBuffer[16]; snprintf(cpuUsageBuffer,16,"CPU:%2d%%",(int)core1_load); spr.drawString(cpuUsageBuffer,25,statsRowY); char internalSramBuffer[16]; snprintf(internalSramBuffer,16,"SRM:%dK",(int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)/1024)); spr.drawString(internalSramBuffer,85,statsRowY); char psramBuffer[16]; snprintf(psramBuffer,16,"PSR:%dK",(int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024)); spr.drawString(psramBuffer,150,statsRowY);
     spr.setTextDatum(MC_DATUM); spr.setTextColor(TFT_WHITE); spr.drawRect(210,statsRowY-7,40,14,TFT_DARKGREY); spr.drawString((currentSampleRate==96000)?"96k":"48k",230,statsRowY); spr.drawRect(255,statsRowY-7,40,14,TFT_DARKGREY); const char* latencyLabelStrings[]={"U.Low","Low","Mid","High"}; spr.drawString(latencyLabelStrings[latencyMode],275,statsRowY);
-    
-    char hexMonitor[64]; snprintf(hexMonitor, 64, "RX: %08X | DC: %.5f", ui_debug_raw_rx, ui_debug_dc_offset); spr.setTextDatum(MC_DATUM); spr.setTextColor(TFT_YELLOW, TFT_BLACK); spr.drawString(hexMonitor, 160, 135);
-
     spr.pushSprite(0,0); updateMeters();
 }
 
@@ -293,7 +289,6 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
         if(bytesRead>0) {
             int framesRead=bytesRead/8; framesRead&=~3;
             if(framesRead>0) {
-                ui_debug_raw_rx = (uint32_t)i2s_in_block[0]; ui_debug_dc_offset = input_dc_offset;
                 if(panicResetRequested) {
                     synthEnv=0.0f; synthFilter=0.0f; padFilter=0.0f; padEnv=0.0f; inputEnvelope=0.0f; feedbackFilterVar=0.0f; currentPitch=1.0f; freezeWriteIdxVar=0; freezePlayCounterVar=0; freezeStartIdxVar=0; activeFreezeLength=currentSampleRate; fbDelayWriteIdx=0; apfNeedsClear=true; freezeRamp=0.0f; feedbackRamp=0.0f; vibratoLfoPhase=0.0f; chorusLfoPhase=0.0f; feedbackLfoPhase=0.0f;
                     uint32_t halfWinFixed=((uint32_t)currentWindowSize/2)<<16; tap_w1_1=0; tap_w1_2=halfWinFixed; tap_w2_1=0; tap_w2_2=halfWinFixed; tap_w3_1=0; tap_w3_2=halfWinFixed; tap_w4_1=0; tap_w4_2=halfWinFixed; tap_w5_1=0; tap_w5_2=halfWinFixed;
@@ -302,7 +297,8 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
                 if(globalAudioResetRequested) {
                     synthEnv=0.0f; synthFilter=0.0f; padFilter=0.0f; padEnv=0.0f; inputEnvelope=0.0f; feedbackFilterVar=0.0f; smoothedVolGain=volumePedalGain; currentPitch=1.0f; freezeWriteIdxVar=0; freezePlayCounterVar=0; freezeStartIdxVar=0; activeFreezeLength=currentSampleRate; fbDelayWriteIdx=0; writeIndex=0; apfNeedsClear=true; input_dc_offset=0.0f; ui_audio_level=0.0f; ui_output_level=0.0f; freezeRamp=0.0f; feedbackRamp=0.0f; vibratoLfoPhase=0.0f; chorusLfoPhase=0.0f; feedbackLfoPhase=0.0f;
                     uint32_t halfWinFixed=((uint32_t)currentWindowSize/2)<<16; tap_w1_1=0; tap_w1_2=halfWinFixed; tap_w2_1=0; tap_w2_2=halfWinFixed; tap_w3_1=0; tap_w3_2=halfWinFixed; tap_w4_1=0; tap_w4_2=halfWinFixed; tap_w5_1=0; tap_w5_2=halfWinFixed;
-                    globalAudioResetRequested=false; smoothed_delay_samples=0.0f; if(hardwareSyncMuteFrames<10) hardwareSyncMuteFrames=(currentSampleRate/HOP_SIZE)*0.15f;
+                    memset(delayBuffer,0,MAX_BUFFER_SIZE*sizeof(int16_t)); memset(fbDelayBuffer,0,FB_BUFFER_SIZE*sizeof(int16_t)); memset(freezeBuffer,0,FREEZE_BUFFER_SIZE*sizeof(int16_t));
+                    globalAudioResetRequested=false; smoothed_delay_samples=0.0f; if(hardwareSyncMuteFrames<10) hardwareSyncMuteFrames=(currentSampleRate/HOP_SIZE)*0.40f;
                 }
                 if(hardwareSyncMuteFrames>0) { 
                     hardwareSyncMuteFrames--; 
@@ -321,7 +317,6 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
                 uint32_t start_cycles=xthal_get_ccount(); float srScale=48000.0f/(float)currentSampleRate;
                 if(audioBufferMutex!=NULL && xSemaphoreTake(audioBufferMutex, 0)==pdTRUE) { for(int j=0; j<10; j++) for(int k=0; k<5; k++) c_fx[j][k]=fxParams[j][k]; c_lat=latencyMode; c_act=activeEffectMode; c_w=isWhammyActive; c_fz=isFrozen; c_fb=isFeedbackActive; c_hr=isHarmonizerMode; c_cp=isCapoMode; c_sy=isSynthMode; c_pd=isPadMode; c_ch=isChorusMode; c_sw=isSwellMode; c_vb=isVibratoMode; c_pt=pitchShiftFactor; c_vg=volumePedalGain; xSemaphoreGive(audioBufferMutex); }
                 
-                // 1:1 Scaling: Unscaled grain window (5.33ms latency preset 0 at 96kHz)
                 float targetWindow = LATENCY_WINDOWS[c_lat];
                 if(currentWindowSize!=targetWindow) { currentWindowSize=targetWindow; uint32_t halfWindowFixed=((uint32_t)targetWindow/2)<<16; tap_w1_1=0; tap_w1_2=halfWindowFixed; tap_w2_1=0; tap_w2_2=halfWindowFixed; tap_w3_1=0; tap_w3_2=halfWindowFixed; tap_w4_1=0; tap_w4_2=halfWindowFixed; tap_w5_1=0; tap_w5_2=halfWindowFixed; }
                 uint32_t hannIntMult=(1024U<<16)/(uint32_t)currentWindowSize, windowMask=(uint32_t)currentWindowSize-1; float p_w_dry=c_fx[0][0], p_w_wet=c_fx[0][1], p_fz_apf=c_fx[1][0], p_fz_att=c_fx[1][1], p_fz_rel=c_fx[1][2], p_fb_spd=c_fx[2][0], p_fb_drv=c_fx[2][1], p_fb_off=c_fx[2][2], p_hr_mix=c_fx[3][0], p_sy_att=c_fx[5][0], p_sy_rel=c_fx[5][1], p_sy_flt=c_fx[5][2], p_sy_mix=c_fx[5][3], p_pd_sm=c_fx[6][0], p_pd_mix=c_fx[6][1], p_ch_spd=c_fx[7][0], p_ch_mix=c_fx[7][1], p_sw_thr=c_fx[8][0], p_sw_att=c_fx[8][1], p_sw_rel=c_fx[8][2], p_vb_dep=c_fx[9][0]; float chorusPhaseIncr=p_ch_spd/(float)currentSampleRate, feedbackPhaseIncr=p_fb_spd/(float)currentSampleRate, targetPitch=c_pt, pitchInc=(targetPitch-currentPitch)/(float)framesRead;
@@ -452,7 +447,14 @@ void MidiTask(void * pvParameters) {
         
         static unsigned long lastLutUpdate=0;
         if(lutNeedsUpdate && (millis()-lastLutUpdate>40)) { lutNeedsUpdate=false; updateLUT(); if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); pitchShiftFactor=pitchShiftLUT[constrain(lastActivePedal,0,16383)]; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); lastLutUpdate=millis(); }
-        if(settingsNeedSaving && (millis()-lastParameterChangeTime>2000)) { if(ui_audio_level<0.01f || (millis()-lastParameterChangeTime>10000)) { settingsNeedSaving=false; sleepRequested=true; int timeoutCounter=0; while(!isSleeping && timeoutCounter<40) { vTaskDelay(pdMS_TO_TICKS(5)); timeoutCounter++; } if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); i2s_channel_disable(tx_chan); i2s_channel_disable(rx_chan); if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); saveSettings(); if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); sleepRequested=false; } }
+        
+        if(settingsNeedSaving && (millis()-lastParameterChangeTime>2000)) { 
+            settingsNeedSaving=false; sleepRequested=true; int timeoutCounter=0; 
+            while(!isSleeping && timeoutCounter<40) { vTaskDelay(pdMS_TO_TICKS(5)); timeoutCounter++; } 
+            saveSettings(); 
+            sleepRequested=false; 
+        }
+        
         if(sampleRateToggleRequested) { sampleRateToggleRequested=false; toggleSampleRate(); }
         if(pb2ToggleRequested) { pb2ToggleRequested=false; calibratePBs(); forceUIUpdate=true; settingsNeedSaving=true; lastParameterChangeTime=millis(); }
         vTaskDelay(pdMS_TO_TICKS(5));
@@ -491,7 +493,7 @@ void setup() {
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &multifx_adc_handle));
     
     adc_continuous_config_t dig_cfg={}; 
-    dig_cfg.sample_freq_hz = 2 * 1000; // FIX: Lowered from 20kHz to 2kHz to stop DMA ringbuffer overruns
+    dig_cfg.sample_freq_hz = 2 * 1000;
     dig_cfg.conv_mode = ADC_CONV_SINGLE_UNIT_1; 
     dig_cfg.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
     
@@ -543,6 +545,7 @@ void setup() {
     
     i2s_std_config_t stdConfig={ .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate), .slot_cfg=I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), .gpio_cfg={ .mclk=GPIO_NUM_43, .bclk=GPIO_NUM_44, .ws=GPIO_NUM_18, .dout=GPIO_NUM_16, .din=GPIO_NUM_17 } };
     stdConfig.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384; 
+    
     i2s_channel_init_std_mode(tx_chan, &stdConfig); i2s_channel_init_std_mode(rx_chan, &stdConfig);
     
     i2s_event_callbacks_t cbs={ .on_recv=i2s_rx_callback, .on_recv_q_ovf=NULL, .on_sent=NULL, .on_send_q_ovf=NULL }; i2s_channel_register_event_callback(rx_chan, &cbs, NULL);

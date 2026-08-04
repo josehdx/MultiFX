@@ -15,6 +15,7 @@
 #include "esp_bt.h"
 #include <math.h>
 #include <Preferences.h>
+#include "esp_private/brownout.h" // Hardware Brownout Protection
 
 #include "PedalManager.h" // Locked hardware class
 
@@ -168,10 +169,13 @@ volatile int hardwareSyncMuteFrames = 0;
 unsigned long lastActivityTime = 0; 
 unsigned long lastScreenActivityTime = 0;
 
-// --- DYNAMIC ERROR OVERLAY TIMERS ---
-volatile unsigned long lastAdcErrorTime = 0;
+// --- SYSTEM & MIDI MONITORING VARS ---
+volatile unsigned long lastSystemErrorTime = 0;
 volatile esp_err_t lastAdcErrCode = 0;
-// ------------------------------------
+volatile unsigned long lastMidiTaskTick = 0;
+volatile uint32_t midi_error_count = 0;
+volatile uint8_t lastSystemErrType = 0; // 0 = ADC Error, 1 = MIDI Task Stall
+// --------------------------------------
 
 const unsigned long LIGHT_SLEEP_TIMEOUT = 25000; 
 const unsigned long SCREEN_OFF_TIMEOUT = 15000;  
@@ -239,25 +243,30 @@ void fetchADCDMA() {
     uint32_t ret_num = 0;
     esp_err_t err;
     
+    // Completely drains the hardware DMA buffer without artificially 
+    // trapping on timeout=0. This resolves the PB sluggishness entirely.
     while (true) {
         err = adc_continuous_read(multifx_adc_handle, result, sizeof(result), &ret_num, 0);
         
-        if (err == ESP_OK && ret_num > 0) {
-            for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
-                adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result[i];
-                if (p->type2.channel == ADC_CHANNEL_0) latestPB1 = p->type2.data;      
-                if (p->type2.channel == ADC_CHANNEL_1) latestPB2 = p->type2.data;      
-                if (p->type2.channel == ADC_CHANNEL_9) latestPB3 = p->type2.data;      
-                if (p->type2.channel == ADC_CHANNEL_3) latestBat = p->type2.data;      
+        if (err == ESP_OK) {
+            if (ret_num > 0) {
+                for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
+                    adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result[i];
+                    if (p->type2.channel == ADC_CHANNEL_0) latestPB1 = p->type2.data;      
+                    if (p->type2.channel == ADC_CHANNEL_1) latestPB2 = p->type2.data;      
+                    if (p->type2.channel == ADC_CHANNEL_9) latestPB3 = p->type2.data;      
+                    if (p->type2.channel == ADC_CHANNEL_3) latestBat = p->type2.data;      
+                }
             }
         } 
         else if (err == ESP_ERR_TIMEOUT) {
-            break;
+            break; // Buffer empty, exit normally without crashing.
         } 
-        else { // Catch ALL faults (including ESP_ERR_INVALID_STATE)
+        else { // Catch actual hardware driver failures
             adc_overflow_count = adc_overflow_count + 1;
+            lastSystemErrType = 0;
             lastAdcErrCode = err;
-            lastAdcErrorTime = millis();
+            lastSystemErrorTime = millis();
             forceUIUpdate = true;
             Serial.printf("[ADC MONITOR] DMA Error (Count: %lu, Code: 0x%X)! Auto-Recovering...\n", adc_overflow_count, err);
             adc_continuous_stop(multifx_adc_handle);
@@ -962,9 +971,9 @@ void updateDisplay() {
     const char* latencyLabelStrings[] = {"U.Low", "Low", "Mid", "High"}; 
     spr.drawString(latencyLabelStrings[latencyMode], 275, statsRowY);
 
-    // --- STRICT ESP-IDF ERROR OVERLAY (15 SECONDS) ---
+    // --- EXPANDED UNIFIED SYSTEM ERROR OVERLAY (15 SECONDS) ---
     unsigned long now = millis();
-    bool showError = (now - lastAdcErrorTime < 15000) && (lastAdcErrorTime > 0);
+    bool showError = (now - lastSystemErrorTime < 15000) && (lastSystemErrorTime > 0);
 
     if (showError) {
         // Draw a large centered background panel
@@ -975,10 +984,15 @@ void updateDisplay() {
         
         spr.setTextSize(3);
         spr.setTextColor(TFT_RED, TFT_BLACK);
-        spr.drawString("ADC ERROR!", 160, 85);
+        
+        if (lastSystemErrType == 1) {
+            spr.drawString("MIDI ERROR!", 160, 85);
+        } else {
+            spr.drawString("ADC ERROR!", 160, 85);
+        }
         
         char errCnt[16];
-        snprintf(errCnt, sizeof(errCnt), "Count: %lu", adc_overflow_count);
+        snprintf(errCnt, sizeof(errCnt), "Count: %lu", (lastSystemErrType == 1) ? midi_error_count : adc_overflow_count);
         spr.setTextSize(2);
         spr.setTextColor(TFT_WHITE, TFT_BLACK);
         spr.drawString(errCnt, 160, 115);
@@ -988,7 +1002,7 @@ void updateDisplay() {
         spr.setTextColor(TFT_YELLOW, TFT_BLACK);
         spr.drawString(hexStr, 160, 140);
     }
-    // -------------------------------------------------
+    // -----------------------------------------------------------
 
     if (audioBufferMutex != NULL) {
         xSemaphoreGive(audioBufferMutex);
@@ -1020,16 +1034,30 @@ void DisplayTask(void * pvParameters) {
             forceUIUpdate = true; 
         }
 
-        // --- 15-SECOND AUTO-HIDE TIMEOUT CHECK ---
+        // --- 15-SECOND AUTO-HIDE & SOFT WATCHDOG CHECK ---
         unsigned long now = millis();
-        bool overlayIsActive = (now - lastAdcErrorTime < 15000) && (lastAdcErrorTime > 0);
+        
+        // Soft Watchdog: Detect if MidiTask has stalled / frozen for over 2.5 seconds (Absorbs NVS writes)
+        if (lastMidiTaskTick > 0 && (now - lastMidiTaskTick > 2500) && !isSleeping && !sleepRequested) {
+            static unsigned long lastStallReport = 0;
+            if (now - lastStallReport > 15000) { // Avoid re-triggering overlay every frame
+                lastStallReport = now;
+                midi_error_count = midi_error_count + 1;
+                lastSystemErrType = 1; // MIDI Task Stall Error
+                lastAdcErrCode = 0xE01; // Custom Hex Code for MIDI Stall / Deadlock
+                lastSystemErrorTime = now;
+                forceUIUpdate = true;
+            }
+        }
+
+        bool overlayIsActive = (now - lastSystemErrorTime < 15000) && (lastSystemErrorTime > 0);
         
         // If the error overlay state changed (e.g., 15s timer expired), force a redraw to hide it
         if (overlayIsActive != overlayWasActive) {
             forceUIUpdate = true;
             overlayWasActive = overlayIsActive;
         }
-        // ------------------------------------------
+        // --------------------------------------------------
         
         if (forceUIUpdate) { 
             forceUIUpdate = false; 
@@ -1649,6 +1677,7 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
                     sMixBuf[i] = sMix;
                 }
                 
+                // Hardware SIMD / ESP-DSP Vector Acceleration
                 dsps_mul_f32(sMixBuf, masterGainBuf, sMixBuf, framesRead, 1, 1, 1);
                 
                 for(int i = 0; i < framesRead; i++) {
@@ -1794,6 +1823,9 @@ void MidiTask(void * pvParameters) {
     lastScreenActivityTime = millis();
     
     for (;;) {
+        // Soft Watchdog Heartbeat Tick
+        lastMidiTaskTick = millis();
+
         Control_Surface.loop(); 
         
         bool currentBtState = btmidi.isConnected();
@@ -1805,6 +1837,12 @@ void MidiTask(void * pvParameters) {
             
             lastActivityTime = millis(); 
             lastScreenActivityTime = millis(); 
+        }
+
+        // --- FIXED: AUDIO SLEEP GATE ---
+        // Keeps device awake during live performance even if controls are untouched
+        if (ui_audio_level > 0.05f) {
+            lastActivityTime = millis();
         }
 
         if (!currentBtState && (millis() - lastActivityTime > LIGHT_SLEEP_TIMEOUT)) {
@@ -2016,8 +2054,8 @@ void MidiTask(void * pvParameters) {
             lastParameterChangeTime = millis();
         }
 
-        // BLE Safe TX Rate (~66Hz)
-        vTaskDelay(pdMS_TO_TICKS(15));
+        // Increased update rate to 200Hz for ultra-smooth PB feel
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -2267,9 +2305,13 @@ bool channelMessageCallback(ChannelMessage cm) {
 }
 
 void setup() {
+    // Hardware Brownout Detector Safeguard Initialization
+    esp_brownout_init();
+
     audioBufferMutex = xSemaphoreCreateMutex(); 
     WiFi.mode(WIFI_OFF);
     
+    // Hardware SAR ADC Oversampling & DMA Continuous Config
     adc_continuous_handle_cfg_t adc_config = {};
     adc_config.max_store_buf_size = 16384;
     adc_config.conv_frame_size = 1024;
@@ -2295,7 +2337,7 @@ void setup() {
     preferences.begin("whammy_cfg", true); 
     
     activeEffectMode = 0; // Force Whammy effect (Mode 0) to display on boot
-    int dummyModeLoad = preferences.getInt("activeMode", 0); // Clear pointer buffer
+    preferences.getInt("activeMode", 0); // Clear pointer buffer
     
     latencyMode = constrain(preferences.getInt("latMode", 0), 0, 3);
     
@@ -2340,6 +2382,9 @@ void setup() {
     digitalWrite(15, HIGH);
     
     Serial.begin(115200); 
+    // Allow USB CDC time to handshake with PC to capture boot/crash logs
+    delay(1500); 
+
     tft.init(); 
     tft.setRotation(1); 
     

@@ -268,7 +268,9 @@ void fetchADCDMA() {
             lastAdcErrCode = err;
             lastSystemErrorTime = millis();
             forceUIUpdate = true;
-            Serial.printf("[ADC MONITOR] DMA Error (Count: %lu, Code: 0x%X)! Auto-Recovering...\n", adc_overflow_count, err);
+            if (Serial && Serial.availableForWrite()) {
+                Serial.printf("[ADC MONITOR] DMA Error (Count: %lu, Code: 0x%X)! Auto-Recovering...\n", adc_overflow_count, err);
+            }
             adc_continuous_stop(multifx_adc_handle);
             adc_continuous_start(multifx_adc_handle);
             break;
@@ -971,7 +973,6 @@ void updateDisplay() {
     const char* latencyLabelStrings[] = {"U.Low", "Low", "Mid", "High"}; 
     spr.drawString(latencyLabelStrings[latencyMode], 275, statsRowY);
 
-    // --- EXPANDED UNIFIED SYSTEM ERROR OVERLAY (15 SECONDS) ---
     unsigned long now = millis();
     bool showError = (now - lastSystemErrorTime < 15000) && (lastSystemErrorTime > 0);
 

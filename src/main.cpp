@@ -16,7 +16,7 @@
 #include <math.h>
 #include <Preferences.h>
 
-#include "PedalManager.h" // 🔒 Locked hardware class
+#include "PedalManager.h" // 馃敀 Locked hardware class
 
 // --- HARDWARE CONFIGURATION TOGGLES ---
 #define ENABLE_PAR_KNOBS false  
@@ -706,16 +706,20 @@ struct GaugeDef {
 };
 
 void updateDisplay() {
+    if (audioBufferMutex != NULL) {
+        xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
+    }
+
     spr.fillSprite(TFT_BLACK); 
     
     int renderMode = activeEffectMode; 
     
-    char batStr[20];
+    char batStr[24];
     if (isBatteryCharging) { 
-        sprintf(batStr, "CHG %.2fV %d%%", currentBatteryVoltage, currentBatteryPercent); 
+        snprintf(batStr, sizeof(batStr), "CHG %.2fV %d%%", currentBatteryVoltage, currentBatteryPercent); 
         spr.setTextColor(TFT_GREEN, TFT_BLACK); 
     } else { 
-        sprintf(batStr, "%.2fV %d%%", currentBatteryVoltage, currentBatteryPercent); 
+        snprintf(batStr, sizeof(batStr), "%.2fV %d%%", currentBatteryVoltage, currentBatteryPercent); 
         spr.setTextColor((currentBatteryPercent > 20) ? TFT_GREEN : TFT_RED, TFT_BLACK); 
     }
     
@@ -768,141 +772,133 @@ void updateDisplay() {
     char valBuf[16];
     
     float pb1Val = (currentPB1 - 8192) / 8192.0f; 
-    sprintf(valBuf, "%d%%", (int)(pb1Val * 100));
+    snprintf(valBuf, sizeof(valBuf), "%d%%", (int)(pb1Val * 100));
     drawCircularGauge(spr, 65, topY, topR, pb1Val, "PB1", valBuf, TFT_CYAN, 1);
 
     float pb2Val = (currentPB2 - 8192) / 8192.0f; 
-    sprintf(valBuf, "%d%%", (int)(pb2Val * 100));
+    snprintf(valBuf, sizeof(valBuf), "%d%%", (int)(pb2Val * 100));
     drawCircularGauge(spr, 125, topY, topR, pb2Val, isPB2WiperMode ? "PB2 W" : "PB2 H", valBuf, TFT_MAGENTA, 1);
 
     float pb3Val = currentPB3 / 16383.0f; 
-    sprintf(valBuf, "%d%%", (int)(pb3Val * 100));
+    snprintf(valBuf, sizeof(valBuf), "%d%%", (int)(pb3Val * 100));
     drawCircularGauge(spr, 185, topY, topR, pb3Val, isVolumeMode ? "VOL" : "PB3", valBuf, TFT_YELLOW, 0);
 
     float cc11Val = currentCC11 / 16383.0f; 
-    sprintf(valBuf, "%d%%", (int)(cc11Val * 100));
+    snprintf(valBuf, sizeof(valBuf), "%d%%", (int)(cc11Val * 100));
     drawCircularGauge(spr, 245, topY, topR, cc11Val, "CC11", valBuf, TFT_GREEN, 0);
 
     GaugeDef bGauges[6]; 
     int numG = 0;
-    
-    if (audioBufferMutex != NULL) {
-        xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-    }
 
     if (renderMode == 0 || renderMode == 1 || renderMode == 8) {
         bGauges[numG++] = {1, effectMemory[1]/24.0f, "HEEL", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%+.1f", effectMemory[1]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%+.1f", effectMemory[1]);
         
         bGauges[numG++] = {1, effectMemory[0]/24.0f, "TOE", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%+.1f", effectMemory[0]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%+.1f", effectMemory[0]);
     } else if (renderMode == 2) {
         float fbi[] = {0.0f, 12.0f, 19.0f, 24.0f, 28.0f}; 
         float val = fbi[constrain((int)feedbackIntervalIdx, 0, 4)];
         bGauges[numG++] = {2, val/28.0f, "OVT", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%+.1f", val);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%+.1f", val);
     } else if (renderMode == 4) {
         int semi = (int)roundf(effectMemory[4]); 
         int cents = (int)roundf((effectMemory[4] - (float)semi) * 100.0f);
         
         bGauges[numG++] = {1, semi/24.0f, "SEMI", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%+d", semi);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%+d", semi);
         
         bGauges[numG++] = {1, cents/50.0f, "CENT", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%+d", cents);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%+d", cents);
         
         bGauges[numG++] = {1, effectMemory[1]/24.0f, "HEEL", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%+.1f", effectMemory[1]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%+.1f", effectMemory[1]);
         
         bGauges[numG++] = {1, effectMemory[0]/24.0f, "TOE", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%+.1f", effectMemory[0]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%+.1f", effectMemory[0]);
     } else {
         float val = effectMemory[renderMode];
         if (renderMode == 3) {
             bGauges[numG++] = {1, val/24.0f, "INT", ""}; 
-            sprintf(bGauges[numG-1].valStr, "%+.1f", val);
+            snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%+.1f", val);
         } else if (renderMode == 5) {
             bGauges[numG++] = {1, val/24.0f, "OSC", ""}; 
-            sprintf(bGauges[numG-1].valStr, "%+.1f", val);
+            snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%+.1f", val);
         } else if (renderMode == 6) {
             bGauges[numG++] = {1, val/24.0f, "SHFT", ""}; 
-            sprintf(bGauges[numG-1].valStr, "%+.1f", val);
+            snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%+.1f", val);
         } else if (renderMode == 7) {
             bGauges[numG++] = {1, val/24.0f, "SHFT", ""}; 
-            sprintf(bGauges[numG-1].valStr, "%+.1f", val);
+            snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%+.1f", val);
         } else if (renderMode == 9) {
             bGauges[numG++] = {1, val/24.0f, "BASE", ""}; 
-            sprintf(bGauges[numG-1].valStr, "%+.1f", val);
+            snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%+.1f", val);
         }
     }
     
     if (renderMode == 0) {
         bGauges[numG++] = {2, fxParams[0][0], "D.MIX", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.1f", fxParams[0][0]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.1f", fxParams[0][0]);
         
         bGauges[numG++] = {2, fxParams[0][1], "W.MIX", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.1f", fxParams[0][1]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.1f", fxParams[0][1]);
     } else if (renderMode == 1) {
         bGauges[numG++] = {2, fxParams[1][0]/0.95f, "RVB", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[1][0]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[1][0]);
         
         bGauges[numG++] = {2, (fxParams[1][1]-0.00001f)/0.001f, "ATK", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[1][1]*1000.0f);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[1][1]*1000.0f);
         
         bGauges[numG++] = {2, (fxParams[1][2]-0.00001f)/0.0005f, "REL", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[1][2]*1000.0f);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[1][2]*1000.0f);
     } else if (renderMode == 2) {
         bGauges[numG++] = {2, (fxParams[2][0]-1000.0f)/10000.0f, "SPD", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.0f", fxParams[2][0]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.0f", fxParams[2][0]);
         
         bGauges[numG++] = {2, (fxParams[2][1]-1.0f)/100.0f, "DRV", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.1f", fxParams[2][1]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.1f", fxParams[2][1]);
         
         bGauges[numG++] = {2, (fxParams[2][2]-0.005f)/0.045f, "DLY", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[2][2]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[2][2]);
     } else if (renderMode == 3) {
         bGauges[numG++] = {2, fxParams[3][0], "MIX", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[3][0]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[3][0]);
     } else if (renderMode == 5) {
         bGauges[numG++] = {2, (fxParams[5][0]-0.01f)/0.5f, "ATK", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[5][0]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[5][0]);
         
         bGauges[numG++] = {2, (fxParams[5][1]-0.001f)/0.05f, "REL", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[5][1]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[5][1]);
         
         bGauges[numG++] = {2, (fxParams[5][2]-0.1f)/0.8f, "FLT", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[5][2]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[5][2]);
         
         bGauges[numG++] = {2, fxParams[5][3], "MIX", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[5][3]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[5][3]);
     } else if (renderMode == 6) {
         bGauges[numG++] = {2, (fxParams[6][0]-0.8f)/0.199f, "TON", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[6][0]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[6][0]);
         
         bGauges[numG++] = {2, fxParams[6][1]/3.0f, "MIX", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.1f", fxParams[6][1]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.1f", fxParams[6][1]);
     } else if (renderMode == 7) {
         bGauges[numG++] = {2, (fxParams[7][0]-500.0f)/4500.0f, "SPD", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.0f", fxParams[7][0]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.0f", fxParams[7][0]);
         
         bGauges[numG++] = {2, fxParams[7][1], "MIX", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[7][1]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[7][1]);
     } else if (renderMode == 8) {
         bGauges[numG++] = {2, (fxParams[8][0]-0.001f)/0.05f, "THR", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[8][0]);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[8][0]);
         
         bGauges[numG++] = {2, (fxParams[8][1]-0.00001f)/0.0005f, "ATK", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[8][1]*1000.0f);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[8][1]*1000.0f);
         
         bGauges[numG++] = {2, (fxParams[8][2]-0.00001f)/0.0005f, "REL", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[8][2]*1000.0f);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[8][2]*1000.0f);
     } else if (renderMode == 9) {
         bGauges[numG++] = {2, fxParams[9][0]/2.0f, "DEP", ""}; 
-        sprintf(bGauges[numG-1].valStr, "%.2f", fxParams[9][0]);
-    }
-    
-    if (audioBufferMutex != NULL) {
-        xSemaphoreGive(audioBufferMutex);
+        snprintf(bGauges[numG-1].valStr, sizeof(bGauges[numG-1].valStr), "%.2f", fxParams[9][0]);
     }
 
     int bY = 115; 
@@ -940,15 +936,15 @@ void updateDisplay() {
     spr.setTextDatum(ML_DATUM); 
     
     char cpuUsageBuffer[16]; 
-    sprintf(cpuUsageBuffer, "CPU:%2d%%", (int)core1_load); 
+    snprintf(cpuUsageBuffer, sizeof(cpuUsageBuffer), "CPU:%2d%%", (int)core1_load); 
     spr.drawString(cpuUsageBuffer, 25, statsRowY);
     
     char internalSramBuffer[16]; 
-    sprintf(internalSramBuffer, "SRM:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024)); 
+    snprintf(internalSramBuffer, sizeof(internalSramBuffer), "SRM:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024)); 
     spr.drawString(internalSramBuffer, 85, statsRowY);
     
     char psramBuffer[16]; 
-    sprintf(psramBuffer, "PSR:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024)); 
+    snprintf(psramBuffer, sizeof(psramBuffer), "PSR:%dK", (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024)); 
     spr.drawString(psramBuffer, 150, statsRowY);
 
     spr.setTextDatum(MC_DATUM); 
@@ -960,6 +956,10 @@ void updateDisplay() {
     spr.drawRect(255, statsRowY - 7, 40, 14, TFT_DARKGREY);
     const char* latencyLabelStrings[] = {"U.Low", "Low", "Mid", "High"}; 
     spr.drawString(latencyLabelStrings[latencyMode], 275, statsRowY);
+
+    if (audioBufferMutex != NULL) {
+        xSemaphoreGive(audioBufferMutex);
+    }
 
     spr.pushSprite(0, 0); 
     updateMeters();
@@ -1076,10 +1076,10 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
             wasSleeping = false;
         }
         
-        ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(20));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
         
         size_t bytesRead; 
-        // 🚀 FIX 2: Block-enforced hardware transfer prevents partial-read channel swapping
+        // 馃殌 FIX 2: Block-enforced hardware transfer prevents partial-read channel swapping
         i2s_channel_read(rx_chan, i2s_in_block, sizeof(i2s_in_block), &bytesRead, pdMS_TO_TICKS(10));
         
         if (bytesRead > 0) {
@@ -1385,7 +1385,7 @@ void IRAM_ATTR __attribute__((hot)) AudioDSPTask(void * pvParameters) {
                         localSwellGain = __builtin_fminf(1.0f, localSwellGain + (0.005f * srScale)); 
                     }
                     
-                    // 🚀 FIX 3: DC Offset added to prevent FPU Subnormal Traps
+                    // 馃殌 FIX 3: DC Offset added to prevent FPU Subnormal Traps
                     smoothedVolGain = smoothedVolGain * (1.0f - vol_alpha) + localVolGain * vol_alpha + DC_OFFSET;
                     masterGainBuf[i] = 2147483520.0f * localSwellGain * smoothedVolGain;
                     
@@ -1940,7 +1940,7 @@ void MidiTask(void * pvParameters) {
             lastLutUpdate = millis();
         }
 
-        // 🚀 FIX 1: Only execute NVS save during true musical silence
+        // 馃殌 FIX 1: Only execute NVS save during true musical silence
         if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) { 
             if (ui_audio_level < 0.01f) { 
                 settingsNeedSaving = false; 

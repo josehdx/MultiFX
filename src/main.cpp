@@ -61,7 +61,7 @@ volatile int hardwareSyncMuteFrames=0; unsigned long lastActivityTime=0, lastScr
 volatile bool isScreenOff=false, wakeupPending=false, sleepRequested=false, isSleeping=false; volatile float core1_load=0.0f; volatile bool isAdcPaused=false;
 
 adc_continuous_handle_t multifx_adc_handle = NULL; volatile int latestPB1=2048, latestPB2=2048, latestPB3=2048, latestBat=2048, currentBatteryPercent=100; volatile float currentBatteryVoltage=4.00f; volatile bool isBatteryCharging=false;
-const int BATTERY_PIN=4, BOOT_SENSE_PIN=0; pin_t pinPB=1, pinPB2=2, pinPB3=10, pinPar1=3, pinPar2=11, pinPar3=12, pinPar4=13, pinPar5=14;
+const int BATTERY_PIN=4, BOOT_SENSE_PIN=0; pin_t pinPB=1, pinPB2=2, pinPB3=10, pinPar1=3, pinPar2=11, pinPar3=12, pinPar4=13, pinPar5=21;
 uint16_t lastMidiSent=8192; volatile uint16_t currentPB1=8192, currentPB2=8192, currentPB3=8192, currentCC11=0; volatile float ui_audio_level=0.0f, ui_output_level=0.0f;
 
 FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar1=pinPar1, filterPar2=pinPar2, filterPar3=pinPar3, filterPar4=pinPar4, filterPar5=pinPar5;

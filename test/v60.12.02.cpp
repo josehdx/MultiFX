@@ -1,4 +1,4 @@
-// v60.12.12.cpp
+// v60.12.13.cpp
 #pragma GCC optimize ("O3")
 #include <Arduino.h>
 #include <Control_Surface.h>
@@ -753,13 +753,15 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                     if(__builtin_expect(localFrzRamp>0.0f, 0)) {
                         float phaseRead=(float)freezePlayCounterVar*activeInvFreqLength, phase2=(phaseRead+0.5f); if(phase2>=1.0f) phase2-=1.0f;
                         
-                        int sum1=freezeStartIdxVar+freezePlayCounterVar;
-                        int idx1=(freezeLength>0)?(sum1%freezeLength):0;
+                        int idx1 = freezeStartIdxVar + freezePlayCounterVar;
+                        if (__builtin_expect(idx1 >= freezeLength, 0)) idx1 -= freezeLength;
                         
-                        int activeLen=(activeFreezeLength>=64)?activeFreezeLength:freezeLength;
-                        int counter2=(activeLen>0)?((freezePlayCounterVar+(activeLen/2))%activeLen):0;
-                        int sum2=freezeStartIdxVar+counter2;
-                        int idx2=(freezeLength>0)?(sum2%freezeLength):0;
+                        int activeLen = (activeFreezeLength >= 64) ? activeFreezeLength : freezeLength;
+                        int counter2 = freezePlayCounterVar + (activeLen / 2);
+                        if (__builtin_expect(counter2 >= activeLen, 0)) counter2 -= activeLen;
+                        
+                        int idx2 = freezeStartIdxVar + counter2;
+                        if (__builtin_expect(idx2 >= freezeLength, 0)) idx2 -= freezeLength;
                         
                         int lutIdx1=(int)(phaseRead*1023.0f)&1023, lutIdx2=(int)(phase2*1023.0f)&1023;
                         float rFrz=__builtin_fmaf((float)freezeBuffer[idx1]*3.0517578125e-5f, hannLUT[lutIdx1], (float)freezeBuffer[idx2]*3.0517578125e-5f*hannLUT[lutIdx2]);
@@ -1002,6 +1004,14 @@ void MidiTask(void * pvParameters) {
         if(settingsNeedSaving && (millis()-lastParameterChangeTime>2000)) { 
             if(ui_audio_level.load(std::memory_order_acquire)<0.01f || (millis()-lastParameterChangeTime>10000)) { 
                 settingsNeedSaving=false; 
+                
+                dsp_is_paused.store(true, std::memory_order_release);
+                while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+                
+                saveSettings();
+                
+                dsp_is_paused.store(false, std::memory_order_release);
+                while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
             } 
         }
         

@@ -1,4 +1,4 @@
-// v60.30.cpp
+// v60.31.cpp
 #pragma GCC optimize ("O3")
 #include <Arduino.h>
 #include <Control_Surface.h>
@@ -74,7 +74,11 @@ void updateParameterFromCC(uint8_t cc, uint8_t val);
 
 i2s_chan_handle_t tx_chan, rx_chan;
 SemaphoreHandle_t audioBufferMutex = NULL;
+
+// PSRAM Task Stack Migration Definitions
 TaskHandle_t audioTaskHandle = NULL;
+StackType_t* dspTaskStack = nullptr;
+StaticTask_t* dspTaskTCB = nullptr;
 
 #define HOP_SIZE 64
 #define MAX_BUFFER_SIZE 65536
@@ -360,6 +364,7 @@ void updateDisplay() {
     spr.fillSprite(TFT_BLACK); 
     int renderMode=activeEffectMode.load(std::memory_order_acquire); 
     
+    // UI Arrays securely copied within Mutex limits
     float lMem[10];
     float lPrm[5];
     int lFbIdx = 0;
@@ -699,7 +704,7 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
         }
         
         size_t bytesRead; 
-        i2s_channel_read(rx_chan, i2s_in_block, HOP_SIZE*2*sizeof(int32_t), &bytesRead, portMAX_DELAY);
+        i2s_channel_read(rx_chan, i2s_in_block, HOP_SIZE*2*sizeof(int32_t), &bytesRead, pdMS_TO_TICKS(10));
         
         if(__builtin_expect(bytesRead>0, 1)) {
             int framesRead=bytesRead/8;
@@ -1093,6 +1098,9 @@ void setup() {
     fbOutBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     sMixBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     
+    if(delayBuffer==nullptr||fbDelayBuffer==nullptr||freezeBuffer==nullptr||pitchShiftLUT==nullptr||pitchShiftLUT_temp==nullptr||i2s_in_block==nullptr||i2s_out_block==nullptr||inBuf==nullptr||envBuf==nullptr||fzOutBuf==nullptr||masterGainBuf==nullptr||w1Buf==nullptr||w2Buf==nullptr||w3Buf==nullptr||padFilterBuf==nullptr||dryBuf==nullptr||fbOutBuf==nullptr||sMixBuf==nullptr) {
+         tft.init(); tft.setRotation(1); tft.fillScreen(TFT_RED); tft.setTextColor(TFT_WHITE, TFT_RED); tft.drawString("MEMORY ERROR", 160, 85); while(1) vTaskDelay(100);
+     }
     memset(i2s_in_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
     memset(i2s_out_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
     memset(inBuf, 0, HOP_SIZE * sizeof(float));
@@ -1140,7 +1148,21 @@ void setup() {
     settingsNeedSaving=false;
     
     xTaskCreatePinnedToCore(DisplayTask, "UI", 8192, NULL, 1, NULL, 1); 
-    xTaskCreatePinnedToCore(AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES-1, &audioTaskHandle, 0);
+
+    // Static PSRAM Allocation for AudioDSPTask Stack
+    dspTaskStack = (StackType_t*)heap_caps_aligned_alloc(16, 16384, MALLOC_CAP_SPIRAM);
+    dspTaskTCB = (StaticTask_t*)heap_caps_aligned_alloc(16, sizeof(StaticTask_t), MALLOC_CAP_SPIRAM);
+
+    if (dspTaskStack != nullptr && dspTaskTCB != nullptr) {
+        audioTaskHandle = xTaskCreateStaticPinnedToCore(
+            AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES - 1, 
+            dspTaskStack, dspTaskTCB, 0
+        );
+    } else {
+        tft.init(); tft.setRotation(1); tft.fillScreen(TFT_RED); 
+        tft.setTextColor(TFT_WHITE, TFT_RED); tft.drawString("PSRAM ALLOC FAIL", 160, 85); 
+        while(1) vTaskDelay(100);
+    }
     
     i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); 
 }
@@ -1266,7 +1288,7 @@ void loop() {
 
             bool charging=(instantVoltage>4.20f); 
             int newPercent=getBatteryPercentage(instantVoltage); 
-            bool stateChanged=(newPercent!=currentBatteryPercent.load(std::memory_order_relaxed))||(charging!=isBatteryCharging.load(std::memory_order_relaxed)); 
+            bool stateChanged=(newPercent!=currentBatteryPercent.load(std::memory_order_relaxed))||(charging!=isBatteryCharging.load(std::memory_order_relaxed));
             currentBatteryVoltage=instantVoltage; 
             currentBatteryPercent.store(newPercent, std::memory_order_relaxed); 
             isBatteryCharging.store(charging, std::memory_order_relaxed); 

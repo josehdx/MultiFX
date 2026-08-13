@@ -1,4 +1,4 @@
-// v60.31.cpp
+// v60.32.cpp
 #pragma GCC optimize ("O3")
 #include <Arduino.h>
 #include <Control_Surface.h>
@@ -295,6 +295,9 @@ void goToLightSleep() {
     adc_continuous_stop(multifx_adc_handle);
     
     while ((REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN))) {
+        if (btmidi.isConnected()) {
+            Control_Surface.loop(); // Keep BLE heartbeat alive
+        }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     
@@ -540,6 +543,13 @@ void DisplayTask(void * pvParameters) {
     }
 }
 
+// Global AntiDenormal definition
+inline float IRAM_ATTR __attribute__((always_inline)) __attribute__((optimize("O3"))) AntiDenormal(float value) {
+    union { float f; uint32_t i; } u = { .f = value };
+    if (__builtin_expect((u.i & 0x7F800000) == 0, 0)) return 0.0f;
+    return value;
+}
+
 inline float IRAM_ATTR __attribute__((hot)) __attribute__((always_inline)) __attribute__((optimize("O3"))) processTap(uint32_t tapPhase, const int16_t* buffer, int currentWriteIdx, uint32_t windowMask, uint32_t hannIntMult) {
     int T=(tapPhase>>16)&windowMask; 
     float frac=(tapPhase&0xFFFF)*0.0000152587890625f; 
@@ -563,7 +573,7 @@ inline float IRAM_ATTR __attribute__((hot)) __attribute__((always_inline)) __att
     float sample = __builtin_fmaf(__builtin_fmaf(__builtin_fmaf(c3, frac, c2), frac, c1), frac, y1); 
     
     int lutIdx = ((uint32_t)(T * hannIntMult) >> 16) & 1023; 
-    return sample * hannLUT[lutIdx];
+    return AntiDenormal(sample * hannLUT[lutIdx]);
 }
 
 void IRAM_ATTR __attribute__((optimize("O3"))) DSP_ProcessInput(
@@ -1098,9 +1108,6 @@ void setup() {
     fbOutBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     sMixBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     
-    if(delayBuffer==nullptr||fbDelayBuffer==nullptr||freezeBuffer==nullptr||pitchShiftLUT==nullptr||pitchShiftLUT_temp==nullptr||i2s_in_block==nullptr||i2s_out_block==nullptr||inBuf==nullptr||envBuf==nullptr||fzOutBuf==nullptr||masterGainBuf==nullptr||w1Buf==nullptr||w2Buf==nullptr||w3Buf==nullptr||padFilterBuf==nullptr||dryBuf==nullptr||fbOutBuf==nullptr||sMixBuf==nullptr) {
-         tft.init(); tft.setRotation(1); tft.fillScreen(TFT_RED); tft.setTextColor(TFT_WHITE, TFT_RED); tft.drawString("MEMORY ERROR", 160, 85); while(1) vTaskDelay(100);
-     }
     memset(i2s_in_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
     memset(i2s_out_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
     memset(inBuf, 0, HOP_SIZE * sizeof(float));
@@ -1149,7 +1156,6 @@ void setup() {
     
     xTaskCreatePinnedToCore(DisplayTask, "UI", 8192, NULL, 1, NULL, 1); 
 
-    // Static PSRAM Allocation for AudioDSPTask Stack
     dspTaskStack = (StackType_t*)heap_caps_aligned_alloc(16, 16384, MALLOC_CAP_SPIRAM);
     dspTaskTCB = (StaticTask_t*)heap_caps_aligned_alloc(16, sizeof(StaticTask_t), MALLOC_CAP_SPIRAM);
 
@@ -1288,7 +1294,7 @@ void loop() {
 
             bool charging=(instantVoltage>4.20f); 
             int newPercent=getBatteryPercentage(instantVoltage); 
-            bool stateChanged=(newPercent!=currentBatteryPercent.load(std::memory_order_relaxed))||(charging!=isBatteryCharging.load(std::memory_order_relaxed));
+            bool stateChanged=(newPercent!=currentBatteryPercent.load(std::memory_order_relaxed))||(charging!=isBatteryCharging.load(std::memory_order_relaxed)); 
             currentBatteryVoltage=instantVoltage; 
             currentBatteryPercent.store(newPercent, std::memory_order_relaxed); 
             isBatteryCharging.store(charging, std::memory_order_relaxed); 

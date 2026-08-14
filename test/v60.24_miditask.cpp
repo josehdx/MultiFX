@@ -1,9 +1,8 @@
-// v60.32.cpp
+// Version: v60.24
 #pragma GCC optimize ("O3")
 #include <Arduino.h>
 #include <Control_Surface.h>
 #include <WiFi.h>
-#include <TFT_eSPI.h>
 #include <driver/i2s_std.h>
 #include "driver/gpio.h"
 #include "soc/gpio_reg.h"
@@ -15,13 +14,13 @@
 #include "dsps_biquad.h"
 #include "driver/rtc_io.h"
 #include "esp_bt.h"
-#include "nvs_flash.h"
 #include <math.h>
 #include <atomic>
 #include <Preferences.h>
 #include "esp_private/brownout.h"
 #include "esp_pm.h"
 #include "PedalManager.h"
+#include "nvs_flash.h"
 
 #define ENABLE_PAR_KNOBS false
 
@@ -40,11 +39,6 @@ const bool INVERT_PB3 = false;
 
 std::atomic<bool> dsp_is_paused{false};
 std::atomic<bool> dsp_ack_parked{false};
-std::atomic<bool> forceUIUpdate{true};
-std::atomic<bool> ui_clear_meters_requested{false};
-std::atomic<bool> isScreenOff{false};
-std::atomic<bool> wakeupPending{false};
-std::atomic<bool> isBatteryDead{false};
 std::atomic<float> pitchShiftFactor{1.0f};
 std::atomic<bool> globalAudioResetRequested{false};
 std::atomic<bool> panicResetRequested{false};
@@ -67,18 +61,14 @@ void __attribute__((constructor)) pre_boot_kill_switch() {
 }
 
 void IRAM_ATTR __attribute__((optimize("O3"))) updateLUT(); 
-void DisplayTask(void * pvParameters); 
+void MidiTask(void * pvParameters); 
 void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters); 
 bool channelMessageCallback(ChannelMessage cm); 
 void updateParameterFromCC(uint8_t cc, uint8_t val);
 
 i2s_chan_handle_t tx_chan, rx_chan;
 SemaphoreHandle_t audioBufferMutex = NULL;
-
-// PSRAM Task Stack Migration Definitions
 TaskHandle_t audioTaskHandle = NULL;
-StackType_t* dspTaskStack = nullptr;
-StaticTask_t* dspTaskTCB = nullptr;
 
 #define HOP_SIZE 64
 #define MAX_BUFFER_SIZE 65536
@@ -98,7 +88,7 @@ float hannLUT[HANN_LUT_SIZE] __attribute__((aligned(64)));
 float lfoLUT[LFO_LUT_SIZE] __attribute__((aligned(64)));
 float synthLUT[WAVE_LUT_SIZE] __attribute__((aligned(64)));
 
-std::atomic<float> globalHarmRatio{1.0f}, globalChorusRatio{1.0f}, globalFbRatio{1.0f}, globalVibratoPhaseInc{0.0f};
+volatile float globalHarmRatio=1.0f, globalChorusRatio=1.0f, globalFbRatio=1.0f, globalVibratoPhaseInc=0.0f;
 uint32_t tap_w1_1=0, tap_w1_2=256<<16, tap_w2_1=0, tap_w2_2=256<<16, tap_w3_1=0, tap_w3_2=256<<16, tap_w4_1=0, tap_w4_2=256<<16, tap_w5_1=0, tap_w5_2=256<<16;
 float currentWindowSize = 512.0f;
 int freezeLength = 48000;
@@ -111,8 +101,7 @@ int apf1Idx = 0, apf2Idx = 0;
 std::atomic<int> feedbackIntervalIdx{0}; 
 volatile bool lutNeedsUpdate = false;
 volatile uint16_t lastActivePedal = 8192;
-TFT_eSPI tft = TFT_eSPI();
-TFT_eSprite spr = TFT_eSprite(&tft), meterSpr = TFT_eSprite(&tft);
+
 volatile float effectMemory[10]={12.0f,-12.0f,0.0f,5.0f,-2.0f,-12.0f,-12.0f,12.0f,0.0f,0.0f}; 
 volatile bool isWhammyActive=true, isFrozen=false, isFeedbackActive=false, isHarmonizerMode=false, isSynthMode=false, isPadMode=false, isCapoMode=false, isChorusMode=false, isSwellMode=false, isVibratoMode=false, isVolumeMode=false, isPB2WiperMode=false;
 volatile float chorusLfoPhase=0.0f, feedbackLfoPhase=0.0f, vibratoLfoPhase=0.0f, swellGain=0.0f, volumePedalGain=1.0f, feedbackRamp=0.0f;
@@ -122,8 +111,8 @@ std::atomic<int> latencyMode{0};
 std::atomic<int> activeEffectMode{0};
 std::atomic<int> hardwareSyncMuteFrames{0}; 
 volatile bool sampleRateToggleRequested=false, pb2ToggleRequested=false;
-unsigned long lastActivityTime=0, lastScreenActivityTime=0;
-const unsigned long LIGHT_SLEEP_TIMEOUT=25000, SCREEN_OFF_TIMEOUT=15000;
+unsigned long lastActivityTime=0;
+const unsigned long LIGHT_SLEEP_TIMEOUT=25000;
 std::atomic<float> core1_load{0.0f};
 volatile bool isAdcPaused=false;
 adc_continuous_handle_t multifx_adc_handle = NULL;
@@ -137,8 +126,6 @@ pin_t pinPB=1, pinPB2=2, pinPB3=10, pinPar1=3, pinPar2=11, pinPar3=12, pinPar4=1
 uint16_t lastMidiSent=8192;
 volatile uint16_t currentPB1=8192, currentPB2=8192, currentPB3=8192, currentCC11=0; 
 
-std::atomic<float> ui_audio_level{0.0f};
-std::atomic<float> ui_output_level{0.0f};
 FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar1=pinPar1, filterPar2=pinPar2, filterPar3=pinPar3, filterPar4=pinPar4, filterPar5=pinPar5;
 BluetoothMIDI_Interface btmidi;
 USBMIDI_Interface usbmidi;
@@ -176,7 +163,7 @@ void switchEffectMode(int newMode) {
     activeEffectMode.store((newMode%10+10)%10, std::memory_order_release);
     isWhammyActive=true; isFrozen=false; isFeedbackActive=false; isHarmonizerMode=false; isSynthMode=false; isPadMode=false; isCapoMode=false; isChorusMode=false; isSwellMode=false; isVibratoMode=false;
     if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex);
-    lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis();
+    lutNeedsUpdate=true; settingsNeedSaving=true; lastParameterChangeTime=millis();
 }
 
 void saveSettings() {
@@ -247,7 +234,7 @@ void toggleSampleRate() {
     i2s_std_config_t stdConfig={ 
         .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate.load(std::memory_order_acquire)), 
         .slot_cfg=I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
-        .gpio_cfg={ .mclk=GPIO_NUM_43, .bclk=GPIO_NUM_44, .ws=GPIO_NUM_18, .dout=GPIO_NUM_16, .din=GPIO_NUM_17 } 
+        .gpio_cfg={ .mclk=GPIO_NUM_6, .bclk=GPIO_NUM_7, .ws=GPIO_NUM_18, .dout=GPIO_NUM_16, .din=GPIO_NUM_17 } 
     };
     stdConfig.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384; 
     i2s_channel_init_std_mode(tx_chan, &stdConfig); 
@@ -266,26 +253,10 @@ void toggleSampleRate() {
     
     dsp_is_paused.store(false, std::memory_order_release);
     while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-    pedals.triggerSystemRecovery(); forceUIUpdate.store(true, std::memory_order_release); lastParameterChangeTime = millis();
-}
-
-void turnScreenOff() { 
-    if(!isScreenOff.load(std::memory_order_acquire)) { 
-        REG_WRITE(GPIO_OUT1_W1TC_REG, 1 << (38 - 32));
-        REG_WRITE(GPIO_OUT_W1TC_REG, 1 << 15);
-        isScreenOff.store(true, std::memory_order_release); 
-    } 
-}
-
-void turnScreenOn() { 
-    if(isScreenOff.load(std::memory_order_acquire) && !wakeupPending.load(std::memory_order_acquire)) { 
-        wakeupPending.store(true, std::memory_order_release); 
-    } 
+    pedals.triggerSystemRecovery(); lastParameterChangeTime = millis();
 }
 
 void goToLightSleep() {
-    turnScreenOff(); 
-    
     dsp_is_paused.store(true, std::memory_order_release);
     while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
     
@@ -295,9 +266,6 @@ void goToLightSleep() {
     adc_continuous_stop(multifx_adc_handle);
     
     while ((REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN))) {
-        if (btmidi.isConnected()) {
-            Control_Surface.loop(); // Keep BLE heartbeat alive
-        }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     
@@ -315,8 +283,7 @@ void goToLightSleep() {
     dsp_is_paused.store(false, std::memory_order_release);
     while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
     
-    if (isScreenOff.load(std::memory_order_acquire)) turnScreenOn();
-    pedals.triggerSystemRecovery(); lastActivityTime = millis(); lastScreenActivityTime = millis();
+    pedals.triggerSystemRecovery(); lastActivityTime = millis();
 }
 
 void IRAM_ATTR __attribute__((optimize("O3"))) updateLUT() {
@@ -335,215 +302,11 @@ void IRAM_ATTR __attribute__((optimize("O3"))) updateLUT() {
     }
     std::atomic_thread_fence(std::memory_order_release);
     float* tempPtr=pitchShiftLUT; pitchShiftLUT=pitchShiftLUT_temp; pitchShiftLUT_temp=tempPtr;
-    
-    globalHarmRatio.store(powf(2.0f, harmRatioMem/12.0f), std::memory_order_release); 
-    globalChorusRatio.store(powf(2.0f, chorusRatioMem/12.0f), std::memory_order_release); 
-    float fbIntervals[5]={0.0f,12.0f,19.0f,24.0f,28.0f}; 
-    globalFbRatio.store(powf(2.0f, fbIntervals[constrain(fbIntervalIdxLocal,0,4)]/12.0f), std::memory_order_release);
-    float vibHz=(vibHzMem!=0.0f)?fabsf(vibHzMem):2.0f; 
-    globalVibratoPhaseInc.store((vibHz*LFO_LUT_SIZE)/(float)currentSampleRate.load(std::memory_order_acquire), std::memory_order_release);
+    globalHarmRatio=powf(2.0f, harmRatioMem/12.0f); globalChorusRatio=powf(2.0f, chorusRatioMem/12.0f); 
+    float fbIntervals[5]={0.0f,12.0f,19.0f,24.0f,28.0f}; globalFbRatio=powf(2.0f, fbIntervals[constrain(fbIntervalIdxLocal,0,4)]/12.0f);
+    float vibHz=(vibHzMem!=0.0f)?fabsf(vibHzMem):2.0f; globalVibratoPhaseInc=(vibHz*LFO_LUT_SIZE)/(float)currentSampleRate.load(std::memory_order_acquire);
 }
 
-void updateMeters() {
-    float current_ui_in = ui_audio_level.load(std::memory_order_acquire);
-    float current_ui_out = ui_output_level.load(std::memory_order_acquire);
-    int barHeight=98, inFillHeight=constrain((int)(current_ui_in*barHeight),0,barHeight); 
-    meterSpr.fillSprite(TFT_BLACK); meterSpr.fillRect(0, barHeight-inFillHeight, 6, inFillHeight, (current_ui_in>0.90f)?TFT_RED:TFT_GREEN); meterSpr.pushSprite(11,31);
-    int outFillHeight=constrain((int)(current_ui_out*barHeight),0,barHeight); 
-    meterSpr.fillSprite(TFT_BLACK); meterSpr.fillRect(0, barHeight-outFillHeight, 6, outFillHeight, (current_ui_out>0.90f)?TFT_RED:TFT_GREEN); meterSpr.pushSprite(spr.width()-17, 31);
-}
-
-void drawCircularGauge(TFT_eSprite& sprite, int x, int y, int radius, float value, const char* label, const char* valStr, uint32_t color, int type) {
-    int thickness=3; sprite.drawArc(x, y, radius, radius-thickness, 210, 150, TFT_DARKGREY, TFT_BLACK, true);
-    if(type==1) { float clamped=fmaxf(-1.0f,fminf(1.0f,value)); int sweep=(int)(clamped*150.0f); if(sweep>0) sprite.drawArc(x,y,radius,radius-thickness,0,sweep,color,TFT_BLACK,true); else if(sweep<0) sprite.drawArc(x,y,radius,radius-thickness,360+sweep,360,color,TFT_BLACK,true); }
-    else if(type==2) { float clamped=fmaxf(0.0f,fminf(1.0f,value)); int sweep=(int)(clamped*300.0f); if(sweep>0) { int startAngle=(150-sweep+360)%360; sprite.drawArc(x,y,radius,radius-thickness,startAngle,150,color,TFT_BLACK,true); } }
-    else { float clamped=fmaxf(0.0f,fminf(1.0f,value)); int sweep=(int)(clamped*300.0f); if(sweep>0) { int endAngle=(210+sweep)%360; sprite.drawArc(x,y,radius,radius-thickness,210,endAngle,color,TFT_BLACK,true); } }
-    sprite.setTextDatum(MC_DATUM); sprite.setTextColor(TFT_WHITE, TFT_BLACK); sprite.setTextSize(1); sprite.drawString(valStr,x,y-4); sprite.setTextColor(TFT_LIGHTGREY, TFT_BLACK); sprite.drawString(label,x,y+14);
-}
-
-struct GaugeDef { int type; float normVal; const char* label; char valStr[16]; };
-
-void updateDisplay() {
-    spr.fillSprite(TFT_BLACK); 
-    int renderMode=activeEffectMode.load(std::memory_order_acquire); 
-    
-    // UI Arrays securely copied within Mutex limits
-    float lMem[10];
-    float lPrm[5];
-    int lFbIdx = 0;
-    if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
-    for(int i=0; i<10; i++) lMem[i] = effectMemory[i];
-    for(int i=0; i<5; i++) lPrm[i] = fxParams[renderMode][i];
-    lFbIdx = feedbackIntervalIdx.load(std::memory_order_acquire);
-    if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex);
-
-    char batStr[24];
-    if(isBatteryCharging.load(std::memory_order_relaxed)) { snprintf(batStr, sizeof(batStr), "CHG %.2fV %d%%", currentBatteryVoltage, currentBatteryPercent.load(std::memory_order_relaxed)); spr.setTextColor(TFT_GREEN, TFT_BLACK); }
-    else { snprintf(batStr, sizeof(batStr), "%.2fV %d%%", currentBatteryVoltage, currentBatteryPercent.load(std::memory_order_relaxed)); spr.setTextColor((currentBatteryPercent.load(std::memory_order_relaxed)>20)?TFT_GREEN:TFT_RED, TFT_BLACK); }
-    spr.setTextDatum(TL_DATUM); spr.setTextSize(1); spr.drawString(batStr, 5, 2); spr.setTextDatum(TR_DATUM);
-    if(btmidi.isConnected()) { spr.setTextColor(TFT_GREEN, TFT_BLACK); spr.drawString("BT: CONN", 315, 2); } 
-    else { spr.setTextColor(TFT_YELLOW, TFT_BLACK); spr.drawString("BT: WAIT", 315, 2); }
-    const char* effectTitleNames[]={"WHAMMY","FREEZE","FEEDBACK","HARMONY","CAPO","SYNTH","PAD","CHORUS","SWELL","VIBRATO"};
-    uint32_t effectTitleColors[]={TFT_ORANGE,TFT_CYAN,TFT_RED,TFT_MAGENTA,TFT_GREEN,TFT_YELLOW,TFT_PINK,TFT_SKYBLUE,TFT_WHITE,TFT_PURPLE};
-    spr.setTextDatum(MC_DATUM); spr.setTextSize(2); spr.setTextColor(effectTitleColors[renderMode], TFT_BLACK); spr.drawString(effectTitleNames[renderMode], 160, 15);
-    bool effectIsActive=false;
-    if(renderMode==0) effectIsActive=isWhammyActive; else if(renderMode==1) effectIsActive=(isWhammyActive||isFrozen); 
-    else if(renderMode==2) effectIsActive=(isWhammyActive||isFeedbackActive); else if(renderMode==3) effectIsActive=(isWhammyActive||isHarmonizerMode); 
-    else if(renderMode==4) effectIsActive=(isWhammyActive||isCapoMode); else if(renderMode==5) effectIsActive=(isWhammyActive||isSynthMode); 
-    else if(renderMode==6) effectIsActive=(isWhammyActive||isPadMode); else if(renderMode==7) effectIsActive=(isWhammyActive||isChorusMode); 
-    else if(renderMode==8) effectIsActive=(isWhammyActive||isSwellMode); else if(renderMode==9) effectIsActive=(isWhammyActive||isVibratoMode);
-    spr.fillCircle(240, 15, 6, effectIsActive?TFT_GREEN:TFT_RED); spr.drawCircle(240, 15, 6, TFT_WHITE); spr.drawRect(10, 30, 8, 100, TFT_DARKGREY); 
-    spr.setTextColor(TFT_WHITE, TFT_BLACK); spr.setTextSize(1); spr.drawString("IN", 14, 140); spr.drawRect(spr.width()-18, 30, 8, 100, TFT_DARKGREY); spr.drawString("OUT", spr.width()-14, 140);
-    int topY=55, topR=17; char valBuf[16]; 
-    float pb1Val=(currentPB1-8192)/8192.0f; snprintf(valBuf,sizeof(valBuf),"%d%%",(int)(pb1Val*100)); drawCircularGauge(spr,65,topY,topR,pb1Val,"PB1",valBuf,TFT_CYAN,1);
-    float pb2Val=(currentPB2-8192)/8192.0f; snprintf(valBuf,sizeof(valBuf),"%d%%",(int)(pb2Val*100)); drawCircularGauge(spr,125,topY,topR,pb2Val,isPB2WiperMode?"PB2 W":"PB2 H",valBuf,TFT_MAGENTA,1);
-    float pb3Val=currentPB3/16383.0f; snprintf(valBuf,sizeof(valBuf),"%d%%",(int)(pb3Val*100)); drawCircularGauge(spr,185,topY,topR,pb3Val,isVolumeMode?"VOL":"PB3",valBuf,TFT_YELLOW,0);
-    float cc11Val=currentCC11/16383.0f; snprintf(valBuf,sizeof(valBuf),"%d%%",(int)(cc11Val*100)); drawCircularGauge(spr,245,topY,topR,cc11Val,"CC11",valBuf,TFT_GREEN,0);
-    GaugeDef bGauges[6]; int numG=0;
-    if(renderMode==0||renderMode==1||renderMode==8) { 
-        bGauges[numG++]={1,lMem[1]/24.0f,"HEEL",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",lMem[1]); 
-        bGauges[numG++]={1,lMem[0]/24.0f,"TOE",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",lMem[0]); 
-    }
-    else if(renderMode==2) { 
-        float fbi[]={0.0f,12.0f,19.0f,24.0f,28.0f}; float val=fbi[constrain(lFbIdx,0,4)]; 
-        bGauges[numG++]={2,val/28.0f,"OVT",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",val); 
-    }
-    else if(renderMode==4) { 
-        int semi=(int)roundf(lMem[4]), cents=(int)roundf((lMem[4]-(float)semi)*100.0f); 
-        bGauges[numG++]={1,semi/24.0f,"SEMI",""}; snprintf(bGauges[numG-1].valStr,16,"%+d",semi); 
-        bGauges[numG++]={1,cents/50.0f,"CENT",""}; snprintf(bGauges[numG-1].valStr,16,"%+d",cents); 
-        bGauges[numG++]={1,lMem[1]/24.0f,"HEEL",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",lMem[1]); 
-        bGauges[numG++]={1,lMem[0]/24.0f,"TOE",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",lMem[0]); 
-    }
-    else { 
-        float val=lMem[renderMode]; 
-        if(renderMode==3) { bGauges[numG++]={1,val/24.0f,"INT",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",val); } 
-        else if(renderMode==5) { bGauges[numG++]={1,val/24.0f,"OSC",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",val); } 
-        else if(renderMode==6) { bGauges[numG++]={1,val/24.0f,"SHFT",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",val); } 
-        else if(renderMode==7) { bGauges[numG++]={1,val/24.0f,"SHFT",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",val); } 
-        else if(renderMode==9) { bGauges[numG++]={1,val/24.0f,"BASE",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",val); } 
-    }
-    if(renderMode==0) { 
-        bGauges[numG++]={2,lPrm[0],"D.MIX",""}; snprintf(bGauges[numG-1].valStr,16,"%.1f",lPrm[0]); 
-        bGauges[numG++]={2,lPrm[1],"W.MIX",""}; snprintf(bGauges[numG-1].valStr,16,"%.1f",lPrm[1]); 
-    }
-    else if(renderMode==1) { 
-        bGauges[numG++]={2,lPrm[0]/0.95f,"RVB",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[0]); 
-        bGauges[numG++]={2,(lPrm[1]-0.00001f)/0.001f,"ATK",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[1]*1000.0f); 
-        bGauges[numG++]={2,(lPrm[2]-0.00001f)/0.0005f,"REL",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[2]*1000.0f); 
-    }
-    else if(renderMode==2) { 
-        bGauges[numG++]={2,(lPrm[0]-1000.0f)/10000.0f,"SPD",""}; snprintf(bGauges[numG-1].valStr,16,"%.0f",lPrm[0]); 
-        bGauges[numG++]={2,(lPrm[1]-1.0f)/100.0f,"DRV",""}; snprintf(bGauges[numG-1].valStr,16,"%.1f",lPrm[1]); 
-        bGauges[numG++]={2,(lPrm[2]-0.005f)/0.045f,"DLY",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[2]); 
-    }
-    else if(renderMode==3) { bGauges[numG++]={2,lPrm[0],"MIX",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[0]); }
-    else if(renderMode==5) { 
-        bGauges[numG++]={2,(lPrm[0]-0.01f)/0.5f,"ATK",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[0]); 
-        bGauges[numG++]={2,(lPrm[1]-0.001f)/0.05f,"REL",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[1]); 
-        bGauges[numG++]={2,(lPrm[2]-0.1f)/0.8f,"FLT",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[2]); 
-        bGauges[numG++]={2,lPrm[3],"MIX",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[3]); 
-    }
-    else if(renderMode==6) { 
-        bGauges[numG++]={2,(lPrm[0]-0.8f)/0.199f,"TON",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[0]); 
-        bGauges[numG++]={2,lPrm[1]/3.0f,"MIX",""}; snprintf(bGauges[numG-1].valStr,16,"%.1f",lPrm[1]); 
-    }
-    else if(renderMode==7) { 
-        bGauges[numG++]={2,(lPrm[0]-500.0f)/4500.0f,"SPD",""}; snprintf(bGauges[numG-1].valStr,16,"%.0f",lPrm[0]); 
-        bGauges[numG++]={2,lPrm[1],"MIX",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[1]); 
-    }
-    else if(renderMode==8) { 
-        bGauges[numG++]={2,(lPrm[0]-0.001f)/0.05f,"THR",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[0]); 
-        bGauges[numG++]={2,(lPrm[1]-0.00001f)/0.0005f,"ATK",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[1]*1000.0f); 
-        bGauges[numG++]={2,(lPrm[2]-0.00001f)/0.0005f,"REL",""}; snprintf(bGauges[numG-1].valStr,16,"%.2f",lPrm[2]*1000.0f); 
-    }
-    else if(renderMode==9) { bGauges[numG++]={2,lPrm[0]/2.0f,"DEP",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",lPrm[0]); }
-    
-    int bY=115, bR=17; uint32_t actCol=effectTitleColors[renderMode]; 
-    for(int i=0; i<numG; i++) { 
-        int xPos=160-((numG-1)*26)+(i*52); 
-        drawCircularGauge(spr,xPos,bY,bR,bGauges[i].normVal,bGauges[i].label,bGauges[i].valStr,actCol,bGauges[i].type); 
-    }
-    
-    spr.setTextDatum(ML_DATUM); spr.setTextSize(1); int bannerX=25; 
-    auto drawBanner=[&](const char* lbl, uint32_t col){ spr.setTextColor(col,TFT_BLACK); spr.drawString(lbl,bannerX,150); bannerX+=28; };
-    if(isFrozen && renderMode!=1) drawBanner("FRZ",TFT_CYAN); if(isFeedbackActive && renderMode!=2) drawBanner("SCM",TFT_RED); 
-    if(isHarmonizerMode && renderMode!=3) drawBanner("HRM",TFT_MAGENTA); if(isCapoMode && renderMode!=4) drawBanner("CAP",TFT_GREEN); 
-    if(isSynthMode && renderMode!=5) drawBanner("SYN",TFT_YELLOW); if(isPadMode && renderMode!=6) drawBanner("PAD",TFT_PINK); 
-    if(isChorusMode && renderMode!=7) drawBanner("CHO",TFT_SKYBLUE); if(isSwellMode && renderMode!=8) drawBanner("SWL",TFT_WHITE); 
-    if(isVibratoMode && renderMode!=9) drawBanner("VIB",TFT_PURPLE); if(isVolumeMode) drawBanner("VOL",TFT_DARKGREY);
-    
-    int statsRowY=162; spr.setTextColor(TFT_LIGHTGREY, TFT_BLACK); spr.setTextDatum(ML_DATUM);
-    char cpuUsageBuffer[16]; snprintf(cpuUsageBuffer,16,"CPU:%2d%%",(int)core1_load.load(std::memory_order_relaxed)); spr.drawString(cpuUsageBuffer,25,statsRowY); 
-    char internalSramBuffer[16]; snprintf(internalSramBuffer,16,"SRM:%dK",(int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)/1024)); spr.drawString(internalSramBuffer,85,statsRowY); 
-    char psramBuffer[16]; snprintf(psramBuffer,16,"PSR:%dK",(int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024)); spr.drawString(psramBuffer,150,statsRowY);
-    spr.setTextDatum(MC_DATUM); spr.setTextColor(TFT_WHITE); spr.drawRect(210,statsRowY-7,40,14,TFT_DARKGREY); 
-    spr.drawString((currentSampleRate.load(std::memory_order_acquire)==96000)?"96k":"48k",230,statsRowY); spr.drawRect(255,statsRowY-7,40,14,TFT_DARKGREY); 
-    const char* latencyLabelStrings[]={"U.Low","Low","Mid","High"}; spr.drawString(latencyLabelStrings[latencyMode.load(std::memory_order_acquire)],275,statsRowY);
-    
-    tft.startWrite();
-    spr.pushSprite(0,0); 
-    tft.dmaWait();
-    tft.endWrite();
-    updateMeters();
-}
-
-void DisplayTask(void * pvParameters) {
-    tft.initDMA();
-    bool metersNeedClear=false;
-    for(;;) {
-        if(__builtin_expect(isBatteryDead.load(std::memory_order_acquire), 0)) {
-            tft.dmaWait();
-            tft.fillScreen(TFT_BLACK);
-            tft.setTextDatum(MC_DATUM);
-            tft.setTextSize(3);
-            tft.setTextColor(TFT_RED, TFT_BLACK);
-            tft.drawString("BATTERY DEAD", 160, 85);
-            tft.setTextColor(TFT_WHITE, TFT_BLACK);
-            tft.setTextSize(2);
-            tft.drawString("PLEASE CHARGE", 160, 115);
-            vTaskDelay(portMAX_DELAY);
-        }
-
-        if(__builtin_expect(wakeupPending.load(std::memory_order_acquire), 0)) {
-             REG_WRITE(GPIO_OUT_W1TS_REG, 1 << 15);
-             tft.writecommand(0x11);
-             vTaskDelay(pdMS_TO_TICKS(150)); 
-             tft.init(); 
-             tft.setRotation(1);
-             REG_WRITE(GPIO_OUT1_W1TS_REG, 1 << (38 - 32));
-             isScreenOff.store(false, std::memory_order_release);
-             wakeupPending.store(false, std::memory_order_release);
-             forceUIUpdate.store(true, std::memory_order_release);
-         }
-        if(__builtin_expect(forceUIUpdate.exchange(false, std::memory_order_acq_rel) && !isScreenOff.load(std::memory_order_acquire), 1)) {
-             updateDisplay(); metersNeedClear=true;
-         }
-        else if(__builtin_expect(!isScreenOff.load(std::memory_order_acquire), 1)) {
-             if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
-                if(metersNeedClear) {
-                    ui_audio_level.store(0.0f, std::memory_order_release);
-                    ui_output_level.store(0.0f, std::memory_order_release);
-                    updateMeters(); metersNeedClear = false;
-                }
-            } else {
-                float current_ui_in = ui_audio_level.load(std::memory_order_acquire);
-                float current_ui_out = ui_output_level.load(std::memory_order_acquire);
-                if(__builtin_expect(current_ui_in > 0.02f || current_ui_out > 0.02f, 1)) {
-                     updateMeters();
-                     metersNeedClear=true;
-                 } else if(__builtin_expect(metersNeedClear, 0)) {
-                     ui_clear_meters_requested.store(true, std::memory_order_release);
-                    updateMeters();
-                     metersNeedClear=false;
-                 }
-             }
-        }
-        vTaskDelay(pdMS_TO_TICKS(33));
-    }
-}
-
-// Global AntiDenormal definition
 inline float IRAM_ATTR __attribute__((always_inline)) __attribute__((optimize("O3"))) AntiDenormal(float value) {
     union { float f; uint32_t i; } u = { .f = value };
     if (__builtin_expect((u.i & 0x7F800000) == 0, 0)) return 0.0f;
@@ -573,7 +336,7 @@ inline float IRAM_ATTR __attribute__((hot)) __attribute__((always_inline)) __att
     float sample = __builtin_fmaf(__builtin_fmaf(__builtin_fmaf(c3, frac, c2), frac, c1), frac, y1); 
     
     int lutIdx = ((uint32_t)(T * hannIntMult) >> 16) & 1023; 
-    return AntiDenormal(sample * hannLUT[lutIdx]);
+    return sample * hannLUT[lutIdx];
 }
 
 void IRAM_ATTR __attribute__((optimize("O3"))) DSP_ProcessInput(
@@ -640,8 +403,7 @@ void IRAM_ATTR __attribute__((optimize("O3"))) DSP_MixdownAndOutput(
     float g_pad, float g_frz, float g_fb,
     float* padFilterBuf, float* dryBuf, float* w1Buf, float* w2Buf,
     float* w3Buf, float* fzOutBuf, float* fbOutBuf, float* sMixBuf,
-    float* masterGainBuf, float* inBuf, int32_t* i2s_out_block,
-    float& peakInputVal, float& peakOutputVal) {
+    float* masterGainBuf, float* inBuf, int32_t* i2s_out_block) {
     
     #pragma GCC ivdep
     #pragma GCC unroll 4
@@ -673,19 +435,9 @@ void IRAM_ATTR __attribute__((optimize("O3"))) DSP_MixdownAndOutput(
     }
     dsps_mul_f32(sMixBuf, masterGainBuf, sMixBuf, framesRead, 1, 1, 1);
     
-    float localPeakIn = peakInputVal;
-    float localPeakOut = peakOutputVal;
-    
     #pragma GCC unroll 4
     for(int i = 0; i < framesRead; i++) {
-        float b_in = inBuf[i];
         float b_mix = sMixBuf[i];
-        
-        float abs_in = fabsf(b_in);
-        float abs_out = fabsf(b_mix);
-        
-        if(__builtin_expect(abs_in > localPeakIn, 0)) localPeakIn = abs_in;
-        if(__builtin_expect(abs_out > localPeakOut, 0)) localPeakOut = abs_out;
         
         float clamped_mix = __builtin_fmaxf(-0.999f, __builtin_fminf(b_mix, 0.999f));
         int32_t finalOut = (int32_t)(clamped_mix * 2147483520.0f);
@@ -694,9 +446,6 @@ void IRAM_ATTR __attribute__((optimize("O3"))) DSP_MixdownAndOutput(
         i2s_out_block[i * 2] = finalOut;
         i2s_out_block[i * 2 + 1] = finalOut;
     }
-    
-    peakInputVal = localPeakIn;
-    peakOutputVal = localPeakOut;
 }
 
 void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters) {
@@ -714,7 +463,7 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
         }
         
         size_t bytesRead; 
-        i2s_channel_read(rx_chan, i2s_in_block, HOP_SIZE*2*sizeof(int32_t), &bytesRead, pdMS_TO_TICKS(10));
+        i2s_channel_read(rx_chan, i2s_in_block, HOP_SIZE*2*sizeof(int32_t), &bytesRead, portMAX_DELAY);
         
         if(__builtin_expect(bytesRead>0, 1)) {
             int framesRead=bytesRead/8;
@@ -725,7 +474,7 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                     panicResetRequested.store(false, std::memory_order_release);
                 }
                 if(__builtin_expect(globalAudioResetRequested.load(std::memory_order_acquire), 0)) {
-                    synthEnv=0.0f; synthFilter=0.0f; padFilter=0.0f; padEnv=0.0f; inputEnvelope=0.0f; feedbackFilterVar=0.0f; smoothedVolGain=volumePedalGain; currentPitch=1.0f; freezeWriteIdxVar=0; freezePlayCounterVar=0; freezeStartIdxVar=0; activeFreezeLength=currentSampleRate.load(std::memory_order_acquire); fbDelayWriteIdx=0; writeIndex=0; apfNeedsClear=true; input_dc_offset=0.0f; ui_audio_level.store(0.0f, std::memory_order_release); ui_output_level.store(0.0f, std::memory_order_release); freezeRamp=0.0f; feedbackRamp=0.0f; vibratoLfoPhase=0.0f; chorusLfoPhase=0.0f; feedbackLfoPhase=0.0f;
+                    synthEnv=0.0f; synthFilter=0.0f; padFilter=0.0f; padEnv=0.0f; inputEnvelope=0.0f; feedbackFilterVar=0.0f; smoothedVolGain=volumePedalGain; currentPitch=1.0f; freezeWriteIdxVar=0; freezePlayCounterVar=0; freezeStartIdxVar=0; activeFreezeLength=currentSampleRate.load(std::memory_order_acquire); fbDelayWriteIdx=0; writeIndex=0; apfNeedsClear=true; input_dc_offset=0.0f; freezeRamp=0.0f; feedbackRamp=0.0f; vibratoLfoPhase=0.0f; chorusLfoPhase=0.0f; feedbackLfoPhase=0.0f;
                     uint32_t halfWinFixed=((uint32_t)currentWindowSize/2)<<16; tap_w1_1=0; tap_w1_2=halfWinFixed; tap_w2_1=0; tap_w2_2=halfWinFixed; tap_w3_1=0; tap_w3_2=halfWinFixed; tap_w4_1=0; tap_w4_2=halfWinFixed; tap_w5_1=0; tap_w5_2=halfWinFixed;
                     globalAudioResetRequested.store(false, std::memory_order_release); smoothed_delay_samples=0.0f; 
                     int targetMute = (currentSampleRate.load(std::memory_order_acquire)/HOP_SIZE)*0.40f;
@@ -736,7 +485,6 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                 if(__builtin_expect(currentMute > 0, 0)) {
                      hardwareSyncMuteFrames.store(currentMute - 1, std::memory_order_release);
                      memset(i2s_out_block,0,framesRead*2*sizeof(int32_t));
-                     ui_audio_level.store(0.0f, std::memory_order_release); ui_output_level.store(0.0f, std::memory_order_release);
                      for(int i=0; i<framesRead; i++) {
                          int32_t clean_sample=i2s_in_block[i*2]&0xFFFFFF00;
                          float raw_in=((float)clean_sample*normFactor);
@@ -768,14 +516,9 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                 if(__builtin_expect(frzActive && !wasFrozen, 0)) { freezePlayCounterVar=0; int bestStart=freezeWriteIdxVar, tempIdx=freezeWriteIdxVar; for(int s=0; s<4000; s++) { int prev=tempIdx-1; if(prev<0) prev+=freezeLength; if(freezeBuffer[tempIdx]>=0 && freezeBuffer[prev]<0) { bestStart=tempIdx; break; } tempIdx=prev; } freezeStartIdxVar=bestStart; activeFreezeLength=freezeLength; int searchEnd=bestStart-1; if(searchEnd<0) searchEnd+=freezeLength; tempIdx=searchEnd; for(int s=0; s<4000; s++) { int prev=tempIdx-1; if(prev<0) prev+=freezeLength; if(freezeBuffer[tempIdx]>=0 && freezeBuffer[prev]<0) { activeFreezeLength=s; break; } tempIdx=prev; } if(activeFreezeLength<64) activeFreezeLength=freezeLength; }
                 if(__builtin_expect(!frzActive && wasFrozen, 0)) apfNeedsClear=true; wasFrozen=frzActive; float activeInvFreqLength=1.0f/(float)activeFreezeLength; bool synthActive=((c_act==5&&c_w)||c_sy), padActive=((c_act==6&&c_w)||c_pd), harmActive=((c_act==3&&c_w)||c_hr), swellActive=((c_act==8&&c_w)||c_sw), chorusActive=((c_act==7&&c_w)||c_ch), feedbackActive=((c_act==2&&c_w)||c_fb);
                 if(__builtin_expect(feedbackActive && !wasFeedbackActive, 0)) { fbOutNode=0.0f; fbHpfState=0.0f; feedbackFilterVar=0.0f; } wasFeedbackActive=feedbackActive; bool vibratoActive=((c_act==9&&c_w)||c_vb), capoActive=((c_act==4&&c_w)||c_cp);
-                float peakInputVal=0.0f, peakOutputVal=0.0f, localSwellGain=swellGain, localVolGain=c_vg, localFrzRamp=freezeRamp, localFbRamp=feedbackRamp, pdSmCoeff=powf(p_pd_sm, srScale), target_delay=constrain((float)(currentSampleRate.load(std::memory_order_acquire)*p_fb_off), 0.0f, (float)(FB_BUFFER_SIZE-1)); smoothed_delay_samples+= (target_delay-smoothed_delay_samples)*0.01f*srScale+DC_OFFSET; int delaySamples=(int)smoothed_delay_samples; float fbHpfCoeff=(currentSampleRate.load(std::memory_order_acquire)==96000)?0.025f:0.05f, fbLpfCoeff=(currentSampleRate.load(std::memory_order_acquire)==96000)?0.05f:0.1f, fbLpfRetain=1.0f-fbLpfCoeff, dc_alpha=(currentSampleRate.load(std::memory_order_acquire)==96000)?0.0005f:0.001f; int halfWindow=(int)currentWindowSize/2; bool activeGroup=c_w||harmActive||chorusActive||feedbackActive||synthActive||padActive||frzActive||vibratoActive||capoActive, dryGroup=chorusActive||padActive||frzActive||feedbackActive||(localFrzRamp>0.0f)||(localFbRamp>0.0f), repeatGroup=capoActive||synthActive||vibratoActive||padActive||harmActive;
-                float g_base=0.0f; if(dryGroup) { if(!repeatGroup) g_base=0.4f; } else if(harmActive) g_base=0.5f; else g_base=1.0f; float g_w2=harmActive?p_hr_mix:0.0f, g_w3=chorusActive?p_ch_mix:0.0f; bool padIsAudible=padActive||(fabsf(padFilter)>0.001f); float g_pad=padIsAudible?p_pd_mix:0.0f, g_frz=(!frzActive&&localFrzRamp>0.0f)?0.5f:0.0f, g_fb=(feedbackActive||localFbRamp>0.0f)?0.6f:0.0f, g_whammy=c_w?p_w_wet:0.0f, g_dry=c_w?p_w_dry:1.0f, vol_alpha=0.01f*srScale, meter_decay=(currentSampleRate.load(std::memory_order_acquire)==96000)?0.999f:0.998f, envRetain=powf(0.99f,srScale), envAttack=1.0f-envRetain;
+                float localSwellGain=swellGain, localVolGain=c_vg, localFrzRamp=freezeRamp, localFbRamp=feedbackRamp, pdSmCoeff=powf(p_pd_sm, srScale), target_delay=constrain((float)(currentSampleRate.load(std::memory_order_acquire)*p_fb_off), 0.0f, (float)(FB_BUFFER_SIZE-1)); smoothed_delay_samples+= (target_delay-smoothed_delay_samples)*0.01f*srScale+DC_OFFSET; int delaySamples=(int)smoothed_delay_samples; float fbHpfCoeff=(currentSampleRate.load(std::memory_order_acquire)==96000)?0.025f:0.05f, fbLpfCoeff=(currentSampleRate.load(std::memory_order_acquire)==96000)?0.05f:0.1f, fbLpfRetain=1.0f-fbLpfCoeff, dc_alpha=(currentSampleRate.load(std::memory_order_acquire)==96000)?0.0005f:0.001f; int halfWindow=(int)currentWindowSize/2; bool activeGroup=c_w||harmActive||chorusActive||feedbackActive||synthActive||padActive||frzActive||vibratoActive||capoActive, dryGroup=chorusActive||padActive||frzActive||feedbackActive||(localFrzRamp>0.0f)||(localFbRamp>0.0f), repeatGroup=capoActive||synthActive||vibratoActive||padActive||harmActive;
+                float g_base=0.0f; if(dryGroup) { if(!repeatGroup) g_base=0.4f; } else if(harmActive) g_base=0.5f; else g_base=1.0f; float g_w2=harmActive?p_hr_mix:0.0f, g_w3=chorusActive?p_ch_mix:0.0f; bool padIsAudible=padActive||(fabsf(padFilter)>0.001f); float g_pad=padIsAudible?p_pd_mix:0.0f, g_frz=(!frzActive&&localFrzRamp>0.0f)?0.5f:0.0f, g_fb=(feedbackActive||localFbRamp>0.0f)?0.6f:0.0f, g_whammy=c_w?p_w_wet:0.0f, g_dry=c_w?p_w_dry:1.0f, vol_alpha=0.01f*srScale, envRetain=powf(0.99f,srScale), envAttack=1.0f-envRetain;
                 if(__builtin_expect(isnan(synthFilter)||isinf(synthFilter), 0)) synthFilter=0.0f; if(__builtin_expect(isnan(padFilter)||isinf(padFilter), 0)) padFilter=0.0f; if(__builtin_expect(isnan(feedbackFilterVar)||isinf(feedbackFilterVar), 0)) feedbackFilterVar=0.0f; if(__builtin_expect(isnan(fbHpfState)||isinf(fbHpfState), 0)) fbHpfState=0.0f; float localVibPhase=vibratoLfoPhase, localChoPhase=chorusLfoPhase, localFbPhase=feedbackLfoPhase, localFbHpf=fbHpfState; int prefetchIdxW1=(writeIndex-halfWindow+MAX_BUFFER_SIZE)&BUFFER_MASK, prefetchIdxFB=(fbDelayWriteIdx-delaySamples+FB_BUFFER_SIZE)&FB_BUFFER_MASK; 
-                
-                int aheadW1 = (prefetchIdxW1 + 32) & BUFFER_MASK; 
-                __builtin_prefetch(&delayBuffer[aheadW1], 0, 3);
-                int aheadFB = (prefetchIdxFB + 32) & FB_BUFFER_MASK; 
-                __builtin_prefetch(&fbDelayBuffer[aheadFB], 0, 3);
                 
                 DSP_ProcessInput(
                     framesRead, i2s_in_block, normFactor, dc_alpha, envRetain, envAttack, 
@@ -783,6 +526,7 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                     input_dc_offset, inputEnvelope, localSwellGain, smoothedVolGain, 
                     currentPitch, targetPitch, envBuf, masterGainBuf, inBuf, fzOutBuf
                 );
+                
                 if(__builtin_expect(synthActive, 0)) for(int i=0; i<framesRead; i++) { synthEnv=(envBuf[i]>0.005f)?__builtin_fminf(1.0f,__builtin_fmaf(p_sy_att, srScale, synthEnv)):__builtin_fmaxf(0.0f,__builtin_fmaf(-p_sy_rel, srScale, synthEnv)); float clampedProc=__builtin_fmaxf(-1.0f,__builtin_fminf(inBuf[i],1.0f)); int waveIdx=(int)((clampedProc+1.0f)*1023.5f); float procSample=synthLUT[waveIdx]; float fltCoeff=__builtin_fmaxf(0.001f,__builtin_fminf(0.99f,__builtin_fmaf(0.6f*synthEnv, srScale, p_sy_flt*srScale))); synthFilter=__builtin_fmaf(fltCoeff, (procSample-synthFilter), synthFilter+DC_OFFSET); inBuf[i]=synthFilter*p_sy_mix; }
                 if(__builtin_expect(padActive, 0)) for(int i=0; i<framesRead; i++) { padEnv=(envBuf[i]>0.005f)?__builtin_fminf(1.0f,__builtin_fmaf(0.00002f, srScale, padEnv)):__builtin_fmaxf(0.0f,__builtin_fmaf(-0.000005f, srScale, padEnv)); inBuf[i]*=padEnv; }
                 
@@ -808,13 +552,13 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                     } else if(__builtin_expect(apfNeedsClear, 0)) { memset(apf1Buffer,0,sizeof(apf1Buffer)); memset(apf2Buffer,0,sizeof(apf2Buffer)); apf1Idx=0; apf2Idx=0; apfNeedsClear=false; }
                     
                     float delayIn=(localFrzRamp>0.0f)?__builtin_fmaf(procSample, (1.0f-localFrzRamp), fzOutBuf[i]):procSample; delayBuffer[writeIndex]=(int16_t)(__builtin_fmaxf(-1.0f,__builtin_fminf(delayIn,1.0f))*32767.0f);
-                    float spd1=currentPitch; if(__builtin_expect(vibratoActive, 0)) { localVibPhase+=globalVibratoPhaseInc.load(std::memory_order_acquire); if(localVibPhase>=LFO_LUT_SIZE) localVibPhase-=LFO_LUT_SIZE; spd1*=1.0f+((lfoLUT[(int)localVibPhase&1023]-1.0f)*p_vb_dep); }
-                    float spd2=currentPitch*globalHarmRatio.load(std::memory_order_acquire), spd3=currentPitch*globalChorusRatio.load(std::memory_order_acquire); if(__builtin_expect(chorusActive, 0)) { localChoPhase+=chorusPhaseIncr; if(localChoPhase>=LFO_LUT_SIZE) localChoPhase-=LFO_LUT_SIZE; spd3*=lfoLUT[(int)localChoPhase&1023]; } float spd4=1.0f, spd5=1.0f;
+                    float spd1=currentPitch; if(__builtin_expect(vibratoActive, 0)) { localVibPhase+=globalVibratoPhaseInc; if(localVibPhase>=LFO_LUT_SIZE) localVibPhase-=LFO_LUT_SIZE; spd1*=1.0f+((lfoLUT[(int)localVibPhase&1023]-1.0f)*p_vb_dep); }
+                    float spd2=currentPitch*globalHarmRatio, spd3=currentPitch*globalChorusRatio; if(__builtin_expect(chorusActive, 0)) { localChoPhase+=chorusPhaseIncr; if(localChoPhase>=LFO_LUT_SIZE) localChoPhase-=LFO_LUT_SIZE; spd3*=lfoLUT[(int)localChoPhase&1023]; } float spd4=1.0f, spd5=1.0f;
                     
                     if(__builtin_expect(feedbackActive||localFbRamp>0.0f, 0)) {
-                        localFbPhase+=feedbackPhaseIncr; if(localFbPhase>=LFO_LUT_SIZE) localFbPhase-=LFO_LUT_SIZE; float lfoVal=lfoLUT[(int)localFbPhase&1023]; spd4=lfoVal; spd5=currentPitch*globalFbRatio.load(std::memory_order_acquire)*lfoVal;
+                        localFbPhase+=feedbackPhaseIncr; if(localFbPhase>=LFO_LUT_SIZE) localFbPhase-=LFO_LUT_SIZE; float lfoVal=lfoLUT[(int)localFbPhase&1023]; spd4=lfoVal; spd5=currentPitch*globalFbRatio*lfoVal;
                         float w4=processTap(tap_w4_1,delayBuffer,writeIndex,windowMask,hannIntMult)+processTap(tap_w4_2,delayBuffer,writeIndex,windowMask,hannIntMult), w5=processTap(tap_w5_1,delayBuffer,writeIndex,windowMask,hannIntMult)+processTap(tap_w5_2,delayBuffer,writeIndex,windowMask,hannIntMult);
-                        if(feedbackActive) localFbRamp=(envBuf[i]>0.005f)?__builtin_fminf(1.0f,__builtin_fmaf(0.000011f, srScale, localFbRamp)):__builtin_fmaxf(0.0f,__builtin_fmaf(-0.0005f, srScale, localFbRamp)); else localFbRamp=__builtin_fmaxf(0.0f,__builtin_fmaf(-0.0001f, srScale, localFbRamp));
+                        if(feedbackActive) localFbRamp=(envBuf[i]>0.005f)?__builtin_fminf(1.0f,__builtin_fmaf(0.000011f, srScale, localFbRamp)):__builtin_fmaxf(0.0f,__builtin_fmaf(-0.005f, srScale, localFbRamp)); else localFbRamp=__builtin_fmaxf(0.0f,__builtin_fmaf(-0.0001f, srScale, localFbRamp));
                         float mixV=__builtin_fmaxf(0.0f,__builtin_fminf((localFbRamp-0.1f)*2.0f,1.0f)), feedInput=(frzActive&&localFrzRamp>0.0f)?fzOutBuf[i]:__builtin_fmaf(w4, (1.0f-mixV), __builtin_fmaf(w5, mixV, fbOutNode*0.95f)); 
                         localFbHpf+=__builtin_fmaf(fbHpfCoeff, (feedInput-localFbHpf), DC_OFFSET); 
                         float rawDrive=(feedInput-localFbHpf)*p_fb_drv, boundedDrive=__builtin_fmaxf(-1.5f,__builtin_fminf(rawDrive,1.5f)), gainDrive=boundedDrive*(1.0f-(0.15f*boundedDrive*boundedDrive)); feedbackFilterVar=__builtin_fmaf(gainDrive, fbLpfCoeff, __builtin_fmaf(feedbackFilterVar, fbLpfRetain, DC_OFFSET)); float satFb=feedbackFilterVar*(localFbRamp*localFbRamp*localFbRamp)*0.85f; fbDelayBuffer[fbDelayWriteIdx]=(int16_t)(__builtin_fmaxf(-1.0f,__builtin_fminf(satFb,1.0f))*32767.0f);
@@ -832,31 +576,9 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                     framesRead, activeGroup, localFrzRamp, localFbRamp,
                     g_whammy, g_dry, g_base, g_w2, g_w3, g_pad, g_frz, g_fb,
                     padFilterBuf, dryBuf, w1Buf, w2Buf, w3Buf, fzOutBuf, fbOutBuf,
-                    sMixBuf, masterGainBuf, inBuf, i2s_out_block, 
-                    peakInputVal, peakOutputVal
+                    sMixBuf, masterGainBuf, inBuf, i2s_out_block
                 );
                 swellGain=localSwellGain; freezeRamp=localFrzRamp; feedbackRamp=localFbRamp;
-                
-                if (__builtin_expect(ui_clear_meters_requested.load(std::memory_order_acquire), 0)) {
-                    ui_audio_level.store(0.0f, std::memory_order_release);
-                    ui_output_level.store(0.0f, std::memory_order_release);
-                    ui_clear_meters_requested.store(false, std::memory_order_release);
-                } else {
-                    float current_in = ui_audio_level.load(std::memory_order_acquire);
-                    if(peakInputVal > current_in) {
-                        ui_audio_level.store(peakInputVal, std::memory_order_release);
-                    } else {
-                        current_in *= meter_decay;
-                        ui_audio_level.store((current_in < 1e-5f) ? 0.0f : current_in, std::memory_order_release);
-                    }
-                    float current_out = ui_output_level.load(std::memory_order_acquire);
-                    if(peakOutputVal > current_out) {
-                        ui_output_level.store(peakOutputVal, std::memory_order_release);
-                    } else {
-                        current_out *= meter_decay;
-                        ui_output_level.store((current_out < 1e-5f) ? 0.0f : current_out, std::memory_order_release);
-                    }
-                }
                 
                 uint32_t end_timer=xthal_get_ccount(); 
                 float max_cycles = (currentSampleRate.load(std::memory_order_acquire) == 96000) ? (2500.0f * (float)framesRead) : (5000.0f * (float)framesRead);
@@ -878,89 +600,318 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
     
     if(audioBufferMutex!=NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         int currentMode = activeEffectMode.load(std::memory_order_acquire);
+        Serial.printf("[MIDI Param] %s Effect (CC: %d, Val: %d) -> ", EFFECT_NAMES[currentMode], cc, val);
         
         if(currentMode==0) { 
-            if(pIdx==0) { effectMemory[1]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); } 
-            if(pIdx==1) { effectMemory[0]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); } 
-            if(pIdx==2) fxParams[0][0]=norm; 
-            if(pIdx==3) fxParams[0][1]=norm; 
+            if(pIdx==0) { effectMemory[1]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; Serial.printf("Heel Range: %.1f ST\n", effectMemory[1]); } 
+            if(pIdx==1) { effectMemory[0]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; Serial.printf("Toe Range: %.1f ST\n", effectMemory[0]); } 
+            if(pIdx==2) { fxParams[0][0]=norm; Serial.printf("Dry Mix: %.2f\n", fxParams[0][0]); } 
+            if(pIdx==3) { fxParams[0][1]=norm; Serial.printf("Wet Mix: %.2f\n", fxParams[0][1]); } 
         }
         else if(currentMode==1) { 
-            if(pIdx==0) { effectMemory[1]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); } 
-            if(pIdx==1) { effectMemory[0]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); } 
-            if(pIdx==2) fxParams[1][0]=0.0f+(norm*0.95f); 
-            if(pIdx==3) fxParams[1][1]=0.00001f+(norm*0.001f); 
-            if(pIdx==4) fxParams[1][2]=0.00001f+(norm*0.0005f); 
+            if(pIdx==0) { effectMemory[1]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; Serial.printf("Heel Range: %.1f ST\n", effectMemory[1]); } 
+            if(pIdx==1) { effectMemory[0]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; Serial.printf("Toe Range: %.1f ST\n", effectMemory[0]); } 
+            if(pIdx==2) { fxParams[1][0]=0.0f+(norm*0.95f); Serial.printf("Reverb APF: %.2f\n", fxParams[1][0]); } 
+            if(pIdx==3) { fxParams[1][1]=0.00001f+(norm*0.001f); Serial.printf("Attack: %.5f\n", fxParams[1][1]); } 
+            if(pIdx==4) { fxParams[1][2]=0.00001f+(norm*0.0005f); Serial.printf("Release: %.5f\n", fxParams[1][2]); } 
         }
         else if(currentMode==2) { 
             if(pIdx==0) { 
                 int newIdx=constrain((int)roundf(norm*4.0f),0,4); 
                 if(newIdx!=feedbackIntervalIdx.load(std::memory_order_acquire)) { 
-                    feedbackIntervalIdx.store(newIdx, std::memory_order_release); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); 
-                } 
+                    feedbackIntervalIdx.store(newIdx, std::memory_order_release); 
+                    lutNeedsUpdate=true; Serial.printf("Overtone Index: %d\n", newIdx);
+                } else { Serial.println("Overtone unchanged."); }
             } 
-            if(pIdx==1) fxParams[2][0]=1000.0f+(norm*10000.0f); 
-            if(pIdx==2) fxParams[2][1]=1.0f+(norm*100.0f); 
-            if(pIdx==3) fxParams[2][2]=0.005f+(norm*0.045f); 
+            if(pIdx==1) { fxParams[2][0]=1000.0f+(norm*10000.0f); Serial.printf("Speed: %.1f\n", fxParams[2][0]); } 
+            if(pIdx==2) { fxParams[2][1]=1.0f+(norm*100.0f); Serial.printf("Drive: %.1f\n", fxParams[2][1]); } 
+            if(pIdx==3) { fxParams[2][2]=0.005f+(norm*0.045f); Serial.printf("Delay Offset: %.3f\n", fxParams[2][2]); } 
         }
         else if(currentMode==3) { 
-            if(pIdx==0) { effectMemory[3]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); } 
-            if(pIdx==1) fxParams[3][0]=norm; 
+            if(pIdx==0) { effectMemory[3]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; Serial.printf("Interval: %.1f ST\n", effectMemory[3]); } 
+            if(pIdx==1) { fxParams[3][0]=norm; Serial.printf("Mix: %.2f\n", fxParams[3][0]); } 
         }
         else if(currentMode==4) { 
             if(pIdx==0) { 
                 int cents=(int)roundf((effectMemory[4]-(float)roundf(effectMemory[4]))*100.0f); 
-                effectMemory[4]=constrain(roundf((norm*48.0f)-24.0f)+((float)cents/100.0f),-24.0f,24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); 
+                effectMemory[4]=constrain(roundf((norm*48.0f)-24.0f)+((float)cents/100.0f),-24.0f,24.0f); 
+                lutNeedsUpdate=true; Serial.printf("Semitone Offset: %.2f\n", effectMemory[4]);
             } 
             if(pIdx==1) { 
-                int semi=(int)roundf(effectMemory[4]); float c=roundf((norm*100.0f)-50.0f)/100.0f; 
-                effectMemory[4]=constrain((float)semi+c,-24.0f,24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); 
+                int semi=(int)roundf(effectMemory[4]); 
+                float c=roundf((norm*100.0f)-50.0f)/100.0f; 
+                effectMemory[4]=constrain((float)semi+c,-24.0f,24.0f); 
+                lutNeedsUpdate=true; Serial.printf("Cents Offset: %.2f\n", effectMemory[4]);
             } 
         }
         else if(currentMode==5) { 
-            if(pIdx==0) { effectMemory[5]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); } 
-            if(pIdx==1) fxParams[5][0]=0.01f+(norm*0.5f); 
-            if(pIdx==2) fxParams[5][1]=0.001f+(norm*0.05f); 
-            if(pIdx==3) fxParams[5][2]=0.1f+(norm*0.8f); 
-            if(pIdx==4) fxParams[5][3]=norm; 
+            if(pIdx==0) { effectMemory[5]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; Serial.printf("Osc Pitch: %.1f ST\n", effectMemory[5]); } 
+            if(pIdx==1) { fxParams[5][0]=0.01f+(norm*0.5f); Serial.printf("Attack: %.2f\n", fxParams[5][0]); } 
+            if(pIdx==2) { fxParams[5][1]=0.001f+(norm*0.05f); Serial.printf("Release: %.3f\n", fxParams[5][1]); } 
+            if(pIdx==3) { fxParams[5][2]=0.1f+(norm*0.8f); Serial.printf("Filter: %.2f\n", fxParams[5][2]); } 
+            if(pIdx==4) { fxParams[5][3]=norm; Serial.printf("Mix: %.2f\n", fxParams[5][3]); } 
         }
         else if(currentMode==6) { 
-            if(pIdx==0) { effectMemory[6]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); } 
-            if(pIdx==1) fxParams[6][0]=0.8f+(norm*0.199f); 
-            if(pIdx==2) fxParams[6][1]=norm*3.0f; 
+            if(pIdx==0) { effectMemory[6]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; Serial.printf("Shift Pitch: %.1f ST\n", effectMemory[6]); } 
+            if(pIdx==1) { fxParams[6][0]=0.8f+(norm*0.199f); Serial.printf("Tone Sm: %.3f\n", fxParams[6][0]); } 
+            if(pIdx==2) { fxParams[6][1]=norm*3.0f; Serial.printf("Mix: %.2f\n", fxParams[6][1]); } 
         }
         else if(currentMode==7) { 
-            if(pIdx==0) { effectMemory[7]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); } 
-            if(pIdx==1) fxParams[7][0]=500.0f+(norm*4500.0f); 
-            if(pIdx==2) fxParams[7][1]=norm; 
+            if(pIdx==0) { effectMemory[7]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; Serial.printf("Shift Range: %.1f ST\n", effectMemory[7]); } 
+            if(pIdx==1) { fxParams[7][0]=500.0f+(norm*4500.0f); Serial.printf("Speed: %.1f\n", fxParams[7][0]); } 
+            if(pIdx==2) { fxParams[7][1]=norm; Serial.printf("Mix: %.2f\n", fxParams[7][1]); } 
         }
         else if(currentMode==8) { 
-            if(pIdx==0) { effectMemory[1]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); } 
-            if(pIdx==1) { effectMemory[0]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); } 
-            if(pIdx==2) fxParams[8][0]=0.001f+(norm*0.05f); 
-            if(pIdx==3) fxParams[8][1]=0.00001f+(norm*0.001f); 
-            if(pIdx==4) fxParams[8][2]=0.00001f+(norm*0.0005f); 
+            if(pIdx==0) { effectMemory[1]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; Serial.printf("Heel Range: %.1f ST\n", effectMemory[1]); } 
+            if(pIdx==1) { effectMemory[0]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; Serial.printf("Toe Range: %.1f ST\n", effectMemory[0]); } 
+            if(pIdx==2) { fxParams[8][0]=0.001f+(norm*0.05f); Serial.printf("Threshold: %.3f\n", fxParams[8][0]); } 
+            if(pIdx==3) { fxParams[8][1]=0.00001f+(norm*0.001f); Serial.printf("Attack: %.5f\n", fxParams[8][1]); } 
+            if(pIdx==4) { fxParams[8][2]=0.00001f+(norm*0.0005f); Serial.printf("Release: %.5f\n", fxParams[8][2]); } 
         }
         else if(currentMode==9) { 
-            if(pIdx==0) { effectMemory[9]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); } 
-            if(pIdx==1) fxParams[9][0]=norm*2.0f; 
+            if(pIdx==0) { effectMemory[9]=roundf((norm*48.0f)-24.0f); lutNeedsUpdate=true; Serial.printf("Base Pitch: %.1f ST\n", effectMemory[9]); } 
+            if(pIdx==1) { fxParams[9][0]=norm*2.0f; Serial.printf("Depth: %.2f\n", fxParams[9][0]); } 
         }
         
         xSemaphoreGive(audioBufferMutex);
-        settingsNeedSaving=true; lastParameterChangeTime=millis();
+        settingsNeedSaving=true; 
+        lastParameterChangeTime=millis();
+    }
+}
+
+void MidiTask(void * pvParameters) {
+    if(dsp_cpu_lock != NULL) esp_pm_lock_acquire(dsp_cpu_lock);
+
+    pedals.resetToCenter(); static bool lastBtState=false; static uint8_t lastVolumeCC=127;
+    #if ENABLE_PAR_KNOBS
+        static int lastCcOut[5]={-1,-1,-1,-1,-1};
+    #endif
+    static unsigned long lastBatteryTime=0; static float smoothedRawBat=0.0f;
+    pinMode(BOOT_SENSE_PIN, INPUT_PULLUP); 
+    pinMode(BLE_TOGGLE_PIN, INPUT_PULLUP);
+    
+    lastActivityTime=millis();
+    
+    static bool bleEnabled = true;
+    static unsigned long gpio14PressTime = 0;
+    static bool gpio14LastState = HIGH;
+    static unsigned long lastDebounceTime = 0;
+    
+    static bool lastBootState = HIGH;
+    
+    for(;;) {
+        if (bleEnabled) {
+            Control_Surface.loop(); 
+        } else {
+            Control_Surface.updateMidiInput(); 
+        }
+
+        bool currentBtState=btmidi.isConnected();
+        if(currentBtState!=lastBtState) { 
+            lastBtState=currentBtState; 
+            lastActivityTime=millis(); 
+            Serial.printf("[BLE] State Changed: %s\n", currentBtState ? "Connected" : "Disconnected");
+        }
+        if(millis()-lastActivityTime>LIGHT_SLEEP_TIMEOUT) goToLightSleep();
+        
+        bool reading = (REG_READ(GPIO_IN_REG) & (1 << BLE_TOGGLE_PIN)) != 0;
+        if (reading != gpio14LastState && (millis() - lastDebounceTime) > 50) {
+            lastDebounceTime = millis();
+            if (!reading) { 
+                gpio14PressTime = millis();
+            } else { 
+                unsigned long pressDuration = millis() - gpio14PressTime;
+                if (pressDuration >= 2000) {
+                    if (!bleEnabled) {
+                        btStart();
+                        bleEnabled = true;
+                        Serial.println("[BLE] Bluetooth Re-enabled");
+                    }
+                } else if (pressDuration >= 1000) {
+                    if (bleEnabled) {
+                        btStop();
+                        bleEnabled = false;
+                        Serial.println("[BLE] Bluetooth Disabled");
+                    }
+                }
+            }
+            gpio14LastState = reading;
+        }
+        
+        #if ENABLE_PAR_KNOBS
+            if(filterPar1.update()) { int cc1=map(filterPar1.getValue(),0,4095,0,127); if(cc1!=lastCcOut[0]) { Control_Surface.sendControlChange({24,Channel_1},cc1); updateParameterFromCC(24,cc1); lastCcOut[0]=cc1; } }
+            if(filterPar2.update()) { int cc2=map(filterPar2.getValue(),0,4095,0,127); if(cc2!=lastCcOut[1]) { Control_Surface.sendControlChange({25,Channel_1},cc2); updateParameterFromCC(25,cc2); lastCcOut[1]=cc2; } }
+            if(filterPar3.update()) { int cc3=map(filterPar3.getValue(),0,4095,0,127); if(cc3!=lastCcOut[2]) { Control_Surface.sendControlChange({26,Channel_1},cc3); updateParameterFromCC(26,cc3); lastCcOut[2]=cc3; } }
+            if(filterPar4.update()) { int cc4=map(filterPar4.getValue(),0,4095,0,127); if(cc4!=lastCcOut[3]) { Control_Surface.sendControlChange({27,Channel_1},cc4); updateParameterFromCC(27,cc4); lastCcOut[3]=cc4; } }
+            if(filterPar5.update()) { int cc5=map(filterPar5.getValue(),0,4095,0,127); if(cc5!=lastCcOut[4]) { Control_Surface.sendControlChange({28,Channel_1},cc5); updateParameterFromCC(28,cc5); lastCcOut[4]=cc5; } }
+        #endif
+        
+        fetchADCDMA();
+        
+        // Edge-triggered carousel logic over BOOT_SENSE_PIN
+        bool currentBootState = (REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN)) != 0;
+        if(!currentBootState && lastBootState) { 
+            switchEffectMode(activeEffectMode.load(std::memory_order_acquire) + 1);
+            lastActivityTime = millis();
+            Serial.printf("[SYSTEM] Boot Button Pressed. Carousel Next -> %s\n", EFFECT_NAMES[activeEffectMode.load(std::memory_order_acquire)]);
+            vTaskDelay(pdMS_TO_TICKS(50)); // Debounce
+        }
+        lastBootState = currentBootState;
+        
+        pedals.process(latestPB1, latestPB2, latestPB3, isVolumeMode, INVERT_PB3);
+        int calA=pedals.getCalA(), calB=pedals.getCalB(), calC=pedals.getCalC(); bool moveA=pedals.hasMovedA(), moveB=pedals.hasMovedB(), moveC=pedals.hasMovedC();
+        if(moveA||moveB||moveC) {
+            lastActivityTime=millis();
+            if(moveA) { 
+                Control_Surface.sendPitchBend(Channel_1, calA); pedals.updateLastMidiA(); currentPB1=calA; 
+                Serial.printf("[PB1] Whammy Position: %d\n", calA);
+            }
+            if(moveB) { 
+                Control_Surface.sendPitchBend(Channel_2, calB); pedals.updateLastMidiB(); currentPB2=calB; 
+                Serial.printf("[PB2] Heel/Toe Wiper: %d\n", calB);
+            }
+            if(moveC) { 
+                if(!isVolumeMode) { Control_Surface.sendPitchBend(Channel_3, calC); pedals.updateLastMidiC(); currentPB3=calC; }
+            }
+            bool pitchChanged=false;
+            if(moveA) { lastActivePedal=calA; pitchChanged=true; }
+            if(moveB) { lastActivePedal=calB; pitchChanged=true; }
+            if(moveC&&!isVolumeMode) { lastActivePedal=calC; pitchChanged=true; Serial.printf("[PB3] Param Mode Position: %d\n", calC); }
+            if(pitchChanged) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); pitchShiftFactor.store(pitchShiftLUT[constrain(lastActivePedal,0,16383)], std::memory_order_release); if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); }
+            if(moveC&&isVolumeMode) { 
+                uint8_t vCC=map(calC,0,16383,0,127); 
+                if(vCC!=lastVolumeCC) { 
+                    Control_Surface.sendControlChange({19,Channel_1},vCC); lastVolumeCC=vCC; 
+                    Serial.printf("[PB3] Volume Position: %d (CC19: %d)\n", calC, vCC);
+                } 
+                if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); volumePedalGain=(float)calC/16383.0f; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); 
+            }
+        }
+        
+        int currentBatVal = latestBat.load(std::memory_order_relaxed);
+        smoothedRawBat = (smoothedRawBat == 0.0f) ? (float)currentBatVal : (smoothedRawBat * 0.95f) + ((float)currentBatVal * 0.05f);
+        if(millis()-lastBatteryTime>1000) { 
+            lastBatteryTime=millis(); 
+            const float CALIBRATION_MULTIPLIER=1.04571f; 
+            float instantVoltage=(smoothedRawBat/4095.0f)*3.3f*2.0f*CALIBRATION_MULTIPLIER; 
+            
+            if(instantVoltage>2.0f) { 
+                if(instantVoltage <= 3.40f) {
+                    dsp_is_paused.store(true, std::memory_order_release);
+                    while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+                    i2s_channel_disable(tx_chan); 
+                    i2s_channel_disable(rx_chan);
+                    
+                    saveSettings();
+                    
+                    Serial.println("[SYSTEM] BATTERY DEAD. PLEASE CHARGE. Halting...");
+                    
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                    
+                    if(bleEnabled) {
+                        btStop();
+                        bleEnabled = false;
+                    }
+                    
+                    while(true) {
+                        vTaskDelay(portMAX_DELAY);
+                    }
+                }
+
+                bool charging=(instantVoltage>4.20f); 
+                int newPercent=getBatteryPercentage(instantVoltage); 
+                currentBatteryVoltage=instantVoltage; 
+                currentBatteryPercent.store(newPercent, std::memory_order_relaxed); 
+                isBatteryCharging.store(charging, std::memory_order_relaxed); 
+            } 
+        }
+        
+        static unsigned long lastLutUpdate=0;
+        if(lutNeedsUpdate && (millis()-lastLutUpdate>40)) { 
+            lutNeedsUpdate=false; updateLUT(); 
+            if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); 
+            pitchShiftFactor.store(pitchShiftLUT[constrain(lastActivePedal,0,16383)], std::memory_order_release); 
+            if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); 
+            lastLutUpdate=millis(); 
+            Serial.println("[SYSTEM] Pitch Lookup Table (LUT) Updated.");
+        }
+        
+        if(settingsNeedSaving && (millis()-lastParameterChangeTime>2000)) { 
+            if(millis()-lastParameterChangeTime>10000) { 
+                settingsNeedSaving=false; 
+                
+                dsp_is_paused.store(true, std::memory_order_release);
+                while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+                
+                saveSettings();
+                Serial.println("[SYSTEM] Settings Auto-Saved.");
+                
+                dsp_is_paused.store(false, std::memory_order_release);
+                while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+            } 
+        }
+        
+        if(sampleRateToggleRequested) { sampleRateToggleRequested=false; toggleSampleRate(); }
+        if(pb2ToggleRequested) { pb2ToggleRequested=false; calibratePBs(); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
 bool channelMessageCallback(ChannelMessage cm) {
-    if(isScreenOff.load(std::memory_order_acquire)) turnScreenOn(); lastActivityTime=millis(); lastScreenActivityTime=millis();
+    lastActivityTime=millis();
     if(cm.header==0xB0) {
-        if(cm.data1==11) { uint16_t mappedCC=map(cm.data2,0,127,0,16383); currentCC11=mappedCC; currentPB3=mappedCC; lastActivePedal=mappedCC; if(isVolumeMode) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); volumePedalGain=(float)mappedCC/16383.0f; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); Control_Surface.sendControlChange({19,Channel_1},cm.data2); } else { if(!lutNeedsUpdate) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); pitchShiftFactor.store(pitchShiftLUT[mappedCC], std::memory_order_release); if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); } } forceUIUpdate.store(true, std::memory_order_release); return false; }
+        if(cm.data1==11) { 
+            uint16_t mappedCC=map(cm.data2,0,127,0,16383); currentCC11=mappedCC; currentPB3=mappedCC; lastActivePedal=mappedCC; 
+            Serial.printf("[MIDI RX] CC 11 Received: %d -> Mapped PB: %d\n", cm.data2, mappedCC);
+            if(isVolumeMode) { 
+                if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); 
+                volumePedalGain=(float)mappedCC/16383.0f; 
+                if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); 
+                Control_Surface.sendControlChange({19,Channel_1},cm.data2); 
+            } else { 
+                if(!lutNeedsUpdate) { 
+                    if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); 
+                    pitchShiftFactor.store(pitchShiftLUT[mappedCC], std::memory_order_release); 
+                    if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); 
+                } 
+            } return false; 
+        }
         if(cm.data1>=24 && cm.data1<=28) { updateParameterFromCC(cm.data1, cm.data2); return false; }
-        if(cm.data1==5 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isPB2WiperMode=!isPB2WiperMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); pb2ToggleRequested=true; }
-        else if(cm.data1==6 && cm.data2>=64) { bool sendCenterMidi=false; if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isVolumeMode=!isVolumeMode; if(!isVolumeMode) { volumePedalGain=1.0f; pedals.lockPB3Whammy(); sendCenterMidi=true; currentPB3=8192; lastActivePedal=8192; if(!lutNeedsUpdate && pitchShiftLUT!=nullptr) pitchShiftFactor.store(pitchShiftLUT[8192], std::memory_order_release); } else { pedals.lockPB3Volume(); lastActivePedal=8192; volumePedalGain=1.0f; if(!lutNeedsUpdate && pitchShiftLUT!=nullptr) pitchShiftFactor.store(pitchShiftLUT[8192], std::memory_order_release); } if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); if(sendCenterMidi) Control_Surface.sendPitchBend(Channel_3, 8192); forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==0 && cm.data2>=64) switchEffectMode(activeEffectMode.load(std::memory_order_acquire)-1);
-        else if(cm.data1==1 && cm.data2>=64) switchEffectMode(activeEffectMode.load(std::memory_order_acquire)+1);
-        else if(cm.data1==2 && cm.data2>=64) sampleRateToggleRequested=true;
+        if(cm.data1==5 && cm.data2>=64) { 
+            if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); 
+            isPB2WiperMode=!isPB2WiperMode; 
+            if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); 
+            pb2ToggleRequested=true; 
+            Serial.printf("[MIDI RX] PB2 Mode: %s\n", isPB2WiperMode ? "WIPER" : "HEEL");
+        }
+        else if(cm.data1==6 && cm.data2>=64) { 
+            bool sendCenterMidi=false; 
+            if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); 
+            isVolumeMode=!isVolumeMode; 
+            if(!isVolumeMode) { 
+                volumePedalGain=1.0f; pedals.lockPB3Whammy(); sendCenterMidi=true; currentPB3=8192; lastActivePedal=8192; 
+                if(!lutNeedsUpdate && pitchShiftLUT!=nullptr) pitchShiftFactor.store(pitchShiftLUT[8192], std::memory_order_release); 
+            } else { 
+                pedals.lockPB3Volume(); lastActivePedal=8192; volumePedalGain=1.0f; 
+                if(!lutNeedsUpdate && pitchShiftLUT!=nullptr) pitchShiftFactor.store(pitchShiftLUT[8192], std::memory_order_release); 
+            } 
+            if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); 
+            if(sendCenterMidi) Control_Surface.sendPitchBend(Channel_3, 8192); 
+            settingsNeedSaving=true; lastParameterChangeTime=millis(); 
+            Serial.printf("[MIDI RX] PB3 Mode: %s\n", isVolumeMode ? "VOLUME" : "WHAMMY");
+        }
+        else if(cm.data1==0 && cm.data2>=64) {
+            switchEffectMode(activeEffectMode.load(std::memory_order_acquire)-1);
+            Serial.printf("[MIDI RX] Effect Mode Prev -> %s\n", EFFECT_NAMES[activeEffectMode.load(std::memory_order_acquire)]);
+        }
+        else if(cm.data1==1 && cm.data2>=64) {
+            switchEffectMode(activeEffectMode.load(std::memory_order_acquire)+1);
+            Serial.printf("[MIDI RX] Effect Mode Next -> %s\n", EFFECT_NAMES[activeEffectMode.load(std::memory_order_acquire)]);
+        }
+        else if(cm.data1==2 && cm.data2>=64) {
+             sampleRateToggleRequested=true;
+             Serial.println("[MIDI RX] Sample Rate Toggle Requested");
+        }
         else if(cm.data1==3 && cm.data2>=64) {
              dsp_is_paused.store(true, std::memory_order_release);
              while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
@@ -973,17 +924,25 @@ bool channelMessageCallback(ChannelMessage cm) {
              if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex);
              dsp_is_paused.store(false, std::memory_order_release);
              while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-             forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis();
+             settingsNeedSaving=true; lastParameterChangeTime=millis();
+             Serial.printf("[MIDI RX] Latency Mode Changed: %d\n", latencyMode.load(std::memory_order_acquire));
          }
         else if(cm.data1==4 && cm.data2>=64) {
              dsp_is_paused.store(true, std::memory_order_release);
              while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+             
              memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t));
              memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t));
              memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
              if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
              bool anyEffectOn=isWhammyActive||isFrozen||isFeedbackActive||isHarmonizerMode||isCapoMode||isSynthMode||isPadMode||isChorusMode||isSwellMode||isVibratoMode;
-             if(anyEffectOn||activeEffectMode.load(std::memory_order_acquire)!=0) { isWhammyActive=false; isFrozen=false; isFeedbackActive=false; isHarmonizerMode=false; isCapoMode=false; isSynthMode=false; isPadMode=false; isChorusMode=false; isSwellMode=false; isVibratoMode=false; activeEffectMode.store(0, std::memory_order_release); panicResetRequested.store(true, std::memory_order_release); } else { isWhammyActive=true; }
+             if(anyEffectOn||activeEffectMode.load(std::memory_order_acquire)!=0) { 
+                 isWhammyActive=false; isFrozen=false; isFeedbackActive=false; isHarmonizerMode=false; isCapoMode=false; isSynthMode=false; isPadMode=false; isChorusMode=false; isSwellMode=false; isVibratoMode=false; activeEffectMode.store(0, std::memory_order_release); panicResetRequested.store(true, std::memory_order_release); 
+                 Serial.println("[MIDI RX] PANIC: All Effects Disabled. Reset to Whammy Mode.");
+             } else { 
+                 isWhammyActive=true; 
+                 Serial.println("[MIDI RX] Whammy Activated.");
+             }
              if(isVolumeMode) { isVolumeMode=false; pedals.lockPB3Whammy(); }
              volumePedalGain=1.0f; currentPB1=8192; currentPB2=8192; currentPB3=8192; lastActivePedal=8192;
              if(!lutNeedsUpdate && pitchShiftLUT!=nullptr) pitchShiftFactor.store(pitchShiftLUT[8192], std::memory_order_release);
@@ -991,17 +950,17 @@ bool channelMessageCallback(ChannelMessage cm) {
              dsp_is_paused.store(false, std::memory_order_release);
              while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
              Control_Surface.sendPitchBend(Channel_1, 8192); Control_Surface.sendPitchBend(Channel_2, 8192); Control_Surface.sendPitchBend(Channel_3, 8192);
-             lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis();
+             lutNeedsUpdate=true; settingsNeedSaving=true; lastParameterChangeTime=millis();
          }
-        else if(cm.data1==8 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isFrozen=!isFrozen; if(activeEffectMode.load(std::memory_order_acquire)==1) isWhammyActive=isFrozen; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==9 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isFeedbackActive=!isFeedbackActive; if(activeEffectMode.load(std::memory_order_acquire)==2) isWhammyActive=isFeedbackActive; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==10 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isHarmonizerMode=!isHarmonizerMode; if(activeEffectMode.load(std::memory_order_acquire)==3) isWhammyActive=isHarmonizerMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==12 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isCapoMode=!isCapoMode; if(activeEffectMode.load(std::memory_order_acquire)==4) isWhammyActive=isCapoMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==13 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isSynthMode=!isSynthMode; if(activeEffectMode.load(std::memory_order_acquire)==5) isWhammyActive=isSynthMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==14 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isPadMode=!isPadMode; if(activeEffectMode.load(std::memory_order_acquire)==6) isWhammyActive=isPadMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==15 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isChorusMode=!isChorusMode; if(activeEffectMode.load(std::memory_order_acquire)==7) isWhammyActive=isChorusMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==16 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isSwellMode=!isSwellMode; if(activeEffectMode.load(std::memory_order_acquire)==8) isWhammyActive=isSwellMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==7 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isVibratoMode=!isVibratoMode; if(activeEffectMode.load(std::memory_order_acquire)==9) isWhammyActive=isVibratoMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
+        else if(cm.data1==8 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isFrozen=!isFrozen; if(activeEffectMode.load(std::memory_order_acquire)==1) isWhammyActive=isFrozen; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); settingsNeedSaving=true; lastParameterChangeTime=millis(); Serial.printf("[MIDI RX] Toggle Freeze: %s\n", isFrozen?"ON":"OFF"); }
+        else if(cm.data1==9 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isFeedbackActive=!isFeedbackActive; if(activeEffectMode.load(std::memory_order_acquire)==2) isWhammyActive=isFeedbackActive; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); settingsNeedSaving=true; lastParameterChangeTime=millis(); Serial.printf("[MIDI RX] Toggle Feedback: %s\n", isFeedbackActive?"ON":"OFF"); }
+        else if(cm.data1==10 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isHarmonizerMode=!isHarmonizerMode; if(activeEffectMode.load(std::memory_order_acquire)==3) isWhammyActive=isHarmonizerMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); settingsNeedSaving=true; lastParameterChangeTime=millis(); Serial.printf("[MIDI RX] Toggle Harmony: %s\n", isHarmonizerMode?"ON":"OFF"); }
+        else if(cm.data1==12 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isCapoMode=!isCapoMode; if(activeEffectMode.load(std::memory_order_acquire)==4) isWhammyActive=isCapoMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); lutNeedsUpdate=true; settingsNeedSaving=true; lastParameterChangeTime=millis(); Serial.printf("[MIDI RX] Toggle Capo: %s\n", isCapoMode?"ON":"OFF"); }
+        else if(cm.data1==13 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isSynthMode=!isSynthMode; if(activeEffectMode.load(std::memory_order_acquire)==5) isWhammyActive=isSynthMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); settingsNeedSaving=true; lastParameterChangeTime=millis(); Serial.printf("[MIDI RX] Toggle Synth: %s\n", isSynthMode?"ON":"OFF"); }
+        else if(cm.data1==14 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isPadMode=!isPadMode; if(activeEffectMode.load(std::memory_order_acquire)==6) isWhammyActive=isPadMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); settingsNeedSaving=true; lastParameterChangeTime=millis(); Serial.printf("[MIDI RX] Toggle Pad: %s\n", isPadMode?"ON":"OFF"); }
+        else if(cm.data1==15 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isChorusMode=!isChorusMode; if(activeEffectMode.load(std::memory_order_acquire)==7) isWhammyActive=isChorusMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); settingsNeedSaving=true; lastParameterChangeTime=millis(); Serial.printf("[MIDI RX] Toggle Chorus: %s\n", isChorusMode?"ON":"OFF"); }
+        else if(cm.data1==16 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isSwellMode=!isSwellMode; if(activeEffectMode.load(std::memory_order_acquire)==8) isWhammyActive=isSwellMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); settingsNeedSaving=true; lastParameterChangeTime=millis(); Serial.printf("[MIDI RX] Toggle Swell: %s\n", isSwellMode?"ON":"OFF"); }
+        else if(cm.data1==7 && cm.data2>=64) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); isVibratoMode=!isVibratoMode; if(activeEffectMode.load(std::memory_order_acquire)==9) isWhammyActive=isVibratoMode; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); settingsNeedSaving=true; lastParameterChangeTime=millis(); Serial.printf("[MIDI RX] Toggle Vibrato: %s\n", isVibratoMode?"ON":"OFF"); }
         else if(cm.data1==17 || cm.data1==18) {
             float step=(cm.data2>=64)?-1.0f:1.0f;
             if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY);
@@ -1026,7 +985,8 @@ bool channelMessageCallback(ChannelMessage cm) {
                 }
             }
             if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex);
-            lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis();
+            lutNeedsUpdate=true; settingsNeedSaving=true; lastParameterChangeTime=millis();
+            Serial.printf("[MIDI RX] %s memory step: %s\n", EFFECT_NAMES[renderMode], step>0 ? "UP" : "DOWN");
         }
     }
     return false;
@@ -1035,15 +995,20 @@ bool channelMessageCallback(ChannelMessage cm) {
 void setup() {
     esp_brownout_init(); audioBufferMutex=xSemaphoreCreateMutex(); WiFi.mode(WIFI_OFF);
     
+    Serial.begin(115200);
+    Serial.println("\n=========================================");
+    Serial.println("BPI-Leaf-S3 DSP Multi-FX - v60.24 Booting...");
+    Serial.println("=========================================\n");
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        Serial.println("[SYSTEM] Corrupted NVS Partition Detected. Reformatting...");
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
 
     esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "DSP_Max_CPU", &dsp_cpu_lock);
-    if(dsp_cpu_lock != NULL) esp_pm_lock_acquire(dsp_cpu_lock);
     
     adc_continuous_handle_cfg_t adc_config={};
     adc_config.max_store_buf_size=16384; 
@@ -1078,14 +1043,9 @@ void setup() {
     isWhammyActive=true; isFrozen=(fxStates&(1<<1))!=0; isFeedbackActive=(fxStates&(1<<2))!=0; isHarmonizerMode=(fxStates&(1<<3))!=0; isCapoMode=(fxStates&(1<<4))!=0; isSynthMode=(fxStates&(1<<5))!=0; isPadMode=(fxStates&(1<<6))!=0; isChorusMode=(fxStates&(1<<7))!=0; isSwellMode=(fxStates&(1<<8))!=0; isVibratoMode=(fxStates&(1<<9))!=0;
     preferences.end();
     
-    pinMode(BATTERY_PIN, INPUT); pinMode(38, OUTPUT); digitalWrite(38, LOW); pinMode(15, OUTPUT); digitalWrite(15, HIGH);
+    pinMode(BATTERY_PIN, INPUT);
+    pinMode(pinPB, INPUT_PULLUP); pinMode(pinPB2, INPUT_PULLUP); pinMode(pinPB3, INPUT_PULLUP);
     
-    pedals.resetToCenter();
-    pinMode(BOOT_SENSE_PIN, INPUT_PULLUP); 
-    pinMode(14, INPUT_PULLUP);
-    lastActivityTime=millis();
-    lastScreenActivityTime=millis();
-
     delayBuffer=(int16_t*)heap_caps_aligned_alloc(64, MAX_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_SPIRAM);
     fbDelayBuffer=(int16_t*)heap_caps_aligned_alloc(64, FB_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if(fbDelayBuffer == nullptr) { fbDelayBuffer=(int16_t*)heap_caps_aligned_alloc(64, FB_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_SPIRAM); }
@@ -1108,6 +1068,9 @@ void setup() {
     fbOutBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     sMixBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     
+    if(delayBuffer==nullptr||fbDelayBuffer==nullptr||freezeBuffer==nullptr||pitchShiftLUT==nullptr||pitchShiftLUT_temp==nullptr||i2s_in_block==nullptr||i2s_out_block==nullptr||inBuf==nullptr||envBuf==nullptr||fzOutBuf==nullptr||masterGainBuf==nullptr||w1Buf==nullptr||w2Buf==nullptr||w3Buf==nullptr||padFilterBuf==nullptr||dryBuf==nullptr||fbOutBuf==nullptr||sMixBuf==nullptr) {
+         Serial.println("CRITICAL: MEMORY ALLOCATION ERROR"); while(1) vTaskDelay(100);
+     }
     memset(i2s_in_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
     memset(i2s_out_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
     memset(inBuf, 0, HOP_SIZE * sizeof(float));
@@ -1131,6 +1094,7 @@ void setup() {
     pitchShiftFactor.store(pitchShiftLUT[8192], std::memory_order_release);
     if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex);
     
+    // V1.24 FIX: Control_Surface initialized here in setup() 
     btmidi.setName("Whammy_S3");
     Control_Surface >> pipes >> btmidi; 
     Control_Surface >> pipes >> usbmidi; 
@@ -1147,180 +1111,19 @@ void setup() {
     i2s_std_config_t stdConfig={ 
         .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate.load(std::memory_order_acquire)), 
         .slot_cfg=I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
-        .gpio_cfg={ .mclk=GPIO_NUM_43, .bclk=GPIO_NUM_44, .ws=GPIO_NUM_18, .dout=GPIO_NUM_16, .din=GPIO_NUM_17 } 
+        .gpio_cfg={ .mclk=GPIO_NUM_6, .bclk=GPIO_NUM_7, .ws=GPIO_NUM_18, .dout=GPIO_NUM_16, .din=GPIO_NUM_17 } 
     };
     stdConfig.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384; 
     i2s_channel_init_std_mode(tx_chan, &stdConfig); i2s_channel_init_std_mode(rx_chan, &stdConfig);
     
     settingsNeedSaving=false;
     
-    xTaskCreatePinnedToCore(DisplayTask, "UI", 8192, NULL, 1, NULL, 1); 
-
-    dspTaskStack = (StackType_t*)heap_caps_aligned_alloc(16, 16384, MALLOC_CAP_SPIRAM);
-    dspTaskTCB = (StaticTask_t*)heap_caps_aligned_alloc(16, sizeof(StaticTask_t), MALLOC_CAP_SPIRAM);
-
-    if (dspTaskStack != nullptr && dspTaskTCB != nullptr) {
-        audioTaskHandle = xTaskCreateStaticPinnedToCore(
-            AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES - 1, 
-            dspTaskStack, dspTaskTCB, 0
-        );
-    } else {
-        tft.init(); tft.setRotation(1); tft.fillScreen(TFT_RED); 
-        tft.setTextColor(TFT_WHITE, TFT_RED); tft.drawString("PSRAM ALLOC FAIL", 160, 85); 
-        while(1) vTaskDelay(100);
-    }
+    Serial.println("[SYSTEM] Starting FreeRTOS Tasks...");
+    xTaskCreatePinnedToCore(MidiTask, "Midi", 8192, NULL, configMAX_PRIORITIES-1, NULL, 0);
+    xTaskCreatePinnedToCore(AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES-1, &audioTaskHandle, 1);
     
     i2s_channel_enable(tx_chan); i2s_channel_enable(rx_chan); 
+    Serial.println("[SYSTEM] Boot Sequence Complete.");
 }
 
-void loop() {
-    static bool lastBtState=false; 
-    static uint8_t lastVolumeCC=127;
-    #if ENABLE_PAR_KNOBS
-        static int lastCcOut[5]={-1,-1,-1,-1,-1};
-    #endif
-    static unsigned long lastBatteryTime=0; 
-    static float smoothedRawBat=0.0f;
-    static bool bleEnabled = true;
-    static unsigned long gpio14PressTime = 0;
-    static bool gpio14LastState = HIGH;
-    static unsigned long lastDebounceTime = 0;
-    static bool lastBootState = HIGH;
-
-    if (bleEnabled) {
-        Control_Surface.loop(); 
-    } else {
-        Control_Surface.updateMidiInput(); 
-    }
-
-    bool currentBtState=btmidi.isConnected();
-    if(currentBtState!=lastBtState) { 
-        lastBtState=currentBtState; 
-        forceUIUpdate.store(true, std::memory_order_release); 
-        if(isScreenOff.load(std::memory_order_acquire)) turnScreenOn(); 
-        lastScreenActivityTime=millis(); 
-    }
-    if(millis()-lastActivityTime>LIGHT_SLEEP_TIMEOUT) goToLightSleep();
-    if(!isScreenOff.load(std::memory_order_acquire) && (millis()-lastScreenActivityTime>SCREEN_OFF_TIMEOUT)) turnScreenOff();
-    
-    bool reading = (REG_READ(GPIO_IN_REG) & (1 << 14)) != 0;
-    if (reading != gpio14LastState && (millis() - lastDebounceTime) > 50) {
-        lastDebounceTime = millis();
-        if (!reading) { 
-            gpio14PressTime = millis();
-        } else { 
-            unsigned long pressDuration = millis() - gpio14PressTime;
-            if (pressDuration >= 2000) {
-                if (!bleEnabled) {
-                    btStart();
-                    bleEnabled = true;
-                }
-            } else if (pressDuration >= 1000) {
-                if (bleEnabled) {
-                    btStop();
-                    bleEnabled = false;
-                }
-            }
-        }
-        gpio14LastState = reading;
-    }
-    
-    #if ENABLE_PAR_KNOBS
-        if(filterPar1.update()) { int cc1=map(filterPar1.getValue(),0,4095,0,127); if(cc1!=lastCcOut[0]) { Control_Surface.sendControlChange({24,Channel_1},cc1); updateParameterFromCC(24,cc1); lastCcOut[0]=cc1; } }
-        if(filterPar2.update()) { int cc2=map(filterPar2.getValue(),0,4095,0,127); if(cc2!=lastCcOut[1]) { Control_Surface.sendControlChange({25,Channel_1},cc2); updateParameterFromCC(25,cc2); lastCcOut[1]=cc2; } }
-        if(filterPar3.update()) { int cc3=map(filterPar3.getValue(),0,4095,0,127); if(cc3!=lastCcOut[2]) { Control_Surface.sendControlChange({26,Channel_1},cc3); updateParameterFromCC(26,cc3); lastCcOut[2]=cc3; } }
-        if(filterPar4.update()) { int cc4=map(filterPar4.getValue(),0,4095,0,127); if(cc4!=lastCcOut[3]) { Control_Surface.sendControlChange({27,Channel_1},cc4); updateParameterFromCC(27,cc4); lastCcOut[3]=cc4; } }
-        if(filterPar5.update()) { int cc5=map(filterPar5.getValue(),0,4095,0,127); if(cc5!=lastCcOut[4]) { Control_Surface.sendControlChange({28,Channel_1},cc5); updateParameterFromCC(28,cc5); lastCcOut[4]=cc5; } }
-    #endif
-    
-    fetchADCDMA();
-    
-    bool currentBootState = (REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN)) != 0;
-    if(!currentBootState && lastBootState) { 
-        switchEffectMode(activeEffectMode.load(std::memory_order_acquire) + 1);
-        lastActivityTime = millis();
-        lastScreenActivityTime = millis();
-        if(isScreenOff.load(std::memory_order_acquire)) turnScreenOn();
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    lastBootState = currentBootState;
-    
-    pedals.process(latestPB1, latestPB2, latestPB3, isVolumeMode, INVERT_PB3);
-    int calA=pedals.getCalA(), calB=pedals.getCalB(), calC=pedals.getCalC(); bool moveA=pedals.hasMovedA(), moveB=pedals.hasMovedB(), moveC=pedals.hasMovedC();
-    if(moveA||moveB||moveC) {
-        if(isScreenOff.load(std::memory_order_acquire)) turnScreenOn(); lastScreenActivityTime=millis(); lastActivityTime=millis();
-        if(moveA) { Control_Surface.sendPitchBend(Channel_1, calA); pedals.updateLastMidiA(); currentPB1=calA; }
-        if(moveB) { Control_Surface.sendPitchBend(Channel_2, calB); pedals.updateLastMidiB(); currentPB2=calB; }
-        if(moveC) { if(!isVolumeMode) Control_Surface.sendPitchBend(Channel_3, calC); pedals.updateLastMidiC(); currentPB3=calC; }
-        bool pitchChanged=false;
-        if(moveA) { lastActivePedal=calA; pitchChanged=true; }
-        if(moveB) { lastActivePedal=calB; pitchChanged=true; }
-        if(moveC&&!isVolumeMode) { lastActivePedal=calC; pitchChanged=true; }
-        if(pitchChanged) { if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); pitchShiftFactor.store(pitchShiftLUT[constrain(lastActivePedal,0,16383)], std::memory_order_release); if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); }
-        if(moveC&&isVolumeMode) { uint8_t vCC=map(calC,0,16383,0,127); if(vCC!=lastVolumeCC) { Control_Surface.sendControlChange({19,Channel_1},vCC); lastVolumeCC=vCC; } if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); volumePedalGain=(float)calC/16383.0f; if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); }
-        forceUIUpdate.store(true, std::memory_order_release);
-    }
-    
-    int currentBatVal = latestBat.load(std::memory_order_relaxed);
-    smoothedRawBat = (smoothedRawBat == 0.0f) ? (float)currentBatVal : (smoothedRawBat * 0.95f) + ((float)currentBatVal * 0.05f);
-    if(millis()-lastBatteryTime>1000) { 
-        lastBatteryTime=millis(); 
-        const float CALIBRATION_MULTIPLIER=1.04571f; 
-        float instantVoltage=(smoothedRawBat/4095.0f)*3.3f*2.0f*CALIBRATION_MULTIPLIER; 
-        
-        if(instantVoltage>2.0f) { 
-            if(instantVoltage <= 3.40f) {
-                dsp_is_paused.store(true, std::memory_order_release);
-                while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-                i2s_channel_disable(tx_chan); 
-                i2s_channel_disable(rx_chan);
-                
-                saveSettings();
-                
-                isBatteryDead.store(true, std::memory_order_release);
-                
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                REG_WRITE(GPIO_OUT1_W1TC_REG, 1 << (38 - 32));
-                
-                if(bleEnabled) {
-                    btStop();
-                    bleEnabled = false;
-                }
-                
-                while(true) {
-                    vTaskDelay(portMAX_DELAY);
-                }
-            }
-
-            bool charging=(instantVoltage>4.20f); 
-            int newPercent=getBatteryPercentage(instantVoltage); 
-            bool stateChanged=(newPercent!=currentBatteryPercent.load(std::memory_order_relaxed))||(charging!=isBatteryCharging.load(std::memory_order_relaxed)); 
-            currentBatteryVoltage=instantVoltage; 
-            currentBatteryPercent.store(newPercent, std::memory_order_relaxed); 
-            isBatteryCharging.store(charging, std::memory_order_relaxed); 
-            if(stateChanged) forceUIUpdate.store(true, std::memory_order_release); 
-        } 
-    }
-    
-    static unsigned long lastLutUpdate=0;
-    if(lutNeedsUpdate && (millis()-lastLutUpdate>40)) { lutNeedsUpdate=false; updateLUT(); if(audioBufferMutex!=NULL) xSemaphoreTake(audioBufferMutex, portMAX_DELAY); pitchShiftFactor.store(pitchShiftLUT[constrain(lastActivePedal,0,16383)], std::memory_order_release); if(audioBufferMutex!=NULL) xSemaphoreGive(audioBufferMutex); lastLutUpdate=millis(); }
-    
-    if(settingsNeedSaving && (millis()-lastParameterChangeTime>2000)) { 
-        if(ui_audio_level.load(std::memory_order_acquire)<0.01f || (millis()-lastParameterChangeTime>10000)) { 
-            settingsNeedSaving=false; 
-            
-            dsp_is_paused.store(true, std::memory_order_release);
-            while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-            
-            saveSettings();
-            
-            dsp_is_paused.store(false, std::memory_order_release);
-            while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-        } 
-    }
-    
-    if(sampleRateToggleRequested) { sampleRateToggleRequested=false; toggleSampleRate(); }
-    if(pb2ToggleRequested) { pb2ToggleRequested=false; calibratePBs(); forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-    
-    vTaskDelay(pdMS_TO_TICKS(5));
-}
+void loop() { vTaskDelay(portMAX_DELAY); }

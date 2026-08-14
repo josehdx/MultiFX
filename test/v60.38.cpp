@@ -1,4 +1,4 @@
-// v60.37.cpp
+// v60.38.cpp - LilyGO T-Display-S3 DSP Engine
 #pragma GCC optimize ("O3")
 #include <Arduino.h>
 #include <Control_Surface.h>
@@ -69,7 +69,7 @@ volatile uint32_t dma_success_count = 0;
 
 static bool IRAM_ATTR dma_memcpy_cb(async_memcpy_handle_t mcp_hdl, async_memcpy_event_t *event, void *cb_args) {
     *((volatile bool*)cb_args) = true;
-    dma_success_count = dma_success_count + 1; // Complies with C++20 volatile rules
+    dma_success_count = dma_success_count + 1;
     return false;
 }
 
@@ -115,6 +115,32 @@ std::atomic<int> latencyMode{0};
 std::atomic<int> activeEffectMode{0};
 std::atomic<int> feedbackIntervalIdx{0}; 
 
+#define HOP_SIZE 64
+#define MAX_BUFFER_SIZE 65536
+#define BUFFER_MASK 0xFFFF
+#define FB_BUFFER_SIZE 8192
+#define FB_BUFFER_MASK 0x1FFF
+#define FREEZE_BUFFER_SIZE 131072
+
+int16_t *delayBuffer = nullptr, *fbDelayBuffer = nullptr, *freezeBuffer = nullptr;
+
+void cycleLatencyMode() {
+    dsp_is_paused.store(true, std::memory_order_release);
+    while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+    latencyMode.store((latencyMode.load(std::memory_order_acquire) + 1) % 4, std::memory_order_release);
+    memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t));
+    memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t));
+    memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
+    globalAudioResetRequested.store(true, std::memory_order_release);
+    dspNeedsCommit = true;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    dsp_is_paused.store(false, std::memory_order_release);
+    while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+    forceUIUpdate.store(true, std::memory_order_release);
+    settingsNeedSaving = true;
+    lastParameterChangeTime = millis();
+}
+
 void commitDSPState() {
     if (!dspAckCommit.load(std::memory_order_acquire)) return; 
 
@@ -147,14 +173,6 @@ TaskHandle_t audioTaskHandle = NULL;
 StackType_t* dspTaskStack = nullptr;
 StaticTask_t* dspTaskTCB = nullptr;
 
-#define HOP_SIZE 64
-#define MAX_BUFFER_SIZE 65536
-#define BUFFER_MASK 0xFFFF
-#define FB_BUFFER_SIZE 8192
-#define FB_BUFFER_MASK 0x1FFF
-#define FREEZE_BUFFER_SIZE 131072
-
-int16_t *delayBuffer = nullptr, *fbDelayBuffer = nullptr, *freezeBuffer = nullptr;
 std::atomic<float*> pitchShiftLUT{nullptr};
 float *pitchShiftLUT_temp = nullptr;
 int writeIndex = 0, fbDelayWriteIdx = 0;
@@ -363,7 +381,9 @@ void goToLightSleep() {
     
     adc_continuous_stop(multifx_adc_handle);
     
-    while ((REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN))) {
+    // Wake up if either BOOT_SENSE_PIN (GPIO 0) or BLE_TOGGLE_PIN (GPIO 14) is pressed
+    while ((REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN)) && 
+           (REG_READ(GPIO_IN_REG) & (1 << BLE_TOGGLE_PIN))) {
         if (btmidi.isConnected()) {
             Control_Surface.loop();
         }
@@ -853,10 +873,8 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                 
                 dma_transfer_done = false;
                 if (__builtin_expect(MAX_BUFFER_SIZE - nextDryIdx >= HOP_SIZE, 1)) {
-                    // Trigger asynchronous GDMA transfer from PSRAM directly to Pong buffer in Internal SRAM
                     esp_async_memcpy(dma_memcpy_handle, activeDmaWriteBuf, &delayBuffer[nextDryIdx], HOP_SIZE * sizeof(int16_t), dma_memcpy_cb, (void*)&dma_transfer_done);
                 } else {
-                    // Fallback to CPU copy if the circular buffer wraps around during this 64-sample block
                     for(int i = 0; i < HOP_SIZE; i++) activeDmaWriteBuf[i] = delayBuffer[(nextDryIdx + i) & BUFFER_MASK];
                     dma_transfer_done = true;
                 }
@@ -865,7 +883,6 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                 int aheadFB = (prefetchIdxFB + 32) & FB_BUFFER_MASK; 
                 __builtin_prefetch(&fbDelayBuffer[aheadFB], 0, 3);
                 
-                // The CPU crunches math here concurrently while GDMA hardware fetches data over the SPI bus
                 DSP_ProcessInput(
                     framesRead, i2s_in_block, normFactor, dc_alpha, envRetain, envAttack, 
                     p_sw_thr, p_sw_att, p_sw_rel, srScale, swellActive, localVolGain, vol_alpha, 
@@ -876,7 +893,6 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                 if(__builtin_expect(synthActive, 0)) for(int i=0; i<framesRead; i++) { synthEnv=(envBuf[i]>0.005f)?__builtin_fminf(1.0f,__builtin_fmaf(p_sy_att, srScale, synthEnv)):__builtin_fmaxf(0.0f,__builtin_fmaf(-p_sy_rel, srScale, synthEnv)); float clampedProc=__builtin_fmaxf(-1.0f,__builtin_fminf(inBuf[i],1.0f)); int waveIdx=(int)((clampedProc+1.0f)*1023.5f); float procSample=synthLUT[waveIdx]; float fltCoeff=__builtin_fmaxf(0.001f,__builtin_fminf(0.99f,__builtin_fmaf(0.6f*synthEnv, srScale, p_sy_flt*srScale))); synthFilter=AntiDenormal(__builtin_fmaf(fltCoeff, (procSample-synthFilter), synthFilter+DC_OFFSET)); inBuf[i]=synthFilter*p_sy_mix; }
                 if(__builtin_expect(padActive, 0)) for(int i=0; i<framesRead; i++) { padEnv=(envBuf[i]>0.005f)?__builtin_fminf(1.0f,__builtin_fmaf(0.00002f, srScale, padEnv)):__builtin_fmaxf(0.0f,__builtin_fmaf(-0.000005f, srScale, padEnv)); inBuf[i]*=padEnv; }
                 
-                // Block/Poll to guarantee PSRAM data has safely landed in Pong buffer
                 while(!dma_transfer_done) { 
                     __asm__ __volatile__ ("nop"); 
                 }
@@ -917,15 +933,12 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                     
                     if(__builtin_expect(padActive, 0)) padFilter=AntiDenormal(__builtin_fmaf(padFilter, pdSmCoeff, __builtin_fmaf(w1Buf[i], (1.0f-pdSmCoeff), DC_OFFSET))); else padFilter=AntiDenormal(__builtin_fmaf(padFilter, pdSmCoeff, DC_OFFSET)); 
                     
-                    // --- DMA Paging Integration ---
-                    // Fetch the sample instantly from the L1 Ping/Pong DMA Buffer instead of PSRAM
                     dryBuf[i] = (float)activeDmaReadBuf[i] * 3.0517578125e-5f; 
                     
                     padFilterBuf[i]=padFilter; fbOutBuf[i]=fbOutNode; writeIndex=(writeIndex+1)&BUFFER_MASK;
                 }
                 vibratoLfoPhase=localVibPhase; chorusLfoPhase=localChoPhase; feedbackLfoPhase=localFbPhase; fbHpfState=localFbHpf;
                 
-                // Swap Ping/Pong GDMA Buffers for the next OS tick
                 int16_t* tempDmaPtr = activeDmaReadBuf;
                 activeDmaReadBuf = activeDmaWriteBuf;
                 activeDmaWriteBuf = tempDmaPtr;
@@ -1083,18 +1096,7 @@ bool channelMessageCallback(ChannelMessage cm) {
         else if(cm.data1==1 && cm.data2>=64) switchEffectMode(activeEffectMode.load(std::memory_order_acquire)+1);
         else if(cm.data1==2 && cm.data2>=64) sampleRateToggleRequested=true;
         else if(cm.data1==3 && cm.data2>=64) {
-             dsp_is_paused.store(true, std::memory_order_release);
-             while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-             latencyMode.store((latencyMode.load(std::memory_order_acquire)+1)%4, std::memory_order_release);
-             memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t));
-             memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t));
-             memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
-             globalAudioResetRequested.store(true, std::memory_order_release);
-             dspNeedsCommit = true;
-             std::atomic_thread_fence(std::memory_order_seq_cst);
-             dsp_is_paused.store(false, std::memory_order_release);
-             while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-             forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis();
+             cycleLatencyMode();
          }
         else if(cm.data1==4 && cm.data2>=64) {
              dsp_is_paused.store(true, std::memory_order_release);
@@ -1209,7 +1211,7 @@ void setup() {
     
     pedals.resetToCenter();
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP); 
-    pinMode(14, INPUT_PULLUP);
+    pinMode(BLE_TOGGLE_PIN, INPUT_PULLUP);
     lastActivityTime=millis();
     lastScreenActivityTime=millis();
 
@@ -1261,11 +1263,8 @@ void setup() {
     memset(dmaPingBuffer, 0, 256);
     memset(dmaPongBuffer, 0, 256);
 
-    // Initialize ESP-IDF GDMA driver for Memory-to-Memory transfers
     async_memcpy_config_t dma_config = ASYNC_MEMCPY_DEFAULT_CONFIG();
     dma_config.backlog = 8;
-    // sram_trans_align and psram_trans_align are deprecated in modern ESP-IDF.
-    // The hardware driver now automatically detects and enforces 64-byte alignment.
     ESP_ERROR_CHECK(esp_async_memcpy_install(&dma_config, &dma_memcpy_handle));
 
     calibratePBs(); updateLUT();
@@ -1343,23 +1342,33 @@ void loop() {
     if(millis()-lastActivityTime>LIGHT_SLEEP_TIMEOUT) goToLightSleep();
     if(!isScreenOff.load(std::memory_order_acquire) && (millis()-lastScreenActivityTime>SCREEN_OFF_TIMEOUT)) turnScreenOff();
     
-    bool reading = (REG_READ(GPIO_IN_REG) & (1 << 14)) != 0;
+    // --- Dual-Function GPIO 14 (LilyGO IO14 Button) Handling ---
+    bool reading = (REG_READ(GPIO_IN_REG) & (1 << BLE_TOGGLE_PIN)) != 0;
     if (reading != gpio14LastState && (millis() - lastDebounceTime) > 50) {
         lastDebounceTime = millis();
         if (!reading) { 
-            gpio14PressTime = millis();
+            gpio14PressTime = millis(); // Button Pressed (Active LOW)
+            if (isScreenOff.load(std::memory_order_acquire)) turnScreenOn();
+            lastActivityTime = millis();
+            lastScreenActivityTime = millis();
         } else { 
+            // Button Released
             unsigned long pressDuration = millis() - gpio14PressTime;
-            if (pressDuration >= 2000) {
-                if (!bleEnabled) {
-                    btStart();
-                    bleEnabled = true;
-                }
-            } else if (pressDuration >= 1000) {
+            if (pressDuration >= 1000) {
+                // LONG PRESS (>= 1.0s): Simplified BLE Toggle (On <-> Off)
                 if (bleEnabled) {
                     btStop();
                     bleEnabled = false;
+                    Serial.println("BLE MIDI Disabled.");
+                } else {
+                    btStart();
+                    bleEnabled = true;
+                    Serial.println("BLE MIDI Enabled.");
                 }
+                forceUIUpdate.store(true, std::memory_order_release);
+            } else if (pressDuration >= 50) {
+                // SHORT TAP (50ms - 999ms): Cycle Latency Windows
+                cycleLatencyMode();
             }
         }
         gpio14LastState = reading;
@@ -1482,12 +1491,12 @@ void loop() {
         dspNeedsCommit = false;
     }
     
-    // Check Background DMA Paging health via Serial
     static unsigned long lastDmaPrint = 0;
     if(millis() - lastDmaPrint > 2000) {
         Serial.printf("\n--- DMA PAGING STATUS ---\n");
         Serial.printf("Transfers Completed: %u\n", dma_success_count);
         Serial.printf("DSP Core Load: %d%%\n", (int)core1_load.load(std::memory_order_relaxed));
+        Serial.printf("Sample Rate: %u Hz\n", currentSampleRate.load(std::memory_order_relaxed));
         lastDmaPrint = millis();
     }
 

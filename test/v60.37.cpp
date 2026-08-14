@@ -1300,8 +1300,8 @@ void setup() {
     
     xTaskCreatePinnedToCore(DisplayTask, "UI", 8192, NULL, 1, NULL, 1); 
 
-    dspTaskStack = (StackType_t*)heap_caps_aligned_alloc(16, 16384, MALLOC_CAP_SPIRAM);
-    dspTaskTCB = (StaticTask_t*)heap_caps_aligned_alloc(16, sizeof(StaticTask_t), MALLOC_CAP_SPIRAM);
+    dspTaskStack = (StackType_t*)heap_caps_aligned_alloc(16, 16384, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    dspTaskTCB = (StaticTask_t*)heap_caps_aligned_alloc(16, sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
     if (dspTaskStack != nullptr && dspTaskTCB != nullptr) {
         audioTaskHandle = xTaskCreateStaticPinnedToCore(
@@ -1309,8 +1309,7 @@ void setup() {
             dspTaskStack, dspTaskTCB, 0
         );
     } else {
-        tft.init(); tft.setRotation(1); tft.fillScreen(TFT_RED); 
-        tft.setTextColor(TFT_WHITE, TFT_RED); tft.drawString("PSRAM ALLOC FAIL", 160, 85); 
+        Serial.println("Error: Internal SRAM allocation failed for DSP Task!");
         while(1) vTaskDelay(100);
     }
     

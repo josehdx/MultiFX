@@ -1,4 +1,4 @@
-// v60.38.cpp - LilyGO T-Display-S3 DSP Engine
+// v1.1 Lilygo Release Controller
 #pragma GCC optimize ("O3")
 #include <Arduino.h>
 #include <Control_Surface.h>
@@ -58,17 +58,16 @@ float *w1Buf=nullptr, *w2Buf=nullptr, *w3Buf=nullptr, *padFilterBuf=nullptr;
 float *dryBuf=nullptr, *fbOutBuf=nullptr, *sMixBuf=nullptr;
 esp_pm_lock_handle_t dsp_cpu_lock = NULL;
 
-// --- Background DMA Paging Architecture ---
 __attribute__((aligned(64))) uint8_t dmaPingBuffer[256];
 __attribute__((aligned(64))) uint8_t dmaPongBuffer[256];
 int16_t* activeDmaReadBuf = (int16_t*)dmaPingBuffer;
 int16_t* activeDmaWriteBuf = (int16_t*)dmaPongBuffer;
 async_memcpy_handle_t dma_memcpy_handle = NULL;
-volatile bool dma_transfer_done = true;
+std::atomic<bool> dma_transfer_done{true};
 volatile uint32_t dma_success_count = 0;
 
 static bool IRAM_ATTR dma_memcpy_cb(async_memcpy_handle_t mcp_hdl, async_memcpy_event_t *event, void *cb_args) {
-    *((volatile bool*)cb_args) = true;
+    static_cast<std::atomic<bool>*>(cb_args)->store(true, std::memory_order_release);
     dma_success_count = dma_success_count + 1;
     return false;
 }
@@ -91,7 +90,6 @@ void updateParameterFromCC(uint8_t cc, uint8_t val);
 volatile i2s_chan_handle_t tx_chan = NULL;
 volatile i2s_chan_handle_t rx_chan = NULL;
 
-// Lock-Free Double Buffer DSP Architecture
 struct __attribute__((aligned(64))) DSPCoreState {
     float fxMem[10];
     float params[10][5];
@@ -100,9 +98,6 @@ struct __attribute__((aligned(64))) DSPCoreState {
     int fbIdx;
     bool w, fz, fb, hr, cp, sy, pd, ch, sw, vb;
     float vg;
-    
-    // Explicit padding to reach exactly 320 bytes (multiple of 64)
-    // 268 bytes of data + 52 bytes padding = 320 bytes (exactly 5 cache lines)
     uint8_t _padding[52]; 
 };
 DSPCoreState dspStates[2];
@@ -145,8 +140,8 @@ void cycleLatencyMode() {
     lastParameterChangeTime = millis();
 }
 
-void commitDSPState() {
-    if (!dspAckCommit.load(std::memory_order_acquire)) return; 
+bool commitDSPState() {
+    if (!dspAckCommit.load(std::memory_order_acquire)) return false; 
 
     DSPCoreState* backBuffer = &dspStates[dspWriteIndex];
     for(int i=0; i<10; i++) {
@@ -171,6 +166,8 @@ void commitDSPState() {
     dspActiveState.store(backBuffer, std::memory_order_release);
     dspWriteIndex = (dspWriteIndex + 1) & 1; 
     dspAckCommit.store(false, std::memory_order_release); 
+    
+    return true;
 }
 
 TaskHandle_t audioTaskHandle = NULL;
@@ -332,7 +329,9 @@ void toggleSampleRate() {
     
     i2s_chan_config_t i2sConfig=I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     i2sConfig.dma_desc_num=8; i2sConfig.dma_frame_num=HOP_SIZE; i2sConfig.auto_clear=true;
-    i2s_new_channel(&i2sConfig, (i2s_chan_handle_t*)&tx_chan, (i2s_chan_handle_t*)&rx_chan);
+    i2s_chan_handle_t t_tx, t_rx;
+    i2s_new_channel(&i2sConfig, &t_tx, &t_rx);
+    tx_chan = t_tx; rx_chan = t_rx;
     
     i2s_std_config_t stdConfig={ 
         .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate.load(std::memory_order_acquire)), 
@@ -386,19 +385,14 @@ void goToLightSleep() {
 
     if (dsp_cpu_lock != NULL) esp_pm_lock_release(dsp_cpu_lock);
     
-    
-    // Wake up if either BOOT_SENSE_PIN (GPIO 0) or BLE_TOGGLE_PIN (GPIO 14) is pressed
     while ((REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN)) && 
            (REG_READ(GPIO_IN_REG) & (1 << BLE_TOGGLE_PIN))) {
-        if (btmidi.isConnected()) {
-            Control_Surface.loop();
-        }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     
-    adc_continuous_start(multifx_adc_handle);
-
     if (dsp_cpu_lock != NULL) esp_pm_lock_acquire(dsp_cpu_lock);
+    
+    adc_continuous_start(multifx_adc_handle);
     
     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
     memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); 
@@ -416,6 +410,7 @@ void goToLightSleep() {
 }
 
 void IRAM_ATTR __attribute__((optimize("O3"))) updateLUT() {
+    if (pitchShiftLUT_temp == nullptr) return;
     DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
     float basePitch=0.0f; 
     if(activeDSP->cp || (activeDSP->activeMode==4 && activeDSP->w)) basePitch+=activeDSP->fxMem[4];
@@ -463,7 +458,6 @@ struct GaugeDef { int type; float normVal; const char* label; char valStr[16]; }
 void updateDisplay() {
     spr.fillSprite(TFT_BLACK); 
     
-    vTaskSuspendAll(); 
     DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
     int renderMode = activeDSP->activeMode; 
     
@@ -472,7 +466,6 @@ void updateDisplay() {
     for(int i=0; i<10; i++) lMem[i] = activeDSP->fxMem[i];
     for(int i=0; i<5; i++) lPrm[i] = activeDSP->params[renderMode][i];
     int lFbIdx = activeDSP->fbIdx;
-    xTaskResumeAll();
 
     char batStr[24];
     if(isBatteryCharging.load(std::memory_order_relaxed)) { snprintf(batStr, sizeof(batStr), "CHG %.2fV %d%%", currentBatteryVoltage, currentBatteryPercent.load(std::memory_order_relaxed)); spr.setTextColor(TFT_GREEN, TFT_BLACK); }
@@ -515,7 +508,7 @@ void updateDisplay() {
     else { 
         float val=lMem[renderMode]; 
         if(renderMode==3) { bGauges[numG++]={1,val/24.0f,"INT",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",val); } 
-        else if(renderMode==5) { bGauges[numG++]={1,val/24.0f,"OSC",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",val); } 
+        else if(renderMode==5) { bGauges[numG++]={2,(val-0.01f)/0.5f,"OSC",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",val); } 
         else if(renderMode==6) { bGauges[numG++]={1,val/24.0f,"SHFT",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",val); } 
         else if(renderMode==7) { bGauges[numG++]={1,val/24.0f,"SHFT",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",val); } 
         else if(renderMode==9) { bGauges[numG++]={1,val/24.0f,"BASE",""}; snprintf(bGauges[numG-1].valStr,16,"%+.1f",val); } 
@@ -617,7 +610,10 @@ void DisplayTask(void * pvParameters) {
         }
 
         if(__builtin_expect(forceUIUpdate.exchange(false, std::memory_order_acq_rel), 1)) {
-             updateDisplay(); metersNeedClear=true;
+             if(!isScreenOff.load(std::memory_order_acquire)) {
+                 updateDisplay(); 
+                 metersNeedClear=true;
+             }
          }
         else {
              if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
@@ -633,8 +629,10 @@ void DisplayTask(void * pvParameters) {
                      updateMeters();
                      metersNeedClear=true;
                  } else if(__builtin_expect(metersNeedClear, 0)) {
+                     ui_audio_level.store(0.0f, std::memory_order_release);
+                     ui_output_level.store(0.0f, std::memory_order_release);
                      ui_clear_meters_requested.store(true, std::memory_order_release);
-                    updateMeters();
+                     updateMeters();
                      metersNeedClear=false;
                  }
              }
@@ -820,13 +818,19 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
         
         if(__builtin_expect(bytesRead>0, 1)) {
             int framesRead=bytesRead/8;
-            if(__builtin_expect(framesRead>0, 1)) {
+            if(__builtin_expect(framesRead == HOP_SIZE, 1)) {
                 if(__builtin_expect(panicResetRequested.load(std::memory_order_acquire), 0)) {
+                    while(!dma_transfer_done.load(std::memory_order_acquire)) { std::atomic_thread_fence(std::memory_order_acquire); __asm__ __volatile__ ("nop"); }
+                    memset(dmaPingBuffer, 0, 256);
+                    memset(dmaPongBuffer, 0, 256);
                     synthEnv=0.0f; synthFilter=0.0f; padFilter=0.0f; padEnv=0.0f; inputEnvelope=0.0f; feedbackFilterVar=0.0f; currentPitch=1.0f; freezeWriteIdxVar=0; freezePlayCounterVar=0; freezeStartIdxVar=0; activeFreezeLength=currentSampleRate.load(std::memory_order_acquire); fbDelayWriteIdx=0; apfNeedsClear=true; freezeRamp=0.0f; feedbackRamp=0.0f; vibratoLfoPhase=0.0f; chorusLfoPhase=0.0f; feedbackLfoPhase=0.0f;
                     uint32_t halfWinFixed=((uint32_t)currentWindowSize/2)<<16; tap_w1_1=0; tap_w1_2=halfWinFixed; tap_w2_1=0; tap_w2_2=halfWinFixed; tap_w3_1=0; tap_w3_2=halfWinFixed; tap_w4_1=0; tap_w4_2=halfWinFixed; tap_w5_1=0; tap_w5_2=halfWinFixed;
                     panicResetRequested.store(false, std::memory_order_release);
                 }
                 if(__builtin_expect(globalAudioResetRequested.load(std::memory_order_acquire), 0)) {
+                    while(!dma_transfer_done.load(std::memory_order_acquire)) { std::atomic_thread_fence(std::memory_order_acquire); __asm__ __volatile__ ("nop"); }
+                    memset(dmaPingBuffer, 0, 256);
+                    memset(dmaPongBuffer, 0, 256);
                     synthEnv=0.0f; synthFilter=0.0f; padFilter=0.0f; padEnv=0.0f; inputEnvelope=0.0f; feedbackFilterVar=0.0f; smoothedVolGain=volumePedalGain; currentPitch=1.0f; freezeWriteIdxVar=0; freezePlayCounterVar=0; freezeStartIdxVar=0; activeFreezeLength=currentSampleRate.load(std::memory_order_acquire); fbDelayWriteIdx=0; writeIndex=0; apfNeedsClear=true; input_dc_offset=0.0f; ui_audio_level.store(0.0f, std::memory_order_release); ui_output_level.store(0.0f, std::memory_order_release); freezeRamp=0.0f; feedbackRamp=0.0f; vibratoLfoPhase=0.0f; chorusLfoPhase=0.0f; feedbackLfoPhase=0.0f;
                     uint32_t halfWinFixed=((uint32_t)currentWindowSize/2)<<16; tap_w1_1=0; tap_w1_2=halfWinFixed; tap_w2_1=0; tap_w2_2=halfWinFixed; tap_w3_1=0; tap_w3_2=halfWinFixed; tap_w4_1=0; tap_w4_2=halfWinFixed; tap_w5_1=0; tap_w5_2=halfWinFixed;
                     globalAudioResetRequested.store(false, std::memory_order_release); smoothed_delay_samples=0.0f; 
@@ -835,30 +839,23 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                 }
                 
                 int currentMute = hardwareSyncMuteFrames.load(std::memory_order_acquire);
+                bool isMuted = false;
                 if(__builtin_expect(currentMute > 0, 0)) {
                      hardwareSyncMuteFrames.store(currentMute - 1, std::memory_order_release);
-                     memset(i2s_out_block,0,framesRead*2*sizeof(int32_t));
-                     ui_audio_level.store(0.0f, std::memory_order_release); ui_output_level.store(0.0f, std::memory_order_release);
-                     for(int i=0; i<framesRead; i++) {
-                         int32_t clean_sample=i2s_in_block[i*2]&0xFFFFFF00;
-                         float raw_in=((float)clean_sample*normFactor);
-                         input_dc_offset=AntiDenormal(__builtin_fmaf(raw_in, 0.05f, input_dc_offset * 0.95f));
-                     }
-                     size_t bytesWrittenCount;
-                     i2s_channel_write((i2s_chan_handle_t)tx_chan, i2s_out_block, framesRead*8, &bytesWrittenCount, pdMS_TO_TICKS(20));
-                     continue;
+                     isMuted = true;
                  }
+                 
                 uint32_t start_cycles=xthal_get_ccount(); float srScale=48000.0f/(float)currentSampleRate.load(std::memory_order_acquire);
                 
                 DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
-                dspAckCommit.store(true, std::memory_order_release); 
-
                 for(int j=0; j<10; j++) for(int k=0; k<5; k++) c_fx[j][k] = activeDSP->params[j][k]; 
                 c_lat = activeDSP->latMode; 
                 c_act = activeDSP->activeMode; 
                 c_w = activeDSP->w; c_fz = activeDSP->fz; c_fb = activeDSP->fb; c_hr = activeDSP->hr; 
                 c_cp = activeDSP->cp; c_sy = activeDSP->sy; c_pd = activeDSP->pd; c_ch = activeDSP->ch; 
                 c_sw = activeDSP->sw; c_vb = activeDSP->vb; c_vg = activeDSP->vg;
+
+                dspAckCommit.store(true, std::memory_order_release); 
                 
                 float c_pt = pitchShiftFactor.load(std::memory_order_acquire);
                 
@@ -873,16 +870,19 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                 float g_base=0.0f; if(dryGroup) { if(!repeatGroup) g_base=0.4f; } else if(harmActive) g_base=0.5f; else g_base=1.0f; float g_w2=harmActive?p_hr_mix:0.0f, g_w3=chorusActive?p_ch_mix:0.0f; bool padIsAudible=padActive||(fabsf(padFilter)>0.001f); float g_pad=padIsAudible?p_pd_mix:0.0f, g_frz=(!frzActive&&localFrzRamp>0.0f)?0.5f:0.0f, g_fb=(feedbackActive||localFbRamp>0.0f)?0.6f:0.0f, g_whammy=c_w?p_w_wet:0.0f, g_dry=c_w?p_w_dry:1.0f, vol_alpha=0.01f*srScale, meter_decay=(currentSampleRate.load(std::memory_order_acquire)==96000)?0.999f:0.998f, envRetain=powf(0.99f,srScale), envAttack=1.0f-envRetain;
                 if(__builtin_expect(isnan(synthFilter)||isinf(synthFilter), 0)) synthFilter=0.0f; if(__builtin_expect(isnan(padFilter)||isinf(padFilter), 0)) padFilter=0.0f; if(__builtin_expect(isnan(feedbackFilterVar)||isinf(feedbackFilterVar), 0)) feedbackFilterVar=0.0f; if(__builtin_expect(isnan(fbHpfState)||isinf(fbHpfState), 0)) fbHpfState=0.0f; float localVibPhase=vibratoLfoPhase, localChoPhase=chorusLfoPhase, localFbPhase=feedbackLfoPhase, localFbHpf=fbHpfState; 
                 
-                // --- BACKGROUND DMA PAGING SETUP ---
                 int currentDryIdx = (writeIndex - halfWindow + MAX_BUFFER_SIZE) & BUFFER_MASK;
                 int nextDryIdx = (currentDryIdx + HOP_SIZE) & BUFFER_MASK;
                 
-                dma_transfer_done = false;
+                dma_transfer_done.store(false, std::memory_order_release);
                 if (__builtin_expect(MAX_BUFFER_SIZE - nextDryIdx >= HOP_SIZE, 1)) {
-                    esp_async_memcpy(dma_memcpy_handle, activeDmaWriteBuf, &delayBuffer[nextDryIdx], HOP_SIZE * sizeof(int16_t), dma_memcpy_cb, (void*)&dma_transfer_done);
+                    esp_cache_msync((void*)&delayBuffer[nextDryIdx], HOP_SIZE * sizeof(int16_t), ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+                    if (esp_async_memcpy(dma_memcpy_handle, activeDmaWriteBuf, &delayBuffer[nextDryIdx], HOP_SIZE * sizeof(int16_t), dma_memcpy_cb, (void*)&dma_transfer_done) != ESP_OK) {
+                        for(int i = 0; i < HOP_SIZE; i++) activeDmaWriteBuf[i] = delayBuffer[(nextDryIdx + i) & BUFFER_MASK];
+                        dma_transfer_done.store(true, std::memory_order_release);
+                    }
                 } else {
                     for(int i = 0; i < HOP_SIZE; i++) activeDmaWriteBuf[i] = delayBuffer[(nextDryIdx + i) & BUFFER_MASK];
-                    dma_transfer_done = true;
+                    dma_transfer_done.store(true, std::memory_order_release);
                 }
                 
                 int prefetchIdxFB = (fbDelayWriteIdx - delaySamples + FB_BUFFER_SIZE) & FB_BUFFER_MASK; 
@@ -899,9 +899,7 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                 if(__builtin_expect(synthActive, 0)) for(int i=0; i<framesRead; i++) { synthEnv=(envBuf[i]>0.005f)?__builtin_fminf(1.0f,__builtin_fmaf(p_sy_att, srScale, synthEnv)):__builtin_fmaxf(0.0f,__builtin_fmaf(-p_sy_rel, srScale, synthEnv)); float clampedProc=__builtin_fmaxf(-1.0f,__builtin_fminf(inBuf[i],1.0f)); int waveIdx=(int)((clampedProc+1.0f)*1023.5f); float procSample=synthLUT[waveIdx]; float fltCoeff=__builtin_fmaxf(0.001f,__builtin_fminf(0.99f,__builtin_fmaf(0.6f*synthEnv, srScale, p_sy_flt*srScale))); synthFilter=AntiDenormal(__builtin_fmaf(fltCoeff, (procSample-synthFilter), synthFilter+DC_OFFSET)); inBuf[i]=synthFilter*p_sy_mix; }
                 if(__builtin_expect(padActive, 0)) for(int i=0; i<framesRead; i++) { padEnv=(envBuf[i]>0.005f)?__builtin_fminf(1.0f,__builtin_fmaf(0.00002f, srScale, padEnv)):__builtin_fmaxf(0.0f,__builtin_fmaf(-0.000005f, srScale, padEnv)); inBuf[i]*=padEnv; }
                 
-                while(!dma_transfer_done) { 
-                    __asm__ __volatile__ ("nop"); 
-                }
+                while(!dma_transfer_done.load(std::memory_order_acquire)) { std::atomic_thread_fence(std::memory_order_acquire); __asm__ __volatile__ ("nop"); }
                 
                 for(int i=0; i<framesRead; i++) {
                     float procSample=inBuf[i]; if(__builtin_expect(!frzActive, 1)) { freezeBuffer[freezeWriteIdxVar]=(int16_t)(__builtin_fmaxf(-1.0f,__builtin_fminf(procSample,1.0f))*32767.0f); freezeWriteIdxVar++; if(freezeWriteIdxVar>=freezeLength) freezeWriteIdxVar=0; }
@@ -983,6 +981,10 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                 float max_cycles = (currentSampleRate.load(std::memory_order_acquire) == 96000) ? (2500.0f * (float)framesRead) : (5000.0f * (float)framesRead);
                 float currentLoadPercentage=((float)(end_timer-start_cycles)/max_cycles)*100.0f; 
                 core1_load.store(__builtin_fmaf(core1_load.load(std::memory_order_relaxed), 0.95f, __builtin_fminf(100.0f,currentLoadPercentage)*0.05f), std::memory_order_relaxed);
+                
+                if(__builtin_expect(isMuted, 0)) {
+                    memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
+                }
                 
                 size_t bytesWrittenCount; i2s_channel_write((i2s_chan_handle_t)tx_chan, i2s_out_block, framesRead*8, &bytesWrittenCount, pdMS_TO_TICKS(20));
             } else {
@@ -1098,68 +1100,7 @@ bool channelMessageCallback(ChannelMessage cm) {
             if(sendCenterMidi) Control_Surface.sendPitchBend(Channel_3, 8192); 
             forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); 
         }
-        else if(cm.data1==0 && cm.data2>=64) switchEffectMode(activeEffectMode.load(std::memory_order_acquire)-1);
-        else if(cm.data1==1 && cm.data2>=64) switchEffectMode(activeEffectMode.load(std::memory_order_acquire)+1);
-        else if(cm.data1==2 && cm.data2>=64) sampleRateToggleRequested=true;
-        else if(cm.data1==3 && cm.data2>=64) {
-             cycleLatencyMode();
-         }
-        else if(cm.data1==4 && cm.data2>=64) {
-             dsp_is_paused.store(true, std::memory_order_release);
-             while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-             memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t));
-             memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t));
-             memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
-             bool anyEffectOn=isWhammyActive||isFrozen||isFeedbackActive||isHarmonizerMode||isCapoMode||isSynthMode||isPadMode||isChorusMode||isSwellMode||isVibratoMode;
-             if(anyEffectOn||activeEffectMode.load(std::memory_order_acquire)!=0) { 
-                 isWhammyActive=false; isFrozen=false; isFeedbackActive=false; isHarmonizerMode=false; isCapoMode=false; isSynthMode=false; isPadMode=false; isChorusMode=false; isSwellMode=false; isVibratoMode=false; 
-                 activeEffectMode.store(0, std::memory_order_release); panicResetRequested.store(true, std::memory_order_release); 
-             } else { isWhammyActive=true; }
-             if(isVolumeMode) { isVolumeMode=false; pedals.lockPB3Whammy(); }
-             volumePedalGain=1.0f; currentPB1=8192; currentPB2=8192; currentPB3=8192; lastActivePedal=8192;
-             float* currentLUT = pitchShiftLUT.load(std::memory_order_acquire);
-             if(!lutNeedsUpdate && currentLUT!=nullptr) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release);
-             dspNeedsCommit = true;
-             std::atomic_thread_fence(std::memory_order_seq_cst);
-             dsp_is_paused.store(false, std::memory_order_release);
-             while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-             Control_Surface.sendPitchBend(Channel_1, 8192); Control_Surface.sendPitchBend(Channel_2, 8192); Control_Surface.sendPitchBend(Channel_3, 8192);
-             lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis();
-         }
-        else if(cm.data1==8 && cm.data2>=64) { isFrozen=!isFrozen; if(activeEffectMode.load(std::memory_order_acquire)==1) isWhammyActive=isFrozen; dspNeedsCommit = true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==9 && cm.data2>=64) { isFeedbackActive=!isFeedbackActive; if(activeEffectMode.load(std::memory_order_acquire)==2) isWhammyActive=isFeedbackActive; dspNeedsCommit = true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==10 && cm.data2>=64) { isHarmonizerMode=!isHarmonizerMode; if(activeEffectMode.load(std::memory_order_acquire)==3) isWhammyActive=isHarmonizerMode; dspNeedsCommit = true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==12 && cm.data2>=64) { isCapoMode=!isCapoMode; if(activeEffectMode.load(std::memory_order_acquire)==4) isWhammyActive=isCapoMode; dspNeedsCommit = true; lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==13 && cm.data2>=64) { isSynthMode=!isSynthMode; if(activeEffectMode.load(std::memory_order_acquire)==5) isWhammyActive=isSynthMode; dspNeedsCommit = true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==14 && cm.data2>=64) { isPadMode=!isPadMode; if(activeEffectMode.load(std::memory_order_acquire)==6) isWhammyActive=isPadMode; dspNeedsCommit = true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==15 && cm.data2>=64) { isChorusMode=!isChorusMode; if(activeEffectMode.load(std::memory_order_acquire)==7) isWhammyActive=isChorusMode; dspNeedsCommit = true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==16 && cm.data2>=64) { isSwellMode=!isSwellMode; if(activeEffectMode.load(std::memory_order_acquire)==8) isWhammyActive=isSwellMode; dspNeedsCommit = true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==7 && cm.data2>=64) { isVibratoMode=!isVibratoMode; if(activeEffectMode.load(std::memory_order_acquire)==9) isWhammyActive=isVibratoMode; dspNeedsCommit = true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
-        else if(cm.data1==17 || cm.data1==18) {
-            float step=(cm.data2>=64)?-1.0f:1.0f;
-            int renderMode=activeEffectMode.load(std::memory_order_acquire);
-            if(cm.data1==17) {
-                if(renderMode==0||renderMode==1||renderMode==8) {
-                    effectMemory[1]=constrain(effectMemory[1]+step,-24.0f,24.0f);
-                } else if(renderMode==4) {
-                    effectMemory[4]=constrain(effectMemory[4]+step,-24.0f,24.0f);
-                } else if(renderMode==2) {
-                    if(step>0) feedbackIntervalIdx.store((feedbackIntervalIdx.load(std::memory_order_acquire)+1)%5, std::memory_order_release);
-                    else feedbackIntervalIdx.store((feedbackIntervalIdx.load(std::memory_order_acquire)+4)%5, std::memory_order_release);
-                } else {
-                    effectMemory[renderMode]=constrain(effectMemory[renderMode]+step,-24.0f,24.0f);
-                }
-            } else if(cm.data1==18) {
-                if(renderMode==0||renderMode==1||renderMode==8) {
-                    effectMemory[0]=constrain(effectMemory[0]+step,-24.0f,24.0f);
-                } else if(renderMode==4) {
-                    float centStep=step*0.01f;
-                    effectMemory[4]=constrain(effectMemory[4]+centStep,-24.0f,24.0f);
-                }
-            }
-            dspNeedsCommit = true;
-            lutNeedsUpdate=true; forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis();
-        }
+        // BANANA LEAF: Effect toggling bypassed for forced 96kHz multi-FX load testing
     }
     return false;
 }
@@ -1201,14 +1142,13 @@ void setup() {
     activeEffectMode.store(preferences.getInt("activeMode", 0), std::memory_order_release);
     latencyMode.store(constrain(preferences.getInt("latMode", 0), 0, 3), std::memory_order_release); 
     isPB2WiperMode=preferences.getBool("pb2Wiper", false); isVolumeMode=false; 
-    currentSampleRate.store(preferences.getUInt("sampleRate", 48000), std::memory_order_release); 
+    currentSampleRate.store(96000, std::memory_order_release); 
     feedbackIntervalIdx.store(constrain(preferences.getInt("fbIdx", 0), 0, 4), std::memory_order_release);
     AppSettings savedSettings; size_t len=preferences.getBytes("dspData", &savedSettings, sizeof(AppSettings));
     if(len==sizeof(AppSettings)) {
         for(int i=0; i<10; i++) { effectMemory[i]=savedSettings.fxMem[i]; for(int p=0; p<5; p++) fxParams[i][p]=savedSettings.params[i][p]; }
     }
-    uint16_t fxStates=preferences.getUShort("fxStates", 1);
-    isWhammyActive=true; isFrozen=(fxStates&(1<<1))!=0; isFeedbackActive=(fxStates&(1<<2))!=0; isHarmonizerMode=(fxStates&(1<<3))!=0; isCapoMode=(fxStates&(1<<4))!=0; isSynthMode=(fxStates&(1<<5))!=0; isPadMode=(fxStates&(1<<6))!=0; isChorusMode=(fxStates&(1<<7))!=0; isSwellMode=(fxStates&(1<<8))!=0; isVibratoMode=(fxStates&(1<<9))!=0;
+    isWhammyActive=true; isFrozen=true; isFeedbackActive=true; isHarmonizerMode=true; isCapoMode=true; isSynthMode=true; isPadMode=true; isChorusMode=true; isSwellMode=true; isVibratoMode=true;
     preferences.end();
     
     commitDSPState();
@@ -1219,7 +1159,6 @@ void setup() {
     pinMode(BOOT_SENSE_PIN, INPUT_PULLUP); 
     pinMode(BLE_TOGGLE_PIN, INPUT_PULLUP);
     lastActivityTime=millis();
-    lastScreenActivityTime=millis();
 
     delayBuffer=(int16_t*)heap_caps_aligned_alloc(64, MAX_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_SPIRAM);
     fbDelayBuffer=(int16_t*)heap_caps_aligned_alloc(64, FB_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -1288,15 +1227,21 @@ void setup() {
     i2s_chan_config_t i2sConfig=I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     i2sConfig.dma_desc_num=8; 
     i2sConfig.dma_frame_num=HOP_SIZE; i2sConfig.auto_clear=true; 
-    i2s_new_channel(&i2sConfig, (i2s_chan_handle_t*)&tx_chan, (i2s_chan_handle_t*)&rx_chan);
+    i2s_chan_handle_t t_tx, t_rx;
+    i2s_new_channel(&i2sConfig, &t_tx, &t_rx);
+    tx_chan = t_tx; rx_chan = t_rx;
     
     i2s_std_config_t stdConfig={ 
         .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate.load(std::memory_order_acquire)), 
         .slot_cfg=I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
-        .gpio_cfg={ .mclk=GPIO_NUM_43, .bclk=GPIO_NUM_44, .ws=GPIO_NUM_18, .dout=GPIO_NUM_16, .din=GPIO_NUM_17 } 
+        // BANANA LEAF MODIFICATION: Remapped MCLK to GPIO 17 and BCLK to GPIO 18
+        // Note: As per instructions, WS and DIN remain unchanged from Lilygo version (18 and 17).
+        // WARNING: This creates an intentional hardware pin conflict for testing purposes.
+        .gpio_cfg={ .mclk=GPIO_NUM_17, .bclk=GPIO_NUM_18, .ws=GPIO_NUM_18, .dout=GPIO_NUM_16, .din=GPIO_NUM_17 } 
     };
     stdConfig.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384; 
-    i2s_channel_init_std_mode((i2s_chan_handle_t)tx_chan, &stdConfig); i2s_channel_init_std_mode((i2s_chan_handle_t)rx_chan, &stdConfig);
+
+    i2s_channel_init_std_mode((i2s_chan_handle_t)rx_chan, &stdConfig);
     
     settingsNeedSaving=false;
     
@@ -1341,27 +1286,18 @@ void loop() {
     bool currentBtState=btmidi.isConnected();
     if(currentBtState!=lastBtState) { 
         lastBtState=currentBtState; 
-        forceUIUpdate.store(true, std::memory_order_release); 
-        if(isScreenOff.load(std::memory_order_acquire)) turnScreenOn(); 
-        lastScreenActivityTime=millis(); 
     }
     if(millis()-lastActivityTime>LIGHT_SLEEP_TIMEOUT) goToLightSleep();
-    if(!isScreenOff.load(std::memory_order_acquire) && (millis()-lastScreenActivityTime>SCREEN_OFF_TIMEOUT)) turnScreenOff();
     
-    // --- Dual-Function GPIO 14 (LilyGO IO14 Button) Handling ---
     bool reading = (REG_READ(GPIO_IN_REG) & (1 << BLE_TOGGLE_PIN)) != 0;
     if (reading != gpio14LastState && (millis() - lastDebounceTime) > 50) {
         lastDebounceTime = millis();
         if (!reading) { 
-            gpio14PressTime = millis(); // Button Pressed (Active LOW)
-            if (isScreenOff.load(std::memory_order_acquire)) turnScreenOn();
+            gpio14PressTime = millis(); 
             lastActivityTime = millis();
-            lastScreenActivityTime = millis();
         } else { 
-            // Button Released
             unsigned long pressDuration = millis() - gpio14PressTime;
             if (pressDuration >= 1000) {
-                // LONG PRESS (>= 1.0s): Simplified BLE Toggle (On <-> Off)
                 if (bleEnabled) {
                     btStop();
                     bleEnabled = false;
@@ -1371,9 +1307,7 @@ void loop() {
                     bleEnabled = true;
                     Serial.println("BLE MIDI Enabled.");
                 }
-                forceUIUpdate.store(true, std::memory_order_release);
             } else if (pressDuration >= 50) {
-                // SHORT TAP (50ms - 999ms): Cycle Latency Windows
                 cycleLatencyMode();
             }
         }
@@ -1394,8 +1328,6 @@ void loop() {
     if(!currentBootState && lastBootState) { 
         switchEffectMode(activeEffectMode.load(std::memory_order_acquire) + 1);
         lastActivityTime = millis();
-        lastScreenActivityTime = millis();
-        if(isScreenOff.load(std::memory_order_acquire)) turnScreenOn();
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     lastBootState = currentBootState;
@@ -1403,7 +1335,7 @@ void loop() {
     pedals.process(latestPB1, latestPB2, latestPB3, isVolumeMode, INVERT_PB3);
     int calA=pedals.getCalA(), calB=pedals.getCalB(), calC=pedals.getCalC(); bool moveA=pedals.hasMovedA(), moveB=pedals.hasMovedB(), moveC=pedals.hasMovedC();
     if(moveA||moveB||moveC) {
-        if(isScreenOff.load(std::memory_order_acquire)) turnScreenOn(); lastScreenActivityTime=millis(); lastActivityTime=millis();
+        lastActivityTime=millis();
         if(moveA) { Control_Surface.sendPitchBend(Channel_1, calA); pedals.updateLastMidiA(); currentPB1=calA; }
         if(moveB) { Control_Surface.sendPitchBend(Channel_2, calB); pedals.updateLastMidiB(); currentPB2=calB; }
         if(moveC) { if(!isVolumeMode) Control_Surface.sendPitchBend(Channel_3, calC); pedals.updateLastMidiC(); currentPB3=calC; }
@@ -1421,7 +1353,6 @@ void loop() {
             volumePedalGain=(float)calC/16383.0f; 
             dspNeedsCommit = true; 
         }
-        forceUIUpdate.store(true, std::memory_order_release);
     }
     
     int currentBatVal = latestBat.load(std::memory_order_relaxed);
@@ -1454,14 +1385,11 @@ void loop() {
                     vTaskDelay(portMAX_DELAY);
                 }
             }
-
             bool charging=(instantVoltage>4.20f); 
             int newPercent=getBatteryPercentage(instantVoltage); 
-            bool stateChanged=(newPercent!=currentBatteryPercent.load(std::memory_order_relaxed))||(charging!=isBatteryCharging.load(std::memory_order_relaxed)); 
             currentBatteryVoltage=instantVoltage; 
             currentBatteryPercent.store(newPercent, std::memory_order_relaxed); 
             isBatteryCharging.store(charging, std::memory_order_relaxed); 
-            if(stateChanged) forceUIUpdate.store(true, std::memory_order_release); 
         } 
     }
     
@@ -1475,26 +1403,27 @@ void loop() {
     }
     
     if(settingsNeedSaving && (millis()-lastParameterChangeTime>2000)) { 
-        if(ui_audio_level.load(std::memory_order_acquire)<0.01f || (millis()-lastParameterChangeTime>10000)) { 
-            settingsNeedSaving=false; 
-            
-            dsp_is_paused.store(true, std::memory_order_release);
-            while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-            
-            saveSettings();
-            
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            dsp_is_paused.store(false, std::memory_order_release);
-            while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-        } 
+        settingsNeedSaving=false; 
+        
+        dsp_is_paused.store(true, std::memory_order_release);
+        while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+        
+        saveSettings();
+        
+        globalAudioResetRequested.store(true, std::memory_order_release);
+        
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        dsp_is_paused.store(false, std::memory_order_release);
+        while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
     }
     
     if(sampleRateToggleRequested) { sampleRateToggleRequested=false; toggleSampleRate(); }
-    if(pb2ToggleRequested) { pb2ToggleRequested=false; calibratePBs(); forceUIUpdate.store(true, std::memory_order_release); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
+    if(pb2ToggleRequested) { pb2ToggleRequested=false; calibratePBs(); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
     
     if (dspNeedsCommit) {
-        commitDSPState();
-        dspNeedsCommit = false;
+        if (commitDSPState()) {
+            dspNeedsCommit = false;
+        }
     }
     
     static unsigned long lastDmaPrint = 0;

@@ -881,9 +881,6 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                     __asm__ __volatile__ ("nop"); 
                 }
                 
-                // Invalidate CPU Cache line to force fetch from SRAM, preventing stale L1 cache hits
-                esp_cache_msync((void*)activeDmaReadBuf, 256, ESP_CACHE_MSYNC_FLAG_INVALIDATE);
-                
                 for(int i=0; i<framesRead; i++) {
                     float procSample=inBuf[i]; if(__builtin_expect(!frzActive, 1)) { freezeBuffer[freezeWriteIdxVar]=(int16_t)(__builtin_fmaxf(-1.0f,__builtin_fminf(procSample,1.0f))*32767.0f); freezeWriteIdxVar++; if(freezeWriteIdxVar>=freezeLength) freezeWriteIdxVar=0; }
                     if(__builtin_expect(localFrzRamp>0.0f||frzActive, 0)) localFrzRamp=frzActive?__builtin_fminf(1.0f,__builtin_fmaf(p_fz_att, srScale, localFrzRamp)):__builtin_fmaxf(0.0f,__builtin_fmaf(-p_fz_rel, srScale, localFrzRamp));

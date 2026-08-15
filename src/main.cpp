@@ -1,4 +1,4 @@
-// v1.4 Lilygo Release Controller (Rich UI 30 FPS Edition)
+// v1.4 Lilygo Release Controller (Dynamic Bipolar/Unipolar UI Edition)
 #pragma GCC optimize ("O3")
 #include <Arduino.h>
 #include <Control_Surface.h>
@@ -214,7 +214,6 @@ volatile float currentBatteryVoltage=4.00f;
 std::atomic<bool> isBatteryCharging{false};
 const int BATTERY_PIN=4, BOOT_SENSE_PIN=0, BLE_TOGGLE_PIN=14, SYSTEM_POWER_LATCH_PIN=5;
 
-// v1.4 Pin Mappings (PAR 5 swapped to ADC2_CH5)
 pin_t pinPB=1, pinPB2=2, pinPB3=10, pinPar1=3, pinPar2=11, pinPar3=12, pinPar4=13, pinPar5=16;
 uint16_t lastMidiSent=8192;
 volatile uint16_t currentPB1=8192, currentPB2=8192, currentPB3=8192, currentCC11=0; 
@@ -333,7 +332,6 @@ void toggleSampleRate() {
     i2s_new_channel(&i2sConfig, &t_tx, &t_rx);
     tx_chan = t_tx; rx_chan = t_rx;
     
-    // v1.4 I2S DOUT Swapped to GPIO 21
     i2s_std_config_t stdConfig={ 
         .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate.load(std::memory_order_acquire)), 
         .slot_cfg=I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
@@ -446,14 +444,17 @@ void DisplayTask(void * pvParameters) {
     tft.fillScreen(TFT_BLACK);
     
     char buf[64];
-    int cx[4] = {65, 130, 195, 260};
+    
+    // Centers exactly distributed for 320px width: 4 columns top, 5 columns bottom
+    int cx_top[4] = {40, 120, 200, 280};
+    int cx_bot[5] = {32, 96, 160, 224, 288};
     int cy1 = 55, cy2 = 105;
+    int r = 18; 
+    
+    const int PAR_COUNT[10] = {4, 5, 4, 2, 2, 5, 3, 3, 5, 2};
+    int lastRenderMode = -1;
 
-    // Draw static structural circles once to save SPI overhead
-    for(int i=0; i<4; i++) {
-        tft.drawCircle(cx[i], cy1, 24, TFT_DARKGREY);
-        tft.drawCircle(cx[i], cy2, 24, TFT_DARKGREY);
-    }
+    for(int i=0; i<4; i++) { tft.drawCircle(cx_top[i], cy1, r, TFT_DARKGREY); }
 
     for(;;) {
         if(__builtin_expect(isBatteryDead.load(std::memory_order_acquire), 0)) {
@@ -467,58 +468,79 @@ void DisplayTask(void * pvParameters) {
             DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
             int renderMode = activeDSP->activeMode; 
             
-            // --- TOP STATUS BAR ---
+            if(renderMode != lastRenderMode) {
+                tft.fillRect(10, 70, 300, 60, TFT_BLACK); 
+                int activeParams = PAR_COUNT[renderMode];
+                for(int i=0; i<activeParams; i++) { tft.drawCircle(cx_bot[i], cy2, r, TFT_DARKGREY); }
+                lastRenderMode = renderMode;
+            }
+            
             tft.fillRect(0, 0, 320, 20, TFT_NAVY);
             tft.setTextColor(TFT_WHITE, TFT_NAVY);
             sprintf(buf, "%.2fV %d%%", currentBatteryVoltage, currentBatteryPercent.load(std::memory_order_relaxed));
             tft.drawString(buf, 4, 2, 2);
-            
             tft.drawCentreString(EFFECT_NAMES[renderMode], 160, 2, 2);
-            
             sprintf(buf, "BT: %s", btmidi.isConnected() ? "CONN" : "WAIT");
             tft.drawString(buf, 250, 2, 2);
 
-            // --- AUDIO METERS ---
             float inLvl = ui_audio_level.load(std::memory_order_acquire);
             float outLvl = ui_output_level.load(std::memory_order_acquire);
             int inH = (int)(inLvl * 90.0f); if(inH>90) inH=90;
             int outH = (int)(outLvl * 90.0f); if(outH>90) outH=90;
             
-            tft.fillRect(5, 30, 10, 90-inH, TFT_BLACK);
-            tft.fillRect(5, 120-inH, 10, inH, TFT_GREEN);
-            tft.fillRect(305, 30, 10, 90-outH, TFT_BLACK);
-            tft.fillRect(305, 120-outH, 10, outH, TFT_GREEN);
+            tft.fillRect(2, 30, 6, 90-inH, TFT_BLACK);
+            tft.fillRect(2, 120-inH, 6, inH, TFT_GREEN);
+            tft.fillRect(312, 30, 6, 90-outH, TFT_BLACK);
+            tft.fillRect(312, 120-outH, 6, outH, TFT_GREEN);
             
             tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-            tft.drawString("IN", 4, 125, 1);
+            tft.drawString("IN", 1, 125, 1);
             tft.drawString("OUT", 300, 125, 1);
 
-            // --- PARAMETER KNOBS (Text Overwrite Background) ---
             tft.setTextColor(TFT_WHITE, TFT_BLACK);
-            tft.drawCentreString("PB1", cx[0], cy1-35, 1);
-            tft.drawCentreString("PB2", cx[1], cy1-35, 1);
-            tft.drawCentreString("PB3", cx[2], cy1-35, 1);
-            tft.drawCentreString("CC11", cx[3], cy1-35, 1);
+            const char* topLabels[] = {"PB1", "PB2", "PB3", "CC11"};
+            for(int i=0; i<4; i++) { tft.drawCentreString(topLabels[i], cx_top[i], cy1-28, 1); }
             
             tft.setTextColor(TFT_CYAN, TFT_BLACK);
-            sprintf(buf, "%3d%%", (int)(currentPB1/163.83f)); tft.drawCentreString(buf, cx[0], cy1-5, 2);
-            sprintf(buf, "%3d%%", (int)(currentPB2/163.83f)); tft.drawCentreString(buf, cx[1], cy1-5, 2);
-            sprintf(buf, "%3d%%", (int)(currentPB3/163.83f)); tft.drawCentreString(buf, cx[2], cy1-5, 2);
-            sprintf(buf, "%3d%%", (int)(currentCC11/163.83f)); tft.drawCentreString(buf, cx[3], cy1-5, 2);
+            
+            // Bipolar mapping for PB1/PB2 (-100% to 100%)
+            int pb1_pct = (int)(((float)currentPB1 - 8192.0f) / 81.915f);
+            int pb2_pct = (int)(((float)currentPB2 - 8192.0f) / 81.915f);
+            
+            // Unipolar mapping for PB3 and CC11 (0% to 100%)
+            int pb3_pct = (int)(currentPB3 / 163.83f);
+            int cc11_pct = (int)(currentCC11 / 163.83f);
+            
+            sprintf(buf, "%d%%", pb1_pct); tft.drawCentreString(buf, cx_top[0], cy1-4, 1);
+            sprintf(buf, "%d%%", pb2_pct); tft.drawCentreString(buf, cx_top[1], cy1-4, 1);
+            sprintf(buf, "%d%%", pb3_pct); tft.drawCentreString(buf, cx_top[2], cy1-4, 1);
+            sprintf(buf, "%d%%", cc11_pct); tft.drawCentreString(buf, cx_top[3], cy1-4, 1);
 
             tft.setTextColor(TFT_WHITE, TFT_BLACK);
-            tft.drawCentreString("PAR 1", cx[0], cy2-35, 1);
-            tft.drawCentreString("PAR 2", cx[1], cy2-35, 1);
-            tft.drawCentreString("PAR 3", cx[2], cy2-35, 1);
-            tft.drawCentreString("PAR 4", cx[3], cy2-35, 1);
+            const char* botLabels[] = {"PAR 1", "PAR 2", "PAR 3", "PAR 4", "PAR 5"};
+            int activeParams = PAR_COUNT[renderMode];
+            for(int i=0; i<activeParams; i++) { tft.drawCentreString(botLabels[i], cx_bot[i], cy2-28, 1); }
 
             tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-            sprintf(buf, "%5.2f", activeDSP->fxMem[renderMode]); tft.drawCentreString(buf, cx[0], cy2-5, 2);
-            sprintf(buf, "%5.2f", activeDSP->params[renderMode][0]); tft.drawCentreString(buf, cx[1], cy2-5, 2);
-            sprintf(buf, "%5.2f", activeDSP->params[renderMode][1]); tft.drawCentreString(buf, cx[2], cy2-5, 2);
-            sprintf(buf, "%5.2f", activeDSP->params[renderMode][2]); tft.drawCentreString(buf, cx[3], cy2-5, 2);
+            float dispVals[5] = {0.0f};
+            switch(renderMode) {
+                case 0: dispVals[0]=activeDSP->fxMem[1]; dispVals[1]=activeDSP->fxMem[0]; dispVals[2]=activeDSP->params[0][0]; dispVals[3]=activeDSP->params[0][1]; break;
+                case 1: dispVals[0]=activeDSP->fxMem[1]; dispVals[1]=activeDSP->fxMem[0]; dispVals[2]=activeDSP->params[1][0]; dispVals[3]=activeDSP->params[1][1]; dispVals[4]=activeDSP->params[1][2]; break;
+                case 2: dispVals[0]=(float)activeDSP->fbIdx; dispVals[1]=activeDSP->params[2][0]; dispVals[2]=activeDSP->params[2][1]; dispVals[3]=activeDSP->params[2][2]; break;
+                case 3: dispVals[0]=activeDSP->fxMem[3]; dispVals[1]=activeDSP->params[3][0]; break;
+                case 4: dispVals[0]=activeDSP->fxMem[4]; dispVals[1]=activeDSP->fxMem[4]; break;
+                case 5: dispVals[0]=activeDSP->fxMem[5]; dispVals[1]=activeDSP->params[5][0]; dispVals[2]=activeDSP->params[5][1]; dispVals[3]=activeDSP->params[5][2]; dispVals[4]=activeDSP->params[5][3]; break;
+                case 6: dispVals[0]=activeDSP->fxMem[6]; dispVals[1]=activeDSP->params[6][0]; dispVals[2]=activeDSP->params[6][1]; break;
+                case 7: dispVals[0]=activeDSP->fxMem[7]; dispVals[1]=activeDSP->params[7][0]; dispVals[2]=activeDSP->params[7][1]; break;
+                case 8: dispVals[0]=activeDSP->fxMem[1]; dispVals[1]=activeDSP->fxMem[0]; dispVals[2]=activeDSP->params[8][0]; dispVals[3]=activeDSP->params[8][1]; dispVals[4]=activeDSP->params[8][2]; break;
+                case 9: dispVals[0]=activeDSP->fxMem[9]; dispVals[1]=activeDSP->params[9][0]; break;
+            }
+            
+            for(int i=0; i<activeParams; i++) {
+                sprintf(buf, "%.2f", dispVals[i]); 
+                tft.drawCentreString(buf, cx_bot[i], cy2-4, 1);
+            }
 
-            // --- FX GRID ---
             const char* fxNamesShort[] = {"[WH]", "[FZ]", "[FB]", "[HR]", "[CP]", "[SY]", "[PD]", "[CH]", "[SW]", "[VB]"};
             bool fxStates[10] = {activeDSP->w, activeDSP->fz, activeDSP->fb, activeDSP->hr, activeDSP->cp, activeDSP->sy, activeDSP->pd, activeDSP->ch, activeDSP->sw, activeDSP->vb};
             int fxX = 22;
@@ -528,7 +550,6 @@ void DisplayTask(void * pvParameters) {
                 fxX += 28;
             }
 
-            // --- BOTTOM TELEMETRY BAR ---
             tft.fillRect(0, 155, 320, 15, TFT_DARKGREY);
             tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
             sprintf(buf, "CPU:%d%%  SRM:%dK  PSR:%dK  SR:%dkHz", 
@@ -551,7 +572,6 @@ void DisplayTask(void * pvParameters) {
             }
         }
 
-        // Target ~30 FPS Refresh Rate
         vTaskDelay(pdMS_TO_TICKS(33)); 
     }
 }

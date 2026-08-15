@@ -268,10 +268,23 @@ void fetchADCDMA() {
     }
 }
 
-// DECOUPLED UI NAVIGATION: Switching modes only changes screen focus; active effect states remain untouched
 void switchEffectMode(int newMode) {
     int cmode = (newMode % 10 + 10) % 10;
     activeEffectMode.store(cmode, std::memory_order_release);
+
+    // Whammy always stays active during manual UI scrolling
+    isWhammyActive = true; 
+
+    // Enable ONLY the effect corresponding to the current screen
+    isFrozen         = (cmode == 1);
+    isFeedbackActive = (cmode == 2);
+    isHarmonizerMode = (cmode == 3);
+    isCapoMode       = (cmode == 4);
+    isSynthMode      = (cmode == 5);
+    isPadMode        = (cmode == 6);
+    isChorusMode     = (cmode == 7);
+    isSwellMode      = (cmode == 8);
+    isVibratoMode    = (cmode == 9);
 
     dspNeedsCommit = true;
     lutNeedsUpdate = true; 

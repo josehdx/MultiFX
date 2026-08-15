@@ -1,4 +1,4 @@
-// v1.4 Lilygo Release Controller
+// v1.4 Lilygo Release Controller (Rich UI 30 FPS Edition)
 #pragma GCC optimize ("O3")
 #include <Arduino.h>
 #include <Control_Surface.h>
@@ -214,7 +214,7 @@ volatile float currentBatteryVoltage=4.00f;
 std::atomic<bool> isBatteryCharging{false};
 const int BATTERY_PIN=4, BOOT_SENSE_PIN=0, BLE_TOGGLE_PIN=14, SYSTEM_POWER_LATCH_PIN=5;
 
-// LILYGO v1.4 Fix: Swapped PAR 5 from 21 to 16 to utilize ADC2_CH5
+// v1.4 Pin Mappings (PAR 5 swapped to ADC2_CH5)
 pin_t pinPB=1, pinPB2=2, pinPB3=10, pinPar1=3, pinPar2=11, pinPar3=12, pinPar4=13, pinPar5=16;
 uint16_t lastMidiSent=8192;
 volatile uint16_t currentPB1=8192, currentPB2=8192, currentPB3=8192, currentCC11=0; 
@@ -333,7 +333,7 @@ void toggleSampleRate() {
     i2s_new_channel(&i2sConfig, &t_tx, &t_rx);
     tx_chan = t_tx; rx_chan = t_rx;
     
-    // LILYGO v1.4: Swapped DOUT to GPIO 21
+    // v1.4 I2S DOUT Swapped to GPIO 21
     i2s_std_config_t stdConfig={ 
         .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate.load(std::memory_order_acquire)), 
         .slot_cfg=I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
@@ -444,6 +444,16 @@ void DisplayTask(void * pvParameters) {
     tft.init();
     tft.setRotation(1);
     tft.fillScreen(TFT_BLACK);
+    
+    char buf[64];
+    int cx[4] = {65, 130, 195, 260};
+    int cy1 = 55, cy2 = 105;
+
+    // Draw static structural circles once to save SPI overhead
+    for(int i=0; i<4; i++) {
+        tft.drawCircle(cx[i], cy1, 24, TFT_DARKGREY);
+        tft.drawCircle(cx[i], cy2, 24, TFT_DARKGREY);
+    }
 
     for(;;) {
         if(__builtin_expect(isBatteryDead.load(std::memory_order_acquire), 0)) {
@@ -457,15 +467,76 @@ void DisplayTask(void * pvParameters) {
             DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
             int renderMode = activeDSP->activeMode; 
             
-            tft.fillRect(0, 0, 320, 40, TFT_NAVY);
+            // --- TOP STATUS BAR ---
+            tft.fillRect(0, 0, 320, 20, TFT_NAVY);
             tft.setTextColor(TFT_WHITE, TFT_NAVY);
-            tft.drawString(EFFECT_NAMES[renderMode], 10, 10, 4);
+            sprintf(buf, "%.2fV %d%%", currentBatteryVoltage, currentBatteryPercent.load(std::memory_order_relaxed));
+            tft.drawString(buf, 4, 2, 2);
             
-            char meterTxt[32];
-            sprintf(meterTxt, "IN: %.2f  OUT: %.2f", ui_audio_level.load(std::memory_order_acquire), ui_output_level.load(std::memory_order_acquire));
-            tft.fillRect(0, 40, 320, 130, TFT_BLACK);
-            tft.setTextColor(TFT_GREEN, TFT_BLACK);
-            tft.drawString(meterTxt, 10, 80, 2);
+            tft.drawCentreString(EFFECT_NAMES[renderMode], 160, 2, 2);
+            
+            sprintf(buf, "BT: %s", btmidi.isConnected() ? "CONN" : "WAIT");
+            tft.drawString(buf, 250, 2, 2);
+
+            // --- AUDIO METERS ---
+            float inLvl = ui_audio_level.load(std::memory_order_acquire);
+            float outLvl = ui_output_level.load(std::memory_order_acquire);
+            int inH = (int)(inLvl * 90.0f); if(inH>90) inH=90;
+            int outH = (int)(outLvl * 90.0f); if(outH>90) outH=90;
+            
+            tft.fillRect(5, 30, 10, 90-inH, TFT_BLACK);
+            tft.fillRect(5, 120-inH, 10, inH, TFT_GREEN);
+            tft.fillRect(305, 30, 10, 90-outH, TFT_BLACK);
+            tft.fillRect(305, 120-outH, 10, outH, TFT_GREEN);
+            
+            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            tft.drawString("IN", 4, 125, 1);
+            tft.drawString("OUT", 300, 125, 1);
+
+            // --- PARAMETER KNOBS (Text Overwrite Background) ---
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.drawCentreString("PB1", cx[0], cy1-35, 1);
+            tft.drawCentreString("PB2", cx[1], cy1-35, 1);
+            tft.drawCentreString("PB3", cx[2], cy1-35, 1);
+            tft.drawCentreString("CC11", cx[3], cy1-35, 1);
+            
+            tft.setTextColor(TFT_CYAN, TFT_BLACK);
+            sprintf(buf, "%3d%%", (int)(currentPB1/163.83f)); tft.drawCentreString(buf, cx[0], cy1-5, 2);
+            sprintf(buf, "%3d%%", (int)(currentPB2/163.83f)); tft.drawCentreString(buf, cx[1], cy1-5, 2);
+            sprintf(buf, "%3d%%", (int)(currentPB3/163.83f)); tft.drawCentreString(buf, cx[2], cy1-5, 2);
+            sprintf(buf, "%3d%%", (int)(currentCC11/163.83f)); tft.drawCentreString(buf, cx[3], cy1-5, 2);
+
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.drawCentreString("PAR 1", cx[0], cy2-35, 1);
+            tft.drawCentreString("PAR 2", cx[1], cy2-35, 1);
+            tft.drawCentreString("PAR 3", cx[2], cy2-35, 1);
+            tft.drawCentreString("PAR 4", cx[3], cy2-35, 1);
+
+            tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+            sprintf(buf, "%5.2f", activeDSP->fxMem[renderMode]); tft.drawCentreString(buf, cx[0], cy2-5, 2);
+            sprintf(buf, "%5.2f", activeDSP->params[renderMode][0]); tft.drawCentreString(buf, cx[1], cy2-5, 2);
+            sprintf(buf, "%5.2f", activeDSP->params[renderMode][1]); tft.drawCentreString(buf, cx[2], cy2-5, 2);
+            sprintf(buf, "%5.2f", activeDSP->params[renderMode][2]); tft.drawCentreString(buf, cx[3], cy2-5, 2);
+
+            // --- FX GRID ---
+            const char* fxNamesShort[] = {"[WH]", "[FZ]", "[FB]", "[HR]", "[CP]", "[SY]", "[PD]", "[CH]", "[SW]", "[VB]"};
+            bool fxStates[10] = {activeDSP->w, activeDSP->fz, activeDSP->fb, activeDSP->hr, activeDSP->cp, activeDSP->sy, activeDSP->pd, activeDSP->ch, activeDSP->sw, activeDSP->vb};
+            int fxX = 22;
+            for(int i=0; i<10; i++) {
+                tft.setTextColor(fxStates[i] ? TFT_BLACK : TFT_DARKGREY, fxStates[i] ? TFT_GREEN : TFT_BLACK);
+                tft.drawString(fxNamesShort[i], fxX, 138, 1);
+                fxX += 28;
+            }
+
+            // --- BOTTOM TELEMETRY BAR ---
+            tft.fillRect(0, 155, 320, 15, TFT_DARKGREY);
+            tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+            sprintf(buf, "CPU:%d%%  SRM:%dK  PSR:%dK  SR:%dkHz", 
+                (int)core1_load.load(std::memory_order_relaxed), 
+                (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)/1024), 
+                (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024),
+                currentSampleRate.load(std::memory_order_acquire)/1000);
+            tft.drawString(buf, 10, 156, 1);
         }
 
         if(__builtin_expect(ui_clear_meters_requested.exchange(false, std::memory_order_acq_rel), 0)) {
@@ -480,7 +551,8 @@ void DisplayTask(void * pvParameters) {
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50)); 
+        // Target ~30 FPS Refresh Rate
+        vTaskDelay(pdMS_TO_TICKS(33)); 
     }
 }
 

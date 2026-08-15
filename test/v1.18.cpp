@@ -1,4 +1,4 @@
-// v1.18 Lilygo Release Controller (Decoupled Engine & UI Navigation Edition)
+// v1.18 Lilygo Release Controller (Delta Updates & Persistent Prefs Edition)
 #pragma GCC optimize ("O3")
 #include <Arduino.h>
 #include <Control_Surface.h>
@@ -148,6 +148,17 @@ void cycleLatencyMode() {
     lastParameterChangeTime = millis();
 }
 
+// DELTA UPDATE GLOBALS FOR NVS FLASHING
+static int lastSavedMode = -1;
+static int lastSavedLatMode = -1;
+static int lastSavedFbIdx = -1;
+static bool lastSavedPb2Wiper = false; 
+static bool lastSavedVolMode = false;
+static uint16_t lastSavedFxStates = 0xFFFF;
+static uint32_t lastSavedSampleRate = 0;
+static AppSettings lastSavedDspData;
+static bool firstSave = true;
+
 bool commitDSPState() {
     if (!dspAckCommit.load(std::memory_order_acquire)) return false; 
 
@@ -268,6 +279,7 @@ void fetchADCDMA() {
     }
 }
 
+// UI NAVIGATION: Whammy is forced ON + only the focused effect is toggled ON
 void switchEffectMode(int newMode) {
     int cmode = (newMode % 10 + 10) % 10;
     activeEffectMode.store(cmode, std::memory_order_release);
@@ -292,6 +304,7 @@ void switchEffectMode(int newMode) {
     lastParameterChangeTime = millis();
 }
 
+// DELTA UPDATES & NO PREFERENCES CLOSE: Massive Latency Spike Mitigation
 void saveSettings() {
     DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
     AppSettings cs;
@@ -315,16 +328,50 @@ void saveSettings() {
     bool pb2Copy = isPB2WiperMode, volCopy = isVolumeMode; 
     uint32_t srCopy = currentSampleRate.load(std::memory_order_acquire);
     
-    preferences.begin("whammy_cfg", false); 
-    preferences.putInt("activeMode", modeCopy); 
-    preferences.putInt("latMode", latCopy); 
-    preferences.putBool("pb2Wiper", pb2Copy); 
-    preferences.putBool("volMode", volCopy); 
-    preferences.putUShort("fxStates", fxStates); 
-    preferences.putUInt("sampleRate", srCopy); 
-    preferences.putInt("fbIdx", fbCopy); 
-    preferences.putBytes("dspData", &cs, sizeof(AppSettings)); 
-    preferences.end();
+    // DELTA CHECKS: Only send flash commands if the actual value has changed
+    if (firstSave || modeCopy != lastSavedMode) {
+        preferences.putInt("activeMode", modeCopy);
+        lastSavedMode = modeCopy;
+    }
+    if (firstSave || latCopy != lastSavedLatMode) {
+        preferences.putInt("latMode", latCopy);
+        lastSavedLatMode = latCopy;
+    }
+    if (firstSave || pb2Copy != lastSavedPb2Wiper) {
+        preferences.putBool("pb2Wiper", pb2Copy);
+        lastSavedPb2Wiper = pb2Copy;
+    }
+    if (firstSave || volCopy != lastSavedVolMode) {
+        preferences.putBool("volMode", volCopy);
+        lastSavedVolMode = volCopy;
+    }
+    if (firstSave || fxStates != lastSavedFxStates) {
+        preferences.putUShort("fxStates", fxStates);
+        lastSavedFxStates = fxStates;
+    }
+    if (firstSave || srCopy != lastSavedSampleRate) {
+        preferences.putUInt("sampleRate", srCopy);
+        lastSavedSampleRate = srCopy;
+    }
+    if (firstSave || fbCopy != lastSavedFbIdx) {
+        preferences.putInt("fbIdx", fbCopy);
+        lastSavedFbIdx = fbCopy;
+    }
+    
+    // Check if block data actually changed
+    bool dspDataChanged = firstSave;
+    if (!dspDataChanged) {
+        if (memcmp(&cs, &lastSavedDspData, sizeof(AppSettings)) != 0) {
+            dspDataChanged = true;
+        }
+    }
+    if (dspDataChanged) {
+        preferences.putBytes("dspData", &cs, sizeof(AppSettings));
+        memcpy(&lastSavedDspData, &cs, sizeof(AppSettings));
+    }
+
+    firstSave = false;
+    // preferences.end() has been explicitly REMOVED to keep FS open
 }
 
 int getBatteryPercentage(float voltage) {
@@ -560,7 +607,7 @@ void DisplayTask(void * pvParameters) {
             float outLvl = ui_output_level.load(std::memory_order_acquire);
             float cpuLoad = core1_load.load(std::memory_order_relaxed);
             float batV = currentBatteryVoltage;
-            int batPct = currentBatteryPercent.load(std::memory_order_relaxed);
+            int batPct = currentBatteryPercent.load(std::order_relaxed);
             uint32_t srVal = currentSampleRate.load(std::memory_order_acquire);
             bool btConn = btmidi.isConnected();
             bool fxStates[10] = {activeDSP->w, activeDSP->fz, activeDSP->fb, activeDSP->hr, activeDSP->cp, activeDSP->sy, activeDSP->pd, activeDSP->ch, activeDSP->sw, activeDSP->vb};
@@ -1370,8 +1417,9 @@ void setup() {
     dig_cfg.pattern_num=4; dig_cfg.adc_pattern=adc_pattern;
     ESP_ERROR_CHECK(adc_continuous_config(multifx_adc_handle, &dig_cfg)); ESP_ERROR_CHECK(adc_continuous_start(multifx_adc_handle));
     
-    preferences.begin("whammy_cfg", true); 
-    // HARDENED NVS LOAD: Constrain activeMode to safe range [0, 9]
+    // PERSISTENT NVS READ-WRITE MODE: File system stays strictly open.
+    preferences.begin("whammy_cfg", false); 
+    
     activeEffectMode.store(constrain(preferences.getInt("activeMode", 0), 0, 9), std::memory_order_release);
     latencyMode.store(constrain(preferences.getInt("latMode", 0), 0, 3), std::memory_order_release); 
     isPB2WiperMode=preferences.getBool("pb2Wiper", false); isVolumeMode=false; 
@@ -1384,7 +1432,8 @@ void setup() {
     
     uint16_t fxStates=preferences.getUShort("fxStates", 1);
     isWhammyActive=(fxStates&(1<<0)); isFrozen=(fxStates&(1<<1)); isFeedbackActive=(fxStates&(1<<2)); isHarmonizerMode=(fxStates&(1<<3)); isCapoMode=(fxStates&(1<<4)); isSynthMode=(fxStates&(1<<5)); isPadMode=(fxStates&(1<<6)); isChorusMode=(fxStates&(1<<7)); isSwellMode=(fxStates&(1<<8)); isVibratoMode=(fxStates&(1<<9));
-    preferences.end();
+    
+    // REMOVED preferences.end(); to keep access continuous and fast!
     
     commitDSPState();
     
@@ -1515,6 +1564,9 @@ void setup() {
 }
 
 void loop() {
+    uint32_t loop_start_cycles = xthal_get_ccount();
+    unsigned long loop_start_time = millis();
+
     static bool lastBtState=false; 
     static uint8_t lastVolumeCC=127;
     #if ENABLE_PAR_KNOBS
@@ -1670,6 +1722,11 @@ void loop() {
             dspNeedsCommit = false;
         }
     }
+
+    uint32_t loop_end_cycles = xthal_get_ccount();
+    float loop_cycles = (float)(loop_end_cycles - loop_start_cycles);
+    float core1_pct = (loop_cycles / 1200000.0f) * 100.0f;
+    core1_load.store(__builtin_fmaf(core1_load.load(std::memory_order_relaxed), 0.95f, __builtin_fminf(100.0f, core1_pct) * 0.05f), std::memory_order_relaxed);
 
     vTaskDelay(pdMS_TO_TICKS(5));
 }

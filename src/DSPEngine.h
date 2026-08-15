@@ -10,7 +10,7 @@
 
 class DSPEngine {
 public:
-    static inline float __attribute__((always_inline)) __attribute__((optimize("O3"))) AntiDenormal(float value) {
+    static inline float __attribute__((always_inline)) __attribute__((optimize("Ofast"))) AntiDenormal(float value) {
         union { float f; uint32_t i; } u = { .f = value };
         if (__builtin_expect((u.i & 0x7F800000) == 0, 0)) return 0.0f;
         return value;
@@ -24,7 +24,7 @@ public:
         return __builtin_fmaf(v2 - v1, frac, v1);
     }
 
-    static inline float __attribute__((hot)) __attribute__((always_inline)) __attribute__((optimize("O3"))) processSincTap(uint32_t tapPhase, const int16_t* sramBuffer, int currentSramWriteIdx, uint32_t windowMask, uint32_t hannIntMult, const float* hannLUT) {
+    static inline float __attribute__((hot)) __attribute__((always_inline)) __attribute__((optimize("Ofast"))) processSincTap(uint32_t tapPhase, const int16_t* sramBuffer, int currentSramWriteIdx, uint32_t windowMask, uint32_t hannIntMult, const float* hannLUT) {
         int T = (tapPhase >> 16) & windowMask; 
         float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
         int effTap = T + 3;
@@ -46,7 +46,7 @@ public:
         return AntiDenormal(interpSample * hannLUT[lutIdx]);
     }
 
-    static inline float __attribute__((hot)) __attribute__((always_inline)) __attribute__((optimize("O3"))) processHermiteTap(uint32_t tapPhase, const int16_t* sramBuffer, int currentSramWriteIdx, uint32_t windowMask, uint32_t hannIntMult, const float* hannLUT) {
+    static inline float __attribute__((hot)) __attribute__((always_inline)) __attribute__((optimize("Ofast"))) processHermiteTap(uint32_t tapPhase, const int16_t* sramBuffer, int currentSramWriteIdx, uint32_t windowMask, uint32_t hannIntMult, const float* hannLUT) {
         int T = (tapPhase >> 16) & windowMask; 
         float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
         int idx_m1 = (currentSramWriteIdx - T + 1 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
@@ -65,7 +65,7 @@ public:
         return AntiDenormal(interpSample * hannLUT[lutIdx]);
     }
 
-    static void __attribute__((optimize("O3"))) processInput(
+    static void __attribute__((optimize("Ofast"))) processInput(
         int framesRead, int32_t* i2s_in_block, float normFactor, float dc_alpha, 
         float envRetain, float envAttack, float p_sw_thr, float p_sw_att, 
         float p_sw_rel, float srScale, bool swellActive, float localVolGain, 
@@ -99,7 +99,7 @@ public:
         localSwellGain = localSwell; smoothedVolGain = localSmVol;
     }
 
-    static void __attribute__((optimize("O3"))) mixdownAndOutput(
+    static void __attribute__((optimize("Ofast"))) mixdownAndOutput(
         int framesRead, bool activeGroup, float localFrzRamp, float localFbRamp,
         float g_whammy, float g_dry, float g_base, float g_w2, float g_w3,
         float g_pad, float g_frz, float g_fb, float* padFilterBuf, float* dryBuf, 

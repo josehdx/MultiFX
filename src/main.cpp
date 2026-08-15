@@ -1,5 +1,5 @@
-// v1.25.cpp LilyGo Release Controller (Safe Boot Enforced + DMA Patched)
-#pragma GCC optimize ("O3")
+// v1.27 LilyGo Release Controller (Ofast, Memory Optimized, No Stress Tester)
+#pragma GCC optimize ("Ofast")
 #include <Arduino.h>
 #include <Control_Surface.h>
 #include <WiFi.h>
@@ -107,9 +107,10 @@ int writeIndex = 0, fbDelayWriteIdx = 0, sramWriteIdx = 0;
 #define HANN_LUT_SIZE 4096
 #define LFO_LUT_SIZE 1024
 #define WAVE_LUT_SIZE 2048
-float hannLUT[HANN_LUT_SIZE] __attribute__((aligned(64)));
-float lfoLUT[LFO_LUT_SIZE] __attribute__((aligned(64)));
-float synthLUT[WAVE_LUT_SIZE] __attribute__((aligned(64)));
+
+float DRAM_ATTR hannLUT[HANN_LUT_SIZE] __attribute__((aligned(64)));
+float DRAM_ATTR lfoLUT[LFO_LUT_SIZE] __attribute__((aligned(64)));
+float DRAM_ATTR synthLUT[WAVE_LUT_SIZE] __attribute__((aligned(64)));
 
 std::atomic<float> globalHarmRatio{1.0f}, globalChorusRatio{1.0f}, globalFbRatio{1.0f}, globalVibratoPhaseInc{0.0f};
 uint32_t tap_w1_1=0, tap_w1_2=256<<16, tap_w2_1=0, tap_w2_2=256<<16, tap_w3_1=0, tap_w3_2=256<<16, tap_w4_1=0, tap_w4_2=256<<16, tap_w5_1=0, tap_w5_2=256<<16;
@@ -314,7 +315,7 @@ void goToLightSleep() {
     pedals.triggerSystemRecovery(); lastActivityTime = millis();
 }
 
-void IRAM_ATTR __attribute__((optimize("O3"))) updateLUT() {
+void IRAM_ATTR __attribute__((optimize("Ofast"))) updateLUT() {
     static std::atomic<bool> lutBusy{false};
     if (lutBusy.exchange(true, std::memory_order_acquire)) return; 
     if (pitchShiftLUT_temp == nullptr) { lutBusy.store(false, std::memory_order_release); return; }
@@ -341,43 +342,27 @@ bool channelMessageCallback(ChannelMessage cm) {
         uint8_t cc = cm.data1;
         uint8_t val = cm.data2;
 
-        // 1. Expression Pedal / Pitch Bend Mapper (CC 11)
         if(cc==11) { 
             uint16_t mappedCC=map(val,0,127,0,16383); currentCC11=mappedCC; currentPB3=mappedCC; lastActivePedal=mappedCC; 
             if(isVolumeMode) { volumePedalGain=(float)mappedCC/16383.0f; dspNeedsCommit = true; Control_Surface.sendControlChange({19,Channel_1},val); } else { if(!lutNeedsUpdate) { float* currentLUT = pitchShiftLUT.load(std::memory_order_acquire); if(currentLUT) pitchShiftFactor.store(currentLUT[mappedCC], std::memory_order_release); } } return false; 
         }
         
-        // 2. Remote Parameter Knobs (CC 24 - 28)
         if(cc>=24 && cc<=28) { MidiRouter::updateParameter(cc, val, activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx); return false; }
-        
-        // 3. PB2 Wiper Mode Toggle (CC 5)
         if(cc==5 && val>=64) { isPB2WiperMode=!isPB2WiperMode; dspNeedsCommit = true; pb2ToggleRequested=true; return false; }
-        
-        // 4. Volume / Whammy Mode Switch (CC 6)
         if(cc==6 && val>=64) { 
             bool sendCenterMidi=false; isVolumeMode=!isVolumeMode; float* currentLUT = pitchShiftLUT.load(std::memory_order_acquire);
             if(!isVolumeMode) { volumePedalGain=1.0f; pedals.lockPB3Whammy(); sendCenterMidi=true; currentPB3=8192; lastActivePedal=8192; if(!lutNeedsUpdate && currentLUT!=nullptr) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release); } else { pedals.lockPB3Volume(); lastActivePedal=8192; volumePedalGain=(float)currentPB3 / 16383.0f; if(!lutNeedsUpdate && currentLUT!=nullptr) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release); } 
             dspNeedsCommit = true; if(sendCenterMidi) Control_Surface.sendPitchBend(Channel_3, 8192); settingsNeedSaving=true; lastParameterChangeTime=millis(); return false; 
         }
-        
-        // 5. Effect Mode Previous / Next (CC 0 & CC 1)
         if (cc == 0 && val >= 64) { switchEffectMode(activeEffectMode.load(std::memory_order_acquire) - 1); return false; }
         if (cc == 1 && val >= 64) { switchEffectMode(activeEffectMode.load(std::memory_order_acquire) + 1); return false; }
-
-        // 6. Sample Rate Toggle (CC 2)
         if (cc == 2 && val >= 64) { sampleRateToggleRequested = true; return false; }
-
-        // 7. Cycle Latency Mode (CC 3)
         if (cc == 3 && val >= 64) { cycleLatencyMode(); return false; }
-
-        // 8. Panic Reset (CC 4)
         if (cc == 4 && val >= 64) { triggerPanicReset(); return false; }
         
-        // 9. Legacy Individual Effect Direct Toggles (CC 7 - CC 16)
         if (val >= 64 && cc >= 7 && cc <= 16) {
             bool toggled = true;
             int curMode = activeEffectMode.load(std::memory_order_acquire);
-            
             if (cc == 7)       { isVibratoMode = !isVibratoMode; if (curMode == 9) isWhammyActive = isVibratoMode; }
             else if (cc == 8)  { isFrozen = !isFrozen; if (curMode == 1) isWhammyActive = isFrozen; }
             else if (cc == 9)  { isFeedbackActive = !isFeedbackActive; if (curMode == 2) isWhammyActive = isFeedbackActive; }
@@ -389,67 +374,29 @@ bool channelMessageCallback(ChannelMessage cm) {
             else if (cc == 16) { isSwellMode = !isSwellMode; if (curMode == 8) isWhammyActive = isSwellMode; }
             else { toggled = false; }
 
-            if (toggled) {
-                dspNeedsCommit = true;
-                settingsNeedSaving = true;
-                lastParameterChangeTime = millis();
-                return false;
-            }
+            if (toggled) { dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); return false; }
         }
 
-        // 10. Legacy Step Memory / Pitch Ranges UP or DOWN (CC 17 & CC 18)
         if (cc == 17 || cc == 18) {
             float step = (val >= 64) ? -1.0f : 1.0f;
             int renderMode = activeEffectMode.load(std::memory_order_acquire);
             if (cc == 17) {
-                if (renderMode == 0 || renderMode == 1 || renderMode == 8) {
-                    effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f);
-                } else if (renderMode == 4) {
-                    effectMemory[4] = constrain(effectMemory[4] + step, -24.0f, 24.0f);
-                } else if (renderMode == 2) {
-                    int curFb = feedbackIntervalIdx.load(std::memory_order_acquire);
-                    if (step > 0) feedbackIntervalIdx.store((curFb + 1) % 5, std::memory_order_release);
-                    else feedbackIntervalIdx.store((curFb + 4) % 5, std::memory_order_release);
-                } else {
-                    effectMemory[renderMode] = constrain(effectMemory[renderMode] + step, -24.0f, 24.0f);
-                }
+                if (renderMode == 0 || renderMode == 1 || renderMode == 8) { effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f); } 
+                else if (renderMode == 4) { effectMemory[4] = constrain(effectMemory[4] + step, -24.0f, 24.0f); } 
+                else if (renderMode == 2) { int curFb = feedbackIntervalIdx.load(std::memory_order_acquire); if (step > 0) feedbackIntervalIdx.store((curFb + 1) % 5, std::memory_order_release); else feedbackIntervalIdx.store((curFb + 4) % 5, std::memory_order_release); } 
+                else { effectMemory[renderMode] = constrain(effectMemory[renderMode] + step, -24.0f, 24.0f); }
             } else if (cc == 18) {
-                if (renderMode == 0 || renderMode == 1 || renderMode == 8) {
-                    effectMemory[0] = constrain(effectMemory[0] + step, -24.0f, 24.0f);
-                } else if (renderMode == 4) {
-                    float centStep = step * 0.01f;
-                    effectMemory[4] = constrain(effectMemory[4] + centStep, -24.0f, 24.0f);
-                }
+                if (renderMode == 0 || renderMode == 1 || renderMode == 8) { effectMemory[0] = constrain(effectMemory[0] + step, -24.0f, 24.0f); } 
+                else if (renderMode == 4) { float centStep = step * 0.01f; effectMemory[4] = constrain(effectMemory[4] + centStep, -24.0f, 24.0f); }
             }
             dspNeedsCommit = true; lutNeedsUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
             return false;
         }
-
-        // 11. Out-of-Focus Remote FX Absolute Toggles (CC 80 - 89)
-        /*
-        if (cc >= 80 && cc <= 89) {
-            bool state = (val >= 64);
-            switch (cc) {
-                case 80: isWhammyActive   = state; break;
-                case 81: isFrozen         = state; break;
-                case 82: isFeedbackActive = state; break;
-                case 83: isHarmonizerMode = state; break;
-                case 84: isCapoMode       = state; break;
-                case 85: isSynthMode      = state; break;
-                case 86: isPadMode        = state; break;
-                case 87: isChorusMode     = state; break;
-                case 88: isSwellMode      = state; break;
-                case 89: isVibratoMode    = state; break;
-            }
-            dspNeedsCommit = true; lutNeedsUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
-            return false;
-        }
-        */
     }
     return false;
 }
 
-void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters) {
+void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParameters) {
     float input_dc_offset=0.0f, synthEnv=0.0f, synthFilter=0.0f, synthBandpass=0.0f, padFilter=0.0f, padEnv=0.0f, inputEnvelope=0.0f, feedbackFilterVar=0.0f, smoothedVolGain=1.0f, currentPitch=1.0f, fbOutNode=0.0f, smoothed_delay_samples=0.0f, dampState=0.0f, wowState=0.0f;
     uint32_t wowRng = 123456789; bool wasFeedbackActive=false; int freezeWriteIdxVar=0, freezePlayCounterVar=0, freezeStartIdxVar=0, activeFreezeLength=48000;
     float c_fx[10][5] = {0.0f}; int c_lat=0, c_act=0; bool c_w=true, c_fz=false, c_fb=false, c_hr=false, c_cp=false, c_sy=false, c_pd=false, c_ch=false, c_sw=false, c_vb=false; float c_vg=1.0f;
@@ -635,7 +582,7 @@ void setup() {
     
     settingsMgr.init(preferences);
     
-    // [SAFE BOOT ENFORCED] Reset active FX toggles on boot to prevent booting into high-load states
+    // Enforce Clean Boot State
     activeEffectMode.store(0, std::memory_order_release);
     isWhammyActive = true; 
     isFrozen = false; isFeedbackActive = false; isHarmonizerMode = false;
@@ -663,8 +610,12 @@ void setup() {
     memset(i2s_in_block, 0, HOP_SIZE * 2 * sizeof(int32_t)); memset(i2s_out_block, 0, HOP_SIZE * 2 * sizeof(int32_t)); memset(inBuf, 0, HOP_SIZE * sizeof(float)); memset(envBuf, 0, HOP_SIZE * sizeof(float)); memset(fzOutBuf, 0, HOP_SIZE * sizeof(float)); memset(masterGainBuf, 0, HOP_SIZE * sizeof(float)); memset(w1Buf, 0, HOP_SIZE * sizeof(float)); memset(w2Buf, 0, HOP_SIZE * sizeof(float)); memset(w3Buf, 0, HOP_SIZE * sizeof(float)); memset(padFilterBuf, 0, HOP_SIZE * sizeof(float)); memset(dryBuf, 0, HOP_SIZE * sizeof(float)); memset(fbOutBuf, 0, HOP_SIZE * sizeof(float)); memset(sMixBuf, 0, HOP_SIZE * sizeof(float));
     memset(delayBuffer, 0, MAX_BUFFER_SIZE*sizeof(int16_t)); memset(sramPitchBuffer, 0, SRAM_PITCH_BUF_SIZE*sizeof(int16_t)); memset(fbDelayBuffer, 0, FB_BUFFER_SIZE*sizeof(int16_t)); memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE*sizeof(int16_t)); memset(diffuserBuf, 0, 1024*sizeof(float));
     float* initLUTPtr = pitchShiftLUT.load(std::memory_order_relaxed); if(initLUTPtr) memset(initLUTPtr, 0, 16384*sizeof(float)); memset(pitchShiftLUT_temp, 0, 16384*sizeof(float)); 
-    for(int i=0; i<4096; i++) { hannLUT[i]=0.5f*(1.0f-cosf(TWO_PI*((float)i/4095.0f))); } for(int i=0; i<1024; i++) { lfoLUT[i]=powf(2.0f,(15.0f*sinf(TWO_PI*((float)i/1024.0f)))/1200.0f); } for(int i=0; i<2048; i++) { synthLUT[i]=sinf((((float)i-1024.0f)/1024.0f)*45.0f); }
     memset(dmaPingBuffer, 0, sizeof(dmaPingBuffer)); memset(dmaPongBuffer, 0, sizeof(dmaPongBuffer));
+
+    // Re-initialize fast memory arrays
+    for(int i=0; i<4096; i++) { hannLUT[i]=0.5f*(1.0f-cosf(TWO_PI*((float)i/4095.0f))); } 
+    for(int i=0; i<1024; i++) { lfoLUT[i]=powf(2.0f,(15.0f*sinf(TWO_PI*((float)i/1024.0f)))/1200.0f); } 
+    for(int i=0; i<2048; i++) { synthLUT[i]=sinf((((float)i-1024.0f)/1024.0f)*45.0f); }
 
     async_memcpy_config_t dma_config = ASYNC_MEMCPY_DEFAULT_CONFIG(); dma_config.backlog = 8; ESP_ERROR_CHECK(esp_async_memcpy_install(&dma_config, &dma_memcpy_handle));
     calibratePBs(); updateLUT(); float* currLut = pitchShiftLUT.load(std::memory_order_acquire); if (currLut) pitchShiftFactor.store(currLut[8192], std::memory_order_release);
@@ -684,8 +635,9 @@ void setup() {
     i2s_channel_init_std_mode((i2s_chan_handle_t)tx_chan, &stdConfig); 
     i2s_channel_init_std_mode((i2s_chan_handle_t)rx_chan, &stdConfig);
     
-    dspTaskStack = (StackType_t*)heap_caps_aligned_alloc(16, 16384, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); dspTaskTCB = (StaticTask_t*)heap_caps_aligned_alloc(16, sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (dspTaskStack != nullptr && dspTaskTCB != nullptr) { audioTaskHandle = xTaskCreateStaticPinnedToCore(AudioDSPTask, "DSP", 16384, NULL, configMAX_PRIORITIES - 1, dspTaskStack, dspTaskTCB, 0); } else { while(1) vTaskDelay(100); }
+    // Stack Size Reduced to 8192 bytes
+    dspTaskStack = (StackType_t*)heap_caps_aligned_alloc(16, 8192, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); dspTaskTCB = (StaticTask_t*)heap_caps_aligned_alloc(16, sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (dspTaskStack != nullptr && dspTaskTCB != nullptr) { audioTaskHandle = xTaskCreateStaticPinnedToCore(AudioDSPTask, "DSP", 8192, NULL, configMAX_PRIORITIES - 1, dspTaskStack, dspTaskTCB, 0); } else { while(1) vTaskDelay(100); }
     i2s_channel_enable((i2s_chan_handle_t)tx_chan); i2s_channel_enable((i2s_chan_handle_t)rx_chan); 
 }
 
@@ -830,32 +782,6 @@ void loop() {
         lastDisplayUpdate = millis();
         display.render(dData);
     }
-
-    // --- CONTINUOUS PERIODIC TELEMETRY DEBUGGER (Every 2000 ms) ---
-    static unsigned long lastTelemetryPrintTime = 0;
-    /*
-    if (millis() - lastTelemetryPrintTime >= 2000) {
-        lastTelemetryPrintTime = millis();
-        Serial.println("================ TELEMETRY DEBUGGER ================");
-        Serial.printf("DSP Core 0 Load  : %d%%\n", (int)dData.dspCoreLoad);
-        Serial.printf("Ctrl Core 1 Load : %d%%\n", (int)dData.ctrlCoreLoad);
-        Serial.printf("Internal SRAM    : %dK Free\n", dData.freeSRAM);
-        Serial.printf("External PSRAM   : %dK Free\n", dData.freePSRAM);
-        Serial.printf("Sample Rate      : %d Hz\n", dData.sampleRate);
-        Serial.printf("Latency Mode     : %d\n", latencyMode.load(std::memory_order_relaxed));
-        Serial.printf("Battery State    : %.2fV (%d%%) - Charging: %s\n", dData.batVoltage, dData.batPercent, (dData.batVoltage > 4.20f) ? "YES" : "NO");
-        Serial.printf("BLE MIDI Conn    : %s\n", dData.bleConnected ? "CONNECTED" : "WAITING");
-        Serial.printf("Active Mode      : %d\n", dData.activeMode);
-        Serial.printf("Pedal Vals       : PB1:%d | PB2:%d | PB3:%d | CC11:%d\n", currentPB1, currentPB2, currentPB3, currentCC11);
-        Serial.printf("Audio Meters     : IN: %.3f | OUT: %.3f\n", dData.inMeter, dData.outMeter);
-        Serial.println("--- SYSTEM STARVATION & DIAGNOSTICS ---");
-        Serial.printf("Audio Underflows : %d\n", dData.underflows);
-        Serial.printf("DSP Min Stack RAM: %d Bytes\n", dData.stackWatermark);
-        Serial.printf("Peak Loop Latency: %d ms\n", dData.peakLatency);
-        Serial.printf("DMA Transfers    : %d\n", dData.dmaCount);
-        Serial.println("====================================================\n");
-    }
-    */
 
     vTaskDelay(pdMS_TO_TICKS(5));
 }

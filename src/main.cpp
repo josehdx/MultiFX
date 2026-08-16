@@ -1,4 +1,4 @@
-// v1.27 LilyGo Release Controller (Ofast, Memory Optimized, No Stress Tester)
+// v1.29 LilyGo Release Controller (Raw IDF BLE Fix & I2S Thread Safety)
 #pragma GCC optimize ("Ofast")
 #include <Arduino.h>
 #include <Control_Surface.h>
@@ -8,7 +8,6 @@
 #include "soc/gpio_reg.h"
 #include "freertos/FreeRTOS.h"
 #include "driver/rtc_io.h"
-#include "esp_bt.h"
 #include "nvs_flash.h"
 #include <math.h>
 #include <atomic>
@@ -23,6 +22,7 @@
 #include "SettingsManager.h"
 #include "DSPEngine.h"
 #include "MidiRouter.h"
+#include "BluetoothManager.h"
 
 // --- LILYGO-SPECIFIC COMPONENTS ---
 #include "PowerManager.h"
@@ -235,11 +235,13 @@ void cycleLatencyMode() {
 }
 
 void toggleSampleRate() {
-    i2s_channel_disable((i2s_chan_handle_t)tx_chan); 
-    i2s_channel_disable((i2s_chan_handle_t)rx_chan); 
-
+    // 1. Tell DSP task to park FIRST to avoid i2s_channel_write errors
     dsp_is_paused.store(true, std::memory_order_release);
     while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+
+    // 2. Safely disable and delete channels after DSP task is parked
+    i2s_channel_disable((i2s_chan_handle_t)tx_chan); 
+    i2s_channel_disable((i2s_chan_handle_t)rx_chan); 
 
     i2s_del_channel((i2s_chan_handle_t)tx_chan); 
     i2s_del_channel((i2s_chan_handle_t)rx_chan);
@@ -285,11 +287,13 @@ void toggleSampleRate() {
 void goToLightSleep() {
     if(!isScreenOff.load(std::memory_order_acquire)) { digitalWrite(TFT_BL_PIN, LOW); isScreenOff.store(true, std::memory_order_release); }
     
-    i2s_channel_disable((i2s_chan_handle_t)tx_chan); 
-    i2s_channel_disable((i2s_chan_handle_t)rx_chan);
-
+    // 1. Tell DSP task to park FIRST
     dsp_is_paused.store(true, std::memory_order_release);
     while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+
+    // 2. Now safe to disable channels without race conditions
+    i2s_channel_disable((i2s_chan_handle_t)tx_chan); 
+    i2s_channel_disable((i2s_chan_handle_t)rx_chan);
     
     adc_continuous_stop(multifx_adc_handle);
     if (dsp_cpu_lock != NULL) esp_pm_lock_release(dsp_cpu_lock);
@@ -554,6 +558,10 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
 
 void setup() {
     Serial.begin(115200); esp_brownout_init(); WiFi.mode(WIFI_OFF);
+    
+    // 1. MUST HAVE: 1000ms delay to let LilyGO's display and USB tasks settle the memory heap
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) { ESP_ERROR_CHECK(nvs_flash_erase()); err = nvs_flash_init(); }
     ESP_ERROR_CHECK(err);
@@ -571,6 +579,23 @@ void setup() {
 
     pinMode(TFT_BL_PIN, OUTPUT); digitalWrite(TFT_BL_PIN, HIGH);
     display.begin(); 
+    
+    // 2. MANUALLY PRE-INITIALIZE THE RAW ESP-IDF CONTROLLER & HCI
+    BluetoothManager::initHCI();
+
+    // 3. ESTABLISH STATIC MIDI ROUTING PIPES
+    btmidi.setName("LilyGO_FX"); 
+    Control_Surface >> pipes >> btmidi; 
+    Control_Surface >> pipes >> usbmidi; 
+    usbmidi >> pipes >> Control_Surface; 
+    btmidi >> pipes >> Control_Surface;
+    Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); 
+    
+    // 4. START CONTROL SURFACE (Boots USB and BLE safely)
+    Control_Surface.begin();
+
+    // 5. CONFIGURE MAXIMUM TX POWER (+9dBm) AND READ MAC
+    BluetoothManager::configurePowerAndMac();
 
     esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "DSP_Max_CPU", &dsp_cpu_lock); if(dsp_cpu_lock != NULL) esp_pm_lock_acquire(dsp_cpu_lock);
     
@@ -619,9 +644,6 @@ void setup() {
 
     async_memcpy_config_t dma_config = ASYNC_MEMCPY_DEFAULT_CONFIG(); dma_config.backlog = 8; ESP_ERROR_CHECK(esp_async_memcpy_install(&dma_config, &dma_memcpy_handle));
     calibratePBs(); updateLUT(); float* currLut = pitchShiftLUT.load(std::memory_order_acquire); if (currLut) pitchShiftFactor.store(currLut[8192], std::memory_order_release);
-    
-    btmidi.setName("Whammy_S3"); Control_Surface >> pipes >> btmidi; Control_Surface >> pipes >> usbmidi; usbmidi >> pipes >> Control_Surface; btmidi >> pipes >> Control_Surface;
-    Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); Control_Surface.begin();
     
     i2s_chan_config_t i2sConfig=I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER); i2sConfig.dma_desc_num=8; i2sConfig.dma_frame_num=HOP_SIZE; i2sConfig.auto_clear=true; 
     i2s_chan_handle_t t_tx, t_rx; i2s_new_channel(&i2sConfig, &t_tx, &t_rx); tx_chan = t_tx; rx_chan = t_rx;

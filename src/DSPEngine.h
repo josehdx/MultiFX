@@ -3,10 +3,43 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
+
+// ESP-DSP Assembly Driver Headers
 #include "dsps_mul.h"
+#include "dsps_add.h"
+#include "dsps_biquad.h"
 
 #define SRAM_PITCH_BUF_SIZE 8192
 #define SRAM_PITCH_BUF_MASK 0x1FFF
+
+// --- ESP32-S3 Vector Biquad Assembly Helper ---
+struct __attribute__((aligned(64))) VectorBiquadS3 {
+    __attribute__((aligned(64))) float coeffs[5] = {0.0f}; 
+    __attribute__((aligned(64))) float delay_state[2] = {0.0f, 0.0f};
+
+    void setLPF(float cutoffHz, float sampleRate, float Q = 0.7071f) {
+        float w0 = 2.0f * M_PI * cutoffHz / sampleRate;
+        float alpha = sinf(w0) / (2.0f * Q);
+        float cosw0 = cosf(w0);
+        float a0 = 1.0f + alpha;
+
+        coeffs[0] = ((1.0f - cosw0) / 2.0f) / a0; // b0
+        coeffs[1] = (1.0f - cosw0) / a0;          // b1
+        coeffs[2] = ((1.0f - cosw0) / 2.0f) / a0; // b2
+        coeffs[3] = (-2.0f * cosw0) / a0;         // a1
+        coeffs[4] = (1.0f - alpha) / a0;          // a2
+    }
+
+    void inline process(const float* input, float* output, int len) {
+        dsps_biquad_f32_aes3(input, output, len, coeffs, delay_state);
+    }
+
+    void reset() {
+        delay_state[0] = 0.0f;
+        delay_state[1] = 0.0f;
+    }
+};
 
 class DSPEngine {
 public:
@@ -24,43 +57,42 @@ public:
         return __builtin_fmaf(v2 - v1, frac, v1);
     }
 
-    static inline float __attribute__((hot)) __attribute__((always_inline)) __attribute__((optimize("Ofast"))) processSincTap(uint32_t tapPhase, const int16_t* sramBuffer, int currentSramWriteIdx, uint32_t windowMask, uint32_t hannIntMult, const float* hannLUT) {
+    // --- ZERO-LATENCY PRE-CALCULATED SINC LUT INTERPOLATOR ---
+    static inline float __attribute__((hot)) __attribute__((always_inline)) __attribute__((optimize("Ofast"))) processPitchTap(
+        uint32_t tapPhase, const int16_t* sramBuffer, int currentSramWriteIdx, 
+        uint32_t windowMask, uint32_t hannIntMult, const float* hannLUT, const float* pitchSincLUT) {
+        
         int T = (tapPhase >> 16) & windowMask; 
-        float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
-        int effTap = T + 3;
-        int idx_m1 = (currentSramWriteIdx - effTap + 2 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
-        int idx_0  = (currentSramWriteIdx - effTap + 3 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
-        int idx_1  = (currentSramWriteIdx - effTap + 4 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
-        int idx_2  = (currentSramWriteIdx - effTap + 5 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
-        float s_m1 = (float)sramBuffer[idx_m1] * 3.0517578125e-5f;
-        float s_0  = (float)sramBuffer[idx_0]  * 3.0517578125e-5f;
-        float s_1  = (float)sramBuffer[idx_1]  * 3.0517578125e-5f;
-        float s_2  = (float)sramBuffer[idx_2]  * 3.0517578125e-5f;
-        float fm1 = frac + 1.0f; float f0  = frac; float f1  = 1.0f - frac; float f2  = 2.0f - frac;
-        float w_m1 = __builtin_fmaf(-0.16666667f * f0, f1 * f2, 0.0f);
-        float w_0  = __builtin_fmaf(0.5f * fm1, f1 * f2, 0.0f);
-        float w_1  = __builtin_fmaf(0.5f * fm1, f0 * f2, 0.0f);
-        float w_2  = __builtin_fmaf(-0.16666667f * fm1, f0 * f1, 0.0f);
-        float interpSample = __builtin_fmaf(s_m1, w_m1, __builtin_fmaf(s_0, w_0, __builtin_fmaf(s_1, w_1, s_2 * w_2)));
-        int lutIdx = ((uint32_t)(T * hannIntMult) >> 16) & 4095; 
-        return AntiDenormal(interpSample * hannLUT[lutIdx]);
-    }
+        uint32_t fracInt = tapPhase & 0xFFFF;
+        
+        // Bit-shift 0-65535 map instantly down to 0-1023 (LUT Resolution Index)
+        int lutIdxFrac = fracInt >> 6; 
+        
+        int startIdx = (currentSramWriteIdx - T - 2 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
+        float y_m1, y0, y1, y2;
 
-    static inline float __attribute__((hot)) __attribute__((always_inline)) __attribute__((optimize("Ofast"))) processHermiteTap(uint32_t tapPhase, const int16_t* sramBuffer, int currentSramWriteIdx, uint32_t windowMask, uint32_t hannIntMult, const float* hannLUT) {
-        int T = (tapPhase >> 16) & windowMask; 
-        float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
-        int idx_m1 = (currentSramWriteIdx - T + 1 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
-        int idx_0  = (currentSramWriteIdx - T + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
-        int idx_1  = (currentSramWriteIdx - T - 1 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
-        int idx_2  = (currentSramWriteIdx - T - 2 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
-        float y_m1 = (float)sramBuffer[idx_m1] * 3.0517578125e-5f;
-        float y0   = (float)sramBuffer[idx_0]  * 3.0517578125e-5f;
-        float y1   = (float)sramBuffer[idx_1]  * 3.0517578125e-5f;
-        float y2   = (float)sramBuffer[idx_2]  * 3.0517578125e-5f;
-        float c0 = y0; float c1 = 0.5f * (y1 - y_m1);
-        float c2 = y_m1 - 2.5f * y0 + 2.0f * y1 - 0.5f * y2;
-        float c3 = 0.5f * (y2 - y_m1) + 1.5f * (y0 - y1);
-        float interpSample = ((c3 * frac + c2) * frac + c1) * frac + c0;
+        if (__builtin_expect(startIdx <= SRAM_PITCH_BUF_MASK - 3, 1)) {
+            y2   = (float)sramBuffer[startIdx]     * 3.0517578125e-5f;
+            y1   = (float)sramBuffer[startIdx + 1] * 3.0517578125e-5f;
+            y0   = (float)sramBuffer[startIdx + 2] * 3.0517578125e-5f;
+            y_m1 = (float)sramBuffer[startIdx + 3] * 3.0517578125e-5f;
+        } else {
+            y2   = (float)sramBuffer[(startIdx + 0) & SRAM_PITCH_BUF_MASK] * 3.0517578125e-5f;
+            y1   = (float)sramBuffer[(startIdx + 1) & SRAM_PITCH_BUF_MASK] * 3.0517578125e-5f;
+            y0   = (float)sramBuffer[(startIdx + 2) & SRAM_PITCH_BUF_MASK] * 3.0517578125e-5f;
+            y_m1 = (float)sramBuffer[(startIdx + 3) & SRAM_PITCH_BUF_MASK] * 3.0517578125e-5f;
+        }
+
+        // Fetch pre-calculated 4-point Sinc Window coefficients mapped to this fractional phase
+        int baseLut = lutIdxFrac << 2; // Equivalent to lutIdxFrac * 4
+        float w_m1 = pitchSincLUT[baseLut];
+        float w_0  = pitchSincLUT[baseLut + 1];
+        float w_1  = pitchSincLUT[baseLut + 2];
+        float w_2  = pitchSincLUT[baseLut + 3];
+
+        // Hardware Fused Multiply-Add crossfade
+        float interpSample = __builtin_fmaf(y_m1, w_m1, __builtin_fmaf(y0, w_0, __builtin_fmaf(y1, w_1, y2 * w_2)));
+        
         int lutIdx = ((uint32_t)(T * hannIntMult) >> 16) & 4095; 
         return AntiDenormal(interpSample * hannLUT[lutIdx]);
     }
@@ -125,6 +157,8 @@ public:
              }
             sMixBuf[i] = sMix;
         }
+
+        // --- NATIVE ESP-DSP VECTOR BLOCK MULTIPLY ---
         dsps_mul_f32(sMixBuf, masterGainBuf, sMixBuf, framesRead, 1, 1, 1);
         
         float localPeakIn = peakInputVal, localPeakOut = peakOutputVal;

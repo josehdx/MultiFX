@@ -6,9 +6,11 @@
 class FX_Freeze {
 public:
     static inline void process(bool active, float inSample, float att, float rel, float srScale, float apfParam, float invFreqLen, int activeLen, int freezeLen, const float* hannLUT, int16_t* freezeBuffer, float* apf1Buffer, float* apf2Buffer, int& writeIdx, int& playCounter, int startIdx, volatile float& frzRamp, float& fzOutNode, int& apf1Idx, int& apf2Idx) __attribute__((always_inline)) {
+        int safeFreezeLen = (freezeLen > 0) ? freezeLen : 96000;
+        
         if(!active) {
             freezeBuffer[writeIdx] = (int16_t)(__builtin_fmaxf(-1.0f, __builtin_fminf(inSample, 1.0f)) * 32767.0f);
-            if(++writeIdx >= freezeLen) writeIdx = 0;
+            if(++writeIdx >= safeFreezeLen) writeIdx = 0;
         }
         if(frzRamp > 0.0f || active) {
             frzRamp = active ? __builtin_fminf(1.0f, __builtin_fmaf(att, srScale, frzRamp)) : __builtin_fmaxf(0.0f, __builtin_fmaf(-rel, srScale, frzRamp));
@@ -17,10 +19,11 @@ public:
             float phaseRead = (float)playCounter * invFreqLen;
             float phase2 = phaseRead + 0.5f; if(phase2 >= 1.0f) phase2 -= 1.0f;
             
-            int idx1 = startIdx + playCounter; if(idx1 >= freezeLen) idx1 -= freezeLen;
-            int aLen = (activeLen >= 64) ? activeLen : freezeLen;
-            int c2 = playCounter + (aLen / 2); if(c2 >= aLen) c2 -= aLen;
-            int idx2 = startIdx + c2; if(idx2 >= freezeLen) idx2 -= freezeLen;
+            // Bounds-safe modulo indexing across dynamic sample rate shifts
+            int idx1 = (startIdx + playCounter) % safeFreezeLen;
+            int aLen = (activeLen >= 64 && activeLen <= safeFreezeLen) ? activeLen : safeFreezeLen;
+            int c2 = (playCounter + (aLen / 2)) % aLen;
+            int idx2 = (startIdx + c2) % safeFreezeLen;
             
             int lut1 = (int)(phaseRead * 4095.0f) & 4095;
             int lut2 = (int)(phase2 * 4095.0f) & 4095;

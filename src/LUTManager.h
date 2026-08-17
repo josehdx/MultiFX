@@ -52,19 +52,19 @@ public:
         }
     }
 
-    // FIXED: Removed IRAM_ATTR to prevent literal pool overflow. Explicit volatile float* pointer.
     static void __attribute__((optimize("Ofast"))) updateDynamicLUT(bool isCapo, bool isWhammy, int activeMode, volatile float* fxMem, int fbIdx, uint32_t currentSampleRate) {
         static std::atomic<bool> lutBusy{false};
         if (lutBusy.exchange(true, std::memory_order_acquire)) return; 
+
         if (!pitchShiftLUT_temp) { lutBusy.store(false, std::memory_order_release); return; }
 
         float basePitch = (isCapo || (activeMode==4 && isWhammy)) ? fxMem[4] : 0.0f;
         float toeBend = fxMem[0], heelBend = fxMem[1], harmRatioMem = fxMem[3], chorusRatioMem = fxMem[7], vibHzMem = fxMem[9];
         
+        // Removed vTaskDelay(1) to execute table generation atomically and prevent pedal event lockups
         for(int i=0; i<16384; i++) {
             float normalizedThrow = (i>=8192) ? ((float)(i-8192)/8191.0f) : ((float)(i-8192)/8192.0f); 
             pitchShiftLUT_temp[i] = powf(2.0f,(basePitch+((normalizedThrow>=0.0f)?(toeBend*normalizedThrow):(heelBend*fabsf(normalizedThrow))))/12.0f); 
-            if(i > 0 && i % 2048 == 0) vTaskDelay(1);
         }
 
         float* tempPtr = pitchShiftLUT.load(std::memory_order_relaxed);

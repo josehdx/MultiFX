@@ -1,4 +1,4 @@
-// v3.2 LilyGO T-Display Production Build (Decoupled + Restored MIDI + PAR Knobs)
+// v3.2 LilyGO T-Display Production Build (Decoupled + Restored MIDI + PAR Knobs + Hardened DSP & NVS)
 #include <Arduino.h>
 #include <Control_Surface.h>
 #include "driver/gpio.h"
@@ -26,6 +26,7 @@
 #include "LUTManager.h"
 #include "I2SManager.h"
 #include "StressTester.h"
+#include "SpinlockGuard.h" // Added Spinlock Guard
 
 // --- DECOUPLED EFFECTS ---
 #include "FX_Whammy.h"
@@ -179,7 +180,16 @@ void triggerPanicReset() {
 bool commitDSPState() {
     if (!dspAckCommit.load(std::memory_order_acquire)) return false; 
     DSPCoreState* backBuffer = &dspStates[dspWriteIndex];
-    for(int i=0; i<10; i++) { backBuffer->fxMem[i] = effectMemory[i]; for(int j=0; j<5; j++) backBuffer->params[i][j] = fxParams[i][j]; }
+    
+    {
+        // Safe Parameter Array Updates via Spinlock Guard
+        CriticalSectionGuard lock(MidiRouter::paramMux);
+        for(int i=0; i<10; i++) { 
+            backBuffer->fxMem[i] = effectMemory[i]; 
+            for(int j=0; j<5; j++) backBuffer->params[i][j] = fxParams[i][j]; 
+        }
+    }
+    
     backBuffer->activeMode = activeEffectMode.load(std::memory_order_relaxed); backBuffer->latMode = latencyMode.load(std::memory_order_relaxed); backBuffer->fbIdx = feedbackIntervalIdx.load(std::memory_order_relaxed);
     backBuffer->w = isWhammyActive; backBuffer->fz = isFrozen; backBuffer->fb = isFeedbackActive; backBuffer->hr = isHarmonizerMode; backBuffer->cp = isCapoMode; backBuffer->sy = isSynthMode; backBuffer->pd = isPadMode; backBuffer->ch = isChorusMode; backBuffer->sw = isSwellMode; backBuffer->vb = isVibratoMode; backBuffer->vg = volumePedalGain;
     dspActiveState.store(backBuffer, std::memory_order_release);
@@ -310,13 +320,17 @@ bool channelMessageCallback(ChannelMessage cm) {
         case MidiEvent::STEP_PARAM_UP:
         case MidiEvent::STEP_PARAM_DOWN: {
             float step = (action.event == MidiEvent::STEP_PARAM_DOWN) ? -1.0f : 1.0f;
-            if (currentMode == 0 || currentMode == 1 || currentMode == 8) effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f); 
-            else if (currentMode == 4) effectMemory[4] = constrain(effectMemory[4] + step, -24.0f, 24.0f); 
-            else if (currentMode == 2) { 
-                int fbIdx = feedbackIntervalIdx.load(std::memory_order_acquire);
-                feedbackIntervalIdx.store(step > 0 ? (fbIdx + 1) % 5 : (fbIdx + 4) % 5, std::memory_order_release);
-            } else { 
-                effectMemory[currentMode] = constrain(effectMemory[currentMode] + step, -24.0f, 24.0f); 
+            {
+                // Safe Parameter Array Updates via Spinlock Guard
+                CriticalSectionGuard lock(MidiRouter::paramMux);
+                if (currentMode == 0 || currentMode == 1 || currentMode == 8) effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f); 
+                else if (currentMode == 4) effectMemory[4] = constrain(effectMemory[4] + step, -24.0f, 24.0f); 
+                else if (currentMode == 2) { 
+                    int fbIdx = feedbackIntervalIdx.load(std::memory_order_acquire);
+                    feedbackIntervalIdx.store(step > 0 ? (fbIdx + 1) % 5 : (fbIdx + 4) % 5, std::memory_order_release);
+                } else { 
+                    effectMemory[currentMode] = constrain(effectMemory[currentMode] + step, -24.0f, 24.0f); 
+                }
             }
             lutNeedsUpdate = true; dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
             break;
@@ -648,7 +662,12 @@ void loop() {
     lastBootState = currentBootState;
     
     pedals.process(latestPB1, latestPB2, latestPB3, isVolumeMode, INVERT_PB3);
-    currentPB1 = 8192; currentPB2 = 8192; currentPB3 = 8192; currentCC11 = 0;
+    
+    // Dynamically retrieve real mapped outputs from PedalManager
+    currentPB1 = pedals.getCalA(); 
+    currentPB2 = pedals.getCalB(); 
+    currentPB3 = pedals.getCalC(); 
+    currentCC11 = 0;
     
     static unsigned long lastLutUpdate = 0;
     unsigned long lutInterval = ENABLE_STRESS_TESTER ? 250 : 40;
@@ -662,15 +681,32 @@ void loop() {
         lastLutUpdate = millis(); 
     }
     
-    if(!ENABLE_STRESS_TESTER && settingsNeedSaving && (millis()-lastParameterChangeTime>2000)) { 
-        if (millis()-lastParameterChangeTime>10000) {
-            settingsNeedSaving=false; dsp_is_paused.store(true, std::memory_order_release); while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-            DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
-            AppSettings cs; for(int i=0; i<10; i++) { cs.fxMem[i]=activeDSP->fxMem[i]; for(int p=0; p<5; p++) cs.params[i][p]=activeDSP->params[i][p]; }
-            uint16_t fxStates=0; if(activeDSP->w) fxStates|=(1<<0); if(activeDSP->fz) fxStates|=(1<<1); if(activeDSP->fb) fxStates|=(1<<2); if(activeDSP->hr) fxStates|=(1<<3); if(activeDSP->cp) fxStates|=(1<<4); if(activeDSP->sy) fxStates|=(1<<5); if(activeDSP->pd) fxStates|=(1<<6); if(activeDSP->ch) fxStates|=(1<<7); if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9);
-            settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), &cs, sizeof(AppSettings));
-            dsp_is_paused.store(false, std::memory_order_release);
+    // Safe DSP Parking Sequence around NVS Flash Writes
+    if(!ENABLE_STRESS_TESTER && settingsNeedSaving && (millis()-lastParameterChangeTime>10000)) { 
+        settingsNeedSaving=false; 
+        
+        dsp_is_paused.store(true, std::memory_order_release); 
+        while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+        
+        DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
+        AppSettings cs; 
+        
+        {
+            // Safe Parameter Array Updates via Spinlock Guard
+            CriticalSectionGuard lock(MidiRouter::paramMux);
+            for(int i=0; i<10; i++) { 
+                cs.fxMem[i]=activeDSP->fxMem[i]; 
+                for(int p=0; p<5; p++) cs.params[i][p]=activeDSP->params[i][p]; 
+            }
         }
+        
+        uint16_t fxStates=0; 
+        if(activeDSP->w) fxStates|=(1<<0); if(activeDSP->fz) fxStates|=(1<<1); if(activeDSP->fb) fxStates|=(1<<2); if(activeDSP->hr) fxStates|=(1<<3); if(activeDSP->cp) fxStates|=(1<<4); if(activeDSP->sy) fxStates|=(1<<5); if(activeDSP->pd) fxStates|=(1<<6); if(activeDSP->ch) fxStates|=(1<<7); if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9);
+        
+        settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), &cs, sizeof(AppSettings));
+        
+        dsp_is_paused.store(false, std::memory_order_release);
+        while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
     }
     
     if(sampleRateToggleRequested) { sampleRateToggleRequested=false; toggleSampleRate(); } if(pb2ToggleRequested) { pb2ToggleRequested=false; calibratePBs(); settingsNeedSaving=true; lastParameterChangeTime=millis(); }

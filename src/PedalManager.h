@@ -41,7 +41,7 @@ private:
     bool pb3_vol_lock = true;
     int pb3_vol_ref = -1;
 
-    analog_t map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
+    int map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
         int deadLower = center - dZone; 
         int deadUpper = center + dZone;
         int effMin = rMin + PEDAL_OUTER_DEADZONE; 
@@ -64,16 +64,16 @@ private:
         return constrain(mappedValue, MIN_MIDI_VAL, MAX_MIDI_VAL);
     }
 
-    analog_t map_raw_expression(int raw, uint16_t rMin, uint16_t rMax, bool invert) {
+    int map_raw_expression(int raw, uint16_t rMin, uint16_t rMax, bool invert) {
         int heelLockZone = 350; int toeLockZone = 300; int lowerLimit, upperLimit;
         if (!invert) {
             lowerLimit = rMin + heelLockZone; upperLimit = rMax - toeLockZone;
-            if (lowerLimit >= upperLimit) { lowerLimit = rMin; upperLimit = rMax; }
+            if (lowerLimit >= upperLimit) return MIN_MIDI_VAL; // Guard against division-by-zero
             if (raw <= lowerLimit) return MIN_MIDI_VAL; if (raw >= upperLimit) return MAX_MIDI_VAL; 
             return map(raw, lowerLimit, upperLimit, MIN_MIDI_VAL, MAX_MIDI_VAL);
         } else {
             lowerLimit = rMin + toeLockZone; upperLimit = rMax - heelLockZone;
-            if (lowerLimit >= upperLimit) { lowerLimit = rMin; upperLimit = rMax; }
+            if (lowerLimit >= upperLimit) return MAX_MIDI_VAL; // Guard against division-by-zero
             if (raw <= lowerLimit) return MAX_MIDI_VAL; if (raw >= upperLimit) return MIN_MIDI_VAL; 
             return map(raw, lowerLimit, upperLimit, MAX_MIDI_VAL, MIN_MIDI_VAL);
         }

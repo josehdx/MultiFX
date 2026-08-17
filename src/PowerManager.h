@@ -24,7 +24,6 @@ public:
         return stdConfig;
     }
 
-    // Added missing battery voltage conversion function
     static float getBatteryVoltage(int raw) {
         return ((float)raw / 4095.0f) * 2.0f * 3.3f;
     }
@@ -48,6 +47,7 @@ public:
         if(isPaused) return;
         uint8_t result[128] __attribute__((aligned(4)));
         uint32_t ret_num=0; esp_err_t err; int loop_bound = 0;
+        
         while(loop_bound++ < 4) {
             err=adc_continuous_read(handle, result, sizeof(result), &ret_num, 0);
             if(err==ESP_OK && ret_num>0) {
@@ -58,10 +58,13 @@ public:
                     if(p->type2.channel==ADC_CHANNEL_9) pb3=p->type2.data;
                     if(p->type2.channel==ADC_CHANNEL_3) bat.store(p->type2.data, std::memory_order_relaxed);
                 }
-            } else if (err == ESP_ERR_TIMEOUT || err == ESP_ERR_INVALID_STATE) { 
+            } else if (err == ESP_ERR_TIMEOUT) { 
+                // Non-blocking pass-through. Do not thrash the ADC driver!
+                break; 
+            } else if (err == ESP_ERR_INVALID_STATE) {
                 adc_continuous_stop(handle); vTaskDelay(pdMS_TO_TICKS(2)); adc_continuous_start(handle); break; 
             } else { 
-                adc_continuous_stop(handle); adc_continuous_start(handle); break; 
+                break; 
             }
         }
     }

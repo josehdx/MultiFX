@@ -1,4 +1,4 @@
-// v3.7 LilyGO T-Display Production Build (Decoupled + Restored MIDI + PAR Knobs + Hardened DSP & NVS, Async LUT Task, Production)
+// v3.11 LilyGO T-Display Production Build (Po2 Latency, Atomic MIDI/PAR Knobs, Async LUT Sync, DMA Guards)
 #include <Arduino.h>
 #include <Control_Surface.h>
 #include "driver/gpio.h"
@@ -67,12 +67,12 @@ volatile bool settingsNeedSaving = false; volatile unsigned long lastParameterCh
 float fxParams[10][5] = {{0.0f,1.0f,0.0f,0.0f,0.0f},{0.6f,0.0002f,0.00005f,0.0f,0.0f},{5120.0f,30.0f,0.02f,0.0f,0.0f},{0.5f,0.0f,0.0f,0.0f,0.0f},{0.0f,0.0f,0.0f,0.0f,0.0f},{0.1f,0.005f,0.3f,0.1f,0.0f},{0.95f,1.5f,0.0f,0.0f,0.0f},{1536.0f,0.4f,0.0f,0.0f,0.0f},{0.015f,0.00002f,0.00005f,0.0f,0.0f},{1.0f,0.0f,0.0f,0.0f,0.0f}};
 const bool INVERT_PB3 = false;
 
-std::atomic<bool> dsp_is_paused{false}, dsp_ack_parked{false}, ui_clear_meters_requested{false}, globalAudioResetRequested{false}, panicResetRequested{false}, bleEnabled{true};
+std::atomic<bool> dsp_is_paused{false}, dsp_ack_parked{false}, lut_ack_parked{false}, ui_clear_meters_requested{false}, globalAudioResetRequested{false}, panicResetRequested{false}, bleEnabled{true};
 std::atomic<float> pitchShiftFactor{1.0f};
 std::atomic<uint32_t> currentSampleRate{96000}; 
 
-// Decoupled window sizes from sample rate
-const float LATENCY_WINDOWS[]={512.0f, 1024.0f, 1200.0f, 2400.0f};
+// Decoupled window sizes (Power-of-Two aligned for DSP SIMD mask compatibility)
+const float LATENCY_WINDOWS[]={512.0f, 1024.0f, 2048.0f, 4096.0f};
 int32_t *i2s_in_block = nullptr, *i2s_out_block = nullptr;
 float *inBuf=nullptr, *envBuf=nullptr, *fzOutBuf=nullptr, *masterGainBuf=nullptr, *w1Buf=nullptr, *w2Buf=nullptr, *w3Buf=nullptr, *padFilterBuf=nullptr, *dryBuf=nullptr, *fbOutBuf=nullptr, *sMixBuf=nullptr;
 esp_pm_lock_handle_t dsp_cpu_lock = NULL;
@@ -133,7 +133,7 @@ std::atomic<bool> asyncLutUpdateRequested{false};
 volatile bool lutNeedsUpdate = false;
 
 uint32_t tap_w1_1=0, tap_w1_2=256<<16, tap_w2_1=0, tap_w2_2=256<<16, tap_w3_1=0, tap_w3_2=256<<16, tap_w4_1=0, tap_w4_2=256<<16, tap_w5_1=0, tap_w5_2=256<<16;
-float currentWindowSize = 1200.0f; int freezeLength = 96000; bool wasFrozen = false;
+float currentWindowSize = 1024.0f; int freezeLength = 96000; bool wasFrozen = false;
 volatile bool apfNeedsClear = false; volatile float freezeRamp = 0.0f;
 volatile float chorusLfoPhase=0.0f, feedbackLfoPhase=0.0f, vibratoLfoPhase=0.0f, swellGain=0.0f, feedbackRamp=0.0f; float fbHpfState=0.0f, feedbackFilter=0.0f; 
 
@@ -212,7 +212,7 @@ void calibratePBs() {
 
 void cycleLatencyMode() {
     dsp_is_paused.store(true, std::memory_order_release);
-    while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+    while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
     latencyMode.store((latencyMode.load(std::memory_order_acquire) + 1) % 4, std::memory_order_release);
     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); memset(sramPitchBuffer, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t));
     memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
@@ -220,13 +220,13 @@ void cycleLatencyMode() {
     globalAudioResetRequested.store(true, std::memory_order_release);
     dspNeedsCommit = true; std::atomic_thread_fence(std::memory_order_seq_cst);
     dsp_is_paused.store(false, std::memory_order_release);
-    while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+    while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
     settingsNeedSaving = true; lastParameterChangeTime = millis();
 }
 
 void toggleSampleRate() {
     dsp_is_paused.store(true, std::memory_order_release);
-    while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+    while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
 
     I2SManager::disableAndDestroyChannels();
     uint32_t newSr = (currentSampleRate.load(std::memory_order_acquire) == 96000) ? 48000 : 96000;
@@ -244,7 +244,7 @@ void toggleSampleRate() {
     I2SManager::enableChannels();
     globalAudioResetRequested.store(true, std::memory_order_release); hardwareSyncMuteFrames.store((newSr/HOP_SIZE)*0.40f, std::memory_order_release);
     std::atomic_thread_fence(std::memory_order_seq_cst); dsp_is_paused.store(false, std::memory_order_release);
-    while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+    while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
     pedals.triggerSystemRecovery(); settingsNeedSaving=true; lastParameterChangeTime = millis();
 }
 
@@ -260,6 +260,7 @@ bool channelMessageCallback(ChannelMessage cm) {
     switch (action.event) {
         case MidiEvent::EXPRESSION_UPDATE:
             currentCC11 = action.rawValue; currentPB3 = action.rawValue; lastActivePedal = action.rawValue;
+            pedals.updateLastMidiC(); // Sync baseline to suppress local physical ADC noise
             if (isVolumeMode) { 
                 volumePedalGain = (float)action.rawValue / 16383.0f; dspNeedsCommit = true; 
                 Control_Surface.sendControlChange({19, Channel_1}, action.val); 
@@ -271,10 +272,12 @@ bool channelMessageCallback(ChannelMessage cm) {
             }
             break;
             
-        case MidiEvent::KNOB_UPDATE:
+        case MidiEvent::KNOB_UPDATE: {
+            CriticalSectionGuard lock(MidiRouter::paramMux);
             MidiRouter::updateParameter(action.cc, action.val, currentMode, effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
             settingsNeedSaving = true; lastParameterChangeTime = millis();
             break;
+        }
 
         case MidiEvent::PREV_MODE: switchEffectMode(currentMode - 1); break;
         case MidiEvent::NEXT_MODE: switchEffectMode(currentMode + 1); break;
@@ -347,10 +350,22 @@ bool channelMessageCallback(ChannelMessage cm) {
 // --- BACKGROUND LUT TASK ---
 void IRAM_ATTR LUTUpdateTask(void * pvParameters) {
     for(;;) {
+        if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
+            lut_ack_parked.store(true, std::memory_order_release);
+            while(dsp_is_paused.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(2)); }
+            lut_ack_parked.store(false, std::memory_order_release);
+        }
+
         if (asyncLutUpdateRequested.exchange(false, std::memory_order_acq_rel)) {
             DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
             
-            LUTManager::updateDynamicLUT(activeDSP->cp, activeDSP->w, activeDSP->activeMode, effectMemory, activeDSP->fbIdx, currentSampleRate.load(std::memory_order_acquire)); 
+            float safeEffectMemory[10];
+            {
+                CriticalSectionGuard lock(MidiRouter::paramMux);
+                for(int i=0; i<10; i++) safeEffectMemory[i] = effectMemory[i];
+            }
+            
+            LUTManager::updateDynamicLUT(activeDSP->cp, activeDSP->w, activeDSP->activeMode, safeEffectMemory, activeDSP->fbIdx, currentSampleRate.load(std::memory_order_acquire)); 
             
             float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire); 
             if(currentLUT) pitchShiftFactor.store(currentLUT[constrain(lastActivePedal, 0, 16383)], std::memory_order_release); 
@@ -372,7 +387,10 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
     
     for(;;) {
         if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
-            dsp_ack_parked.store(true, std::memory_order_release); while(dsp_is_paused.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(2)); } dsp_ack_parked.store(false, std::memory_order_release);
+            if (dma_memcpy_handle != NULL) safeDmaWait();
+            dsp_ack_parked.store(true, std::memory_order_release); 
+            while(dsp_is_paused.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(2)); } 
+            dsp_ack_parked.store(false, std::memory_order_release);
         }
         size_t bytesRead; i2s_channel_read((i2s_chan_handle_t)I2SManager::rx_chan, i2s_in_block, HOP_SIZE*2*sizeof(int32_t), &bytesRead, pdMS_TO_TICKS(10));
         if(__builtin_expect(bytesRead > 0, 1)) {
@@ -380,6 +398,7 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
             if(__builtin_expect(framesRead == HOP_SIZE, 1)) {
                 if(__builtin_expect(panicResetRequested.load(std::memory_order_acquire), 0)) {
                     safeDmaWait(); memset(dmaPingBuffer, 0, sizeof(dmaPingBuffer)); memset(dmaPongBuffer, 0, sizeof(dmaPongBuffer));
+                    memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t));
                     synthEnv=0.0f; synthFilter=0.0f; synthBandpass=0.0f; padEnv=0.0f; inputEnvelope=0.0f; feedbackFilterVar=0.0f; currentPitch=1.0f; freezeWriteIdxVar=0; freezePlayCounterVar=0; freezeStartIdxVar=0; activeFreezeLength=currentSampleRate.load(std::memory_order_acquire); fbDelayWriteIdx=0; apfNeedsClear=true; freezeRamp=0.0f; feedbackRamp=0.0f; vibratoLfoPhase=0.0f; chorusLfoPhase=0.0f; feedbackLfoPhase=0.0f; dampState=0.0f; wowState=0.0f; diffuserIdx=0; if(diffuserBuf) memset(diffuserBuf, 0, 1024*sizeof(float));
                     uint32_t halfWinFixed=((uint32_t)currentWindowSize/2)<<16; tap_w1_1=0; tap_w1_2=halfWinFixed; tap_w2_1=0; tap_w2_2=halfWinFixed; tap_w3_1=0; tap_w3_2=halfWinFixed; tap_w4_1=0; tap_w4_2=halfWinFixed; tap_w5_1=0; tap_w5_2=halfWinFixed; panicResetRequested.store(false, std::memory_order_release);
                     padVectorFilter.reset();
@@ -649,7 +668,10 @@ void loop() {
             int cc1 = map(filterPar1.getValue(), 0, 4095, 0, 127);
             if (cc1 != lastCcOut[0]) {
                 Control_Surface.sendControlChange({24, Channel_1}, cc1);
-                MidiRouter::updateParameter(24, cc1, activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+                {
+                    CriticalSectionGuard lock(MidiRouter::paramMux);
+                    MidiRouter::updateParameter(24, cc1, activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+                }
                 lastCcOut[0] = cc1;
             }
         }
@@ -657,7 +679,10 @@ void loop() {
             int cc2 = map(filterPar2.getValue(), 0, 4095, 0, 127);
             if (cc2 != lastCcOut[1]) {
                 Control_Surface.sendControlChange({25, Channel_1}, cc2);
-                MidiRouter::updateParameter(25, cc2, activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+                {
+                    CriticalSectionGuard lock(MidiRouter::paramMux);
+                    MidiRouter::updateParameter(25, cc2, activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+                }
                 lastCcOut[1] = cc2;
             }
         }
@@ -665,7 +690,10 @@ void loop() {
             int cc3 = map(filterPar3.getValue(), 0, 4095, 0, 127);
             if (cc3 != lastCcOut[2]) {
                 Control_Surface.sendControlChange({26, Channel_1}, cc3);
-                MidiRouter::updateParameter(26, cc3, activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+                {
+                    CriticalSectionGuard lock(MidiRouter::paramMux);
+                    MidiRouter::updateParameter(26, cc3, activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+                }
                 lastCcOut[2] = cc3;
             }
         }
@@ -673,7 +701,10 @@ void loop() {
             int cc4 = map(filterPar4.getValue(), 0, 4095, 0, 127);
             if (cc4 != lastCcOut[3]) {
                 Control_Surface.sendControlChange({27, Channel_1}, cc4);
-                MidiRouter::updateParameter(27, cc4, activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+                {
+                    CriticalSectionGuard lock(MidiRouter::paramMux);
+                    MidiRouter::updateParameter(27, cc4, activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+                }
                 lastCcOut[3] = cc4;
             }
         }
@@ -681,7 +712,10 @@ void loop() {
             int cc5 = map(filterPar5.getValue(), 0, 4095, 0, 127);
             if (cc5 != lastCcOut[4]) {
                 Control_Surface.sendControlChange({28, Channel_1}, cc5);
-                MidiRouter::updateParameter(28, cc5, activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+                {
+                    CriticalSectionGuard lock(MidiRouter::paramMux);
+                    MidiRouter::updateParameter(28, cc5, activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+                }
                 lastCcOut[4] = cc5;
             }
         }
@@ -696,7 +730,20 @@ void loop() {
     currentPB1 = pedals.getCalA(); 
     currentPB2 = pedals.getCalB(); 
     currentPB3 = pedals.getCalC(); 
-    currentCC11 = 0;
+    
+    if (pedals.hasMovedC()) {
+        lastActivePedal = currentPB3;
+        if (isVolumeMode) {
+            volumePedalGain = (float)currentPB3 / 16383.0f;
+            dspNeedsCommit = true;
+        } else {
+            if (!asyncLutUpdateRequested.load(std::memory_order_acquire)) {
+                float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire);
+                if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB3], std::memory_order_release);
+            }
+        }
+        pedals.updateLastMidiC();
+    }
     
     // Trigger Async LUT Generation (0.001 ms block)
     static unsigned long lastLutUpdate = 0;
@@ -712,7 +759,7 @@ void loop() {
         settingsNeedSaving=false; 
         
         dsp_is_paused.store(true, std::memory_order_release); 
-        while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+        while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
         
         DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
         AppSettings cs; 
@@ -731,7 +778,7 @@ void loop() {
         settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), &cs, sizeof(AppSettings));
         
         dsp_is_paused.store(false, std::memory_order_release);
-        while(dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+        while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
     }
     
     if(sampleRateToggleRequested) { sampleRateToggleRequested=false; toggleSampleRate(); } if(pb2ToggleRequested) { pb2ToggleRequested=false; calibratePBs(); settingsNeedSaving=true; lastParameterChangeTime=millis(); }

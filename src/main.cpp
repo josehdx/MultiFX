@@ -1,4 +1,4 @@
-// v3.2 LilyGO T-Display Production Build (Decoupled + Restored MIDI + PAR Knobs + Hardened DSP & NVS)
+// v3.7 LilyGO T-Display Production Build (Decoupled + Restored MIDI + PAR Knobs + Hardened DSP & NVS, Async LUT Task, Production)
 #include <Arduino.h>
 #include <Control_Surface.h>
 #include "driver/gpio.h"
@@ -26,7 +26,7 @@
 #include "LUTManager.h"
 #include "I2SManager.h"
 #include "StressTester.h"
-#include "SpinlockGuard.h" // Added Spinlock Guard
+#include "SpinlockGuard.h"
 
 // --- DECOUPLED EFFECTS ---
 #include "FX_Whammy.h"
@@ -42,11 +42,12 @@
 
 #define ENABLE_ADVANCED_TELEMETRY 
 #define ENABLE_STRESS_TESTER false 
-#define ENABLE_PAR_KNOBS true // Restored Hardware Knobs
+#define ENABLE_PAR_KNOBS true
 
 #ifdef ENABLE_ADVANCED_TELEMETRY
     std::atomic<uint32_t> audio_underflow_count{0};
     std::atomic<uint32_t> dsp_stack_watermark{0};
+    std::atomic<uint32_t> lut_stack_watermark{0};
 #endif
 
 #if ENABLE_PAR_KNOBS
@@ -54,7 +55,7 @@
     FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar2 = 11;
     FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar3 = 12;
     FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar4 = 13;
-    FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar5 = 16; // Safely mapped to 16
+    FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar5 = 16;
     int lastCcOut[5] = {-1, -1, -1, -1, -1};
 #endif
 
@@ -70,7 +71,8 @@ std::atomic<bool> dsp_is_paused{false}, dsp_ack_parked{false}, ui_clear_meters_r
 std::atomic<float> pitchShiftFactor{1.0f};
 std::atomic<uint32_t> currentSampleRate{96000}; 
 
-const float LATENCY_WINDOWS[]={512.0f,1024.0f,2048.0f,4096.0f};
+// Decoupled window sizes from sample rate
+const float LATENCY_WINDOWS[]={512.0f, 1024.0f, 1200.0f, 2400.0f};
 int32_t *i2s_in_block = nullptr, *i2s_out_block = nullptr;
 float *inBuf=nullptr, *envBuf=nullptr, *fzOutBuf=nullptr, *masterGainBuf=nullptr, *w1Buf=nullptr, *w2Buf=nullptr, *w3Buf=nullptr, *padFilterBuf=nullptr, *dryBuf=nullptr, *fbOutBuf=nullptr, *sMixBuf=nullptr;
 esp_pm_lock_handle_t dsp_cpu_lock = NULL;
@@ -125,10 +127,15 @@ float *diffuserBuf = nullptr; int diffuserIdx = 0;
 TaskHandle_t audioTaskHandle = NULL; StackType_t* dspTaskStack = nullptr; StaticTask_t* dspTaskTCB = nullptr;
 int writeIndex = 0, fbDelayWriteIdx = 0, sramWriteIdx = 0;
 
+// Async LUT Background Task Control
+TaskHandle_t lutTaskHandle = NULL; StackType_t* lutTaskStack = nullptr; StaticTask_t* lutTaskTCB = nullptr;
+std::atomic<bool> asyncLutUpdateRequested{false};
+volatile bool lutNeedsUpdate = false;
+
 uint32_t tap_w1_1=0, tap_w1_2=256<<16, tap_w2_1=0, tap_w2_2=256<<16, tap_w3_1=0, tap_w3_2=256<<16, tap_w4_1=0, tap_w4_2=256<<16, tap_w5_1=0, tap_w5_2=256<<16;
-float currentWindowSize = 512.0f; int freezeLength = 96000; bool wasFrozen = false;
+float currentWindowSize = 1200.0f; int freezeLength = 96000; bool wasFrozen = false;
 volatile bool apfNeedsClear = false; volatile float freezeRamp = 0.0f;
-volatile bool lutNeedsUpdate = false; volatile float chorusLfoPhase=0.0f, feedbackLfoPhase=0.0f, vibratoLfoPhase=0.0f, swellGain=0.0f, feedbackRamp=0.0f; float fbHpfState=0.0f, feedbackFilter=0.0f; 
+volatile float chorusLfoPhase=0.0f, feedbackLfoPhase=0.0f, vibratoLfoPhase=0.0f, swellGain=0.0f, feedbackRamp=0.0f; float fbHpfState=0.0f, feedbackFilter=0.0f; 
 
 std::atomic<int> hardwareSyncMuteFrames{0}; volatile bool sampleRateToggleRequested=false, pb2ToggleRequested=false; unsigned long lastActivityTime=0;
 
@@ -182,7 +189,6 @@ bool commitDSPState() {
     DSPCoreState* backBuffer = &dspStates[dspWriteIndex];
     
     {
-        // Safe Parameter Array Updates via Spinlock Guard
         CriticalSectionGuard lock(MidiRouter::paramMux);
         for(int i=0; i<10; i++) { 
             backBuffer->fxMem[i] = effectMemory[i]; 
@@ -246,13 +252,11 @@ bool channelMessageCallback(ChannelMessage cm) {
     lastActivityTime = millis();
     if (cm.header != 0xB0) return false;
 
-    // 1. Pass the raw CC to the decoupled router
     MidiAction action = MidiRouter::parseMessage(cm.data1, cm.data2);
     if (action.event == MidiEvent::NONE) return false;
 
     int currentMode = activeEffectMode.load(std::memory_order_acquire);
 
-    // 2. Execute the returned event
     switch (action.event) {
         case MidiEvent::EXPRESSION_UPDATE:
             currentCC11 = action.rawValue; currentPB3 = action.rawValue; lastActivePedal = action.rawValue;
@@ -260,7 +264,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 volumePedalGain = (float)action.rawValue / 16383.0f; dspNeedsCommit = true; 
                 Control_Surface.sendControlChange({19, Channel_1}, action.val); 
             } else { 
-                if (!lutNeedsUpdate) { 
+                if (!asyncLutUpdateRequested.load(std::memory_order_acquire)) { 
                     float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire); 
                     if (currentLUT) pitchShiftFactor.store(currentLUT[action.rawValue], std::memory_order_release); 
                 } 
@@ -290,7 +294,7 @@ bool channelMessageCallback(ChannelMessage cm) {
             } else { 
                 pedals.lockPB3Volume(); lastActivePedal = 8192; volumePedalGain = (float)currentPB3 / 16383.0f; 
             } 
-            if (!lutNeedsUpdate) {
+            if (!asyncLutUpdateRequested.load(std::memory_order_acquire)) {
                 float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release); 
             }
@@ -308,10 +312,9 @@ bool channelMessageCallback(ChannelMessage cm) {
             else if (action.targetEffect == 8) isSwellMode = !isSwellMode;
             else if (action.targetEffect == 9) isVibratoMode = !isVibratoMode;
             
-            // If we toggle the effect that corresponds to the base mode, flip the Whammy flag too
             if (currentMode == action.targetEffect) {
                 isWhammyActive = !isWhammyActive;
-                if (currentMode == 4 && isCapoMode) lutNeedsUpdate = true; // Specific update for Capo
+                if (currentMode == 4 && isCapoMode) lutNeedsUpdate = true;
             }
             
             dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
@@ -321,7 +324,6 @@ bool channelMessageCallback(ChannelMessage cm) {
         case MidiEvent::STEP_PARAM_DOWN: {
             float step = (action.event == MidiEvent::STEP_PARAM_DOWN) ? -1.0f : 1.0f;
             {
-                // Safe Parameter Array Updates via Spinlock Guard
                 CriticalSectionGuard lock(MidiRouter::paramMux);
                 if (currentMode == 0 || currentMode == 1 || currentMode == 8) effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f); 
                 else if (currentMode == 4) effectMemory[4] = constrain(effectMemory[4] + step, -24.0f, 24.0f); 
@@ -342,12 +344,28 @@ bool channelMessageCallback(ChannelMessage cm) {
     return false;
 }
 
+// --- BACKGROUND LUT TASK ---
+void IRAM_ATTR LUTUpdateTask(void * pvParameters) {
+    for(;;) {
+        if (asyncLutUpdateRequested.exchange(false, std::memory_order_acq_rel)) {
+            DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
+            
+            LUTManager::updateDynamicLUT(activeDSP->cp, activeDSP->w, activeDSP->activeMode, effectMemory, activeDSP->fbIdx, currentSampleRate.load(std::memory_order_acquire)); 
+            
+            float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire); 
+            if(currentLUT) pitchShiftFactor.store(currentLUT[constrain(lastActivePedal, 0, 16383)], std::memory_order_release); 
+        }
+        vTaskDelay(pdMS_TO_TICKS(15)); 
+    }
+}
+
 void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParameters) {
     float input_dc_offset=0.0f, synthEnv=0.0f, synthFilter=0.0f, synthBandpass=0.0f, padEnv=0.0f, inputEnvelope=0.0f, feedbackFilterVar=0.0f, smoothedVolGain=1.0f, currentPitch=1.0f, fbOutNode=0.0f, smoothed_delay_samples=0.0f, dampState=0.0f, wowState=0.0f;
     uint32_t wowRng = 123456789; bool wasFeedbackActive=false; int freezeWriteIdxVar=0, freezePlayCounterVar=0, freezeStartIdxVar=0, activeFreezeLength=96000;
     float c_fx[10][5] = {0.0f}; int c_lat=0, c_act=0; bool c_w=true, c_fz=false, c_fb=false, c_hr=false, c_cp=false, c_sy=false, c_pd=false, c_ch=false, c_sw=false, c_vb=false; float c_vg=1.0f;
     const float normFactor=1.0f/2147483648.0f, DC_OFFSET=1e-9f;
     
+    float lastPadCutoff = -1.0f;
     int apf1Idx = 0, apf2Idx = 0;
     
     while (LUTManager::hannLUT == nullptr || LUTManager::lfoLUT == nullptr || LUTManager::synthLUT == nullptr || LUTManager::apf1Buffer == nullptr || LUTManager::apf2Buffer == nullptr || LUTManager::pitchSincLUT == nullptr) { vTaskDelay(pdMS_TO_TICKS(10)); }
@@ -365,6 +383,7 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                     synthEnv=0.0f; synthFilter=0.0f; synthBandpass=0.0f; padEnv=0.0f; inputEnvelope=0.0f; feedbackFilterVar=0.0f; currentPitch=1.0f; freezeWriteIdxVar=0; freezePlayCounterVar=0; freezeStartIdxVar=0; activeFreezeLength=currentSampleRate.load(std::memory_order_acquire); fbDelayWriteIdx=0; apfNeedsClear=true; freezeRamp=0.0f; feedbackRamp=0.0f; vibratoLfoPhase=0.0f; chorusLfoPhase=0.0f; feedbackLfoPhase=0.0f; dampState=0.0f; wowState=0.0f; diffuserIdx=0; if(diffuserBuf) memset(diffuserBuf, 0, 1024*sizeof(float));
                     uint32_t halfWinFixed=((uint32_t)currentWindowSize/2)<<16; tap_w1_1=0; tap_w1_2=halfWinFixed; tap_w2_1=0; tap_w2_2=halfWinFixed; tap_w3_1=0; tap_w3_2=halfWinFixed; tap_w4_1=0; tap_w4_2=halfWinFixed; tap_w5_1=0; tap_w5_2=halfWinFixed; panicResetRequested.store(false, std::memory_order_release);
                     padVectorFilter.reset();
+                    lastPadCutoff = -1.0f;
                 }
                 if(__builtin_expect(globalAudioResetRequested.load(std::memory_order_acquire), 0)) {
                     safeDmaWait(); memset(dmaPingBuffer, 0, sizeof(dmaPingBuffer)); memset(dmaPongBuffer, 0, sizeof(dmaPongBuffer));
@@ -373,6 +392,7 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                     globalAudioResetRequested.store(false, std::memory_order_release); smoothed_delay_samples=0.0f; 
                     if(hardwareSyncMuteFrames.load(std::memory_order_acquire) < 10) hardwareSyncMuteFrames.store((currentSampleRate.load(std::memory_order_acquire)/HOP_SIZE)*0.40f, std::memory_order_release);
                     padVectorFilter.reset();
+                    lastPadCutoff = -1.0f;
                 }
                 
                 int currentMute = hardwareSyncMuteFrames.load(std::memory_order_acquire); bool isMuted = false;
@@ -385,7 +405,7 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
 
                 float targetWindow = LATENCY_WINDOWS[c_lat];
                 if(__builtin_expect(currentWindowSize!=targetWindow, 0)) { currentWindowSize=targetWindow; uint32_t halfWindowFixed=((uint32_t)targetWindow/2)<<16; tap_w1_1=0; tap_w1_2=halfWindowFixed; tap_w2_1=0; tap_w2_2=halfWindowFixed; tap_w3_1=0; tap_w3_2=halfWindowFixed; tap_w4_1=0; tap_w4_2=halfWindowFixed; tap_w5_1=0; tap_w5_2=halfWindowFixed; }
-                uint32_t hannIntMult=(4096U<<16)/(uint32_t)currentWindowSize, windowMask=(uint32_t)currentWindowSize-1; float p_w_dry=c_fx[0][0], p_w_wet=c_fx[0][1], p_fz_apf=c_fx[1][0], p_fz_att=c_fx[1][1], p_fz_rel=c_fx[1][2], p_fb_spd=c_fx[2][0], p_fb_drv=c_fx[2][1], p_fb_off=c_fx[2][2], p_hr_mix=c_fx[3][0], p_sy_att=c_fx[5][0], p_sy_rel=c_fx[5][1], p_sy_flt=c_fx[5][2], p_sy_mix=c_fx[5][3], p_pd_sm=c_fx[6][0], p_pd_mix=c_fx[6][1], p_ch_spd=c_fx[7][0], p_ch_mix=c_fx[7][1], p_sw_thr=c_fx[8][0], p_sw_att=c_fx[8][1], p_sw_rel=c_fx[8][2], p_vb_dep=c_fx[9][0]; 
+                uint32_t hannIntMult=(4096U<<16)/(uint32_t)currentWindowSize; int windowSize=(int)currentWindowSize; float p_w_dry=c_fx[0][0], p_w_wet=c_fx[0][1], p_fz_apf=c_fx[1][0], p_fz_att=c_fx[1][1], p_fz_rel=c_fx[1][2], p_fb_spd=c_fx[2][0], p_fb_drv=c_fx[2][1], p_fb_off=c_fx[2][2], p_hr_mix=c_fx[3][0], p_sy_att=c_fx[5][0], p_sy_rel=c_fx[5][1], p_sy_flt=c_fx[5][2], p_sy_mix=c_fx[5][3], p_pd_sm=c_fx[6][0], p_pd_mix=c_fx[6][1], p_ch_spd=c_fx[7][0], p_ch_mix=c_fx[7][1], p_sw_thr=c_fx[8][0], p_sw_att=c_fx[8][1], p_sw_rel=c_fx[8][2], p_vb_dep=c_fx[9][0]; 
                 
                 float chorusPhaseIncr = p_ch_spd / (float)currentSampleRate.load(std::memory_order_acquire);
                 float feedbackPhaseIncr = p_fb_spd / (float)currentSampleRate.load(std::memory_order_acquire);
@@ -422,6 +442,7 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                 } else { for(int i = 0; i < HOP_SIZE; i++) activeDmaWriteBuf[i] = delayBuffer[(nextDryIdx + i) & BUFFER_MASK]; dma_transfer_done.store(true, std::memory_order_release); }
                 int prefetchIdxFB = (fbDelayWriteIdx - delaySamples + FB_BUFFER_SIZE) & FB_BUFFER_MASK; int aheadFB = (prefetchIdxFB + 32) & FB_BUFFER_MASK; __builtin_prefetch(&fbDelayBuffer[aheadFB], 0, 3);
                 
+                int32_t windowFixed = (int32_t)currentWindowSize << 16;
                 float peakInputVal=0.0f, peakOutputVal=0.0f;
                 DSPEngine::processInput(framesRead, i2s_in_block, normFactor, dc_alpha, envRetain, envAttack, p_sw_thr, p_sw_att, p_sw_rel, srScale, swellActive, localVolGain, vol_alpha, input_dc_offset, inputEnvelope, localSwellGain, smoothedVolGain, currentPitch, targetPitch, envBuf, masterGainBuf, inBuf, fzOutBuf);
                 
@@ -450,24 +471,24 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                     
                     float w4 = 0.0f, w5 = 0.0f;
                     if(__builtin_expect(feedbackActive||localFbRamp>0.0f, 0)) {
-                        w4 = DSPEngine::processPitchTap(tap_w4_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,LUTManager::hannLUT,LUTManager::pitchSincLUT)+DSPEngine::processPitchTap(tap_w4_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,LUTManager::hannLUT,LUTManager::pitchSincLUT);
-                        w5 = DSPEngine::processPitchTap(tap_w5_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,LUTManager::hannLUT,LUTManager::pitchSincLUT)+DSPEngine::processPitchTap(tap_w5_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,LUTManager::hannLUT,LUTManager::pitchSincLUT);
+                        w4 = DSPEngine::processDualPitchTap_SIMD(tap_w4_1, tap_w4_2, sramPitchBuffer, sramWriteIdx, windowSize, hannIntMult, LUTManager::hannLUT, LUTManager::pitchSincLUT);
+                        w5 = DSPEngine::processDualPitchTap_SIMD(tap_w5_1, tap_w5_2, sramPitchBuffer, sramWriteIdx, windowSize, hannIntMult, LUTManager::hannLUT, LUTManager::pitchSincLUT);
                     }
                     
                     FX_Feedback::process(feedbackActive, srScale, p_fb_drv, fbHpfCoeff, fbLpfCoeff, fbLpfRetain, LUTManager::globalFbRatio.load(std::memory_order_relaxed), currentPitch, LUTManager::lfoLUT, localFbPhase, feedbackPhaseIncr, wowRng, wowState, spd4, spd5, w4, w5, envBuf[i], localFbRamp, fzOutBuf[i], frzActive, localFrzRamp, localFbHpf, feedbackFilter, fbDelayBuffer, delaySamples, fbDelayWriteIdx, fbOutNode);
                     
-                    float rawW1 = DSPEngine::processPitchTap(tap_w1_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,LUTManager::hannLUT,LUTManager::pitchSincLUT)+DSPEngine::processPitchTap(tap_w1_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,LUTManager::hannLUT,LUTManager::pitchSincLUT); 
+                    float rawW1 = DSPEngine::processDualPitchTap_SIMD(tap_w1_1, tap_w1_2, sramPitchBuffer, sramWriteIdx, windowSize, hannIntMult, LUTManager::hannLUT, LUTManager::pitchSincLUT); 
                     float dampCutoff = (currentPitch > 1.498f) ? __builtin_fmaxf(0.1f, 1.0f - (currentPitch - 1.498f) * 0.5f) : 1.0f;
                     dampState = DSPEngine::AntiDenormal(__builtin_fmaf(dampCutoff, (rawW1 - dampState), dampState)); w1Buf[i] = dampState;
                     
-                    w2Buf[i]=0.0f; if(__builtin_expect(harmActive, 0)) w2Buf[i]=DSPEngine::processPitchTap(tap_w2_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,LUTManager::hannLUT,LUTManager::pitchSincLUT)+DSPEngine::processPitchTap(tap_w2_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,LUTManager::hannLUT,LUTManager::pitchSincLUT); 
-                    w3Buf[i]=0.0f; if(__builtin_expect(chorusActive, 0)) w3Buf[i]=DSPEngine::processPitchTap(tap_w3_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,LUTManager::hannLUT,LUTManager::pitchSincLUT)+DSPEngine::processPitchTap(tap_w3_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,LUTManager::hannLUT,LUTManager::pitchSincLUT);
+                    w2Buf[i]=0.0f; if(__builtin_expect(harmActive, 0)) w2Buf[i]=DSPEngine::processDualPitchTap_SIMD(tap_w2_1, tap_w2_2, sramPitchBuffer, sramWriteIdx, windowSize, hannIntMult, LUTManager::hannLUT, LUTManager::pitchSincLUT); 
+                    w3Buf[i]=0.0f; if(__builtin_expect(chorusActive, 0)) w3Buf[i]=DSPEngine::processDualPitchTap_SIMD(tap_w3_1, tap_w3_2, sramPitchBuffer, sramWriteIdx, windowSize, hannIntMult, LUTManager::hannLUT, LUTManager::pitchSincLUT);
                     
-                    int32_t step1=(int32_t)((1.0f-spd1)*65536.0f); tap_w1_1+=step1; tap_w1_2+=step1; 
-                    int32_t step2=(int32_t)((1.0f-spd2)*65536.0f); tap_w2_1+=step2; tap_w2_2+=step2; 
-                    int32_t step3=(int32_t)((1.0f-spd3)*65536.0f); tap_w3_1+=step3; tap_w3_2+=step3; 
-                    int32_t step4=(int32_t)((1.0f-spd4)*65536.0f); tap_w4_1+=step4; tap_w4_2+=step4; 
-                    int32_t step5=(int32_t)((1.0f-spd5)*65536.0f); tap_w5_1+=step5; tap_w5_2+=step5;
+                    int32_t step1=(int32_t)((1.0f-spd1)*65536.0f); tap_w1_1+=step1; while((int32_t)tap_w1_1 >= windowFixed) tap_w1_1 -= windowFixed; while((int32_t)tap_w1_1 < 0) tap_w1_1 += windowFixed; tap_w1_2+=step1; while((int32_t)tap_w1_2 >= windowFixed) tap_w1_2 -= windowFixed; while((int32_t)tap_w1_2 < 0) tap_w1_2 += windowFixed;
+                    int32_t step2=(int32_t)((1.0f-spd2)*65536.0f); tap_w2_1+=step2; while((int32_t)tap_w2_1 >= windowFixed) tap_w2_1 -= windowFixed; while((int32_t)tap_w2_1 < 0) tap_w2_1 += windowFixed; tap_w2_2+=step2; while((int32_t)tap_w2_2 >= windowFixed) tap_w2_2 -= windowFixed; while((int32_t)tap_w2_2 < 0) tap_w2_2 += windowFixed;
+                    int32_t step3=(int32_t)((1.0f-spd3)*65536.0f); tap_w3_1+=step3; while((int32_t)tap_w3_1 >= windowFixed) tap_w3_1 -= windowFixed; while((int32_t)tap_w3_1 < 0) tap_w3_1 += windowFixed; tap_w3_2+=step3; while((int32_t)tap_w3_2 >= windowFixed) tap_w3_2 -= windowFixed; while((int32_t)tap_w3_2 < 0) tap_w3_2 += windowFixed;
+                    int32_t step4=(int32_t)((1.0f-spd4)*65536.0f); tap_w4_1+=step4; while((int32_t)tap_w4_1 >= windowFixed) tap_w4_1 -= windowFixed; while((int32_t)tap_w4_1 < 0) tap_w4_1 += windowFixed; tap_w4_2+=step4; while((int32_t)tap_w4_2 >= windowFixed) tap_w4_2 -= windowFixed; while((int32_t)tap_w4_2 < 0) tap_w4_2 += windowFixed;
+                    int32_t step5=(int32_t)((1.0f-spd5)*65536.0f); tap_w5_1+=step5; while((int32_t)tap_w5_1 >= windowFixed) tap_w5_1 -= windowFixed; while((int32_t)tap_w5_1 < 0) tap_w5_1 += windowFixed; tap_w5_2+=step5; while((int32_t)tap_w5_2 >= windowFixed) tap_w5_2 -= windowFixed; while((int32_t)tap_w5_2 < 0) tap_w5_2 += windowFixed;
                     
                     dryBuf[i] = (float)activeDmaReadBuf[i] * 3.0517578125e-5f; fbOutBuf[i]=fbOutNode; 
                     writeIndex=(writeIndex+1)&BUFFER_MASK; sramWriteIdx=(sramWriteIdx+1)&SRAM_PITCH_BUF_MASK;
@@ -477,7 +498,6 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                 
                 if (__builtin_expect(padActive, 0)) {
                     float padCutoff = __builtin_fmaxf(150.0f, (1.0f - p_pd_sm) * 12000.0f);
-                    static float lastPadCutoff = -1.0f;
                     if (fabsf(padCutoff - lastPadCutoff) > 10.0f) { padVectorFilter.setLPF(padCutoff, currentSampleRate.load(std::memory_order_relaxed)); lastPadCutoff = padCutoff; }
                     padVectorFilter.process(w1Buf, padFilterBuf, framesRead);
                 } else { memset(padFilterBuf, 0, framesRead * sizeof(float)); }
@@ -523,7 +543,10 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
 }
 
 void setup() {
-    Serial.begin(115200); esp_brownout_init(); vTaskDelay(pdMS_TO_TICKS(1000));
+    Serial.begin(115200); 
+    esp_brownout_init(); 
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
     esp_err_t err = nvs_flash_init(); if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) { ESP_ERROR_CHECK(nvs_flash_erase()); err = nvs_flash_init(); } ESP_ERROR_CHECK(err);
 
     BluetoothManager::initHCI();
@@ -583,8 +606,15 @@ void setup() {
     i2s_std_config_t stdConfig = PowerManager::getI2SConfig(currentSampleRate.load(std::memory_order_acquire));
     I2SManager::initChannels(stdConfig, HOP_SIZE);
     
+    // Core 0: High Priority Audio DSP Task
     dspTaskStack = (StackType_t*)heap_caps_aligned_alloc(16, 8192, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); dspTaskTCB = (StaticTask_t*)heap_caps_aligned_alloc(16, sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (dspTaskStack != nullptr && dspTaskTCB != nullptr) { audioTaskHandle = xTaskCreateStaticPinnedToCore(AudioDSPTask, "DSP", 8192, NULL, configMAX_PRIORITIES - 1, dspTaskStack, dspTaskTCB, 0); } else { while(1) vTaskDelay(100); }
+    
+    // Core 1: Low Priority Background LUT Task (Using exactly 3KB of internal SRAM)
+    lutTaskStack = (StackType_t*)heap_caps_aligned_alloc(16, 3072, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); 
+    lutTaskTCB = (StaticTask_t*)heap_caps_aligned_alloc(16, sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (lutTaskStack != nullptr && lutTaskTCB != nullptr) { lutTaskHandle = xTaskCreateStaticPinnedToCore(LUTUpdateTask, "LUT_Task", 3072, NULL, 1, lutTaskStack, lutTaskTCB, 1); } else { while(1) vTaskDelay(100); }
+
     I2SManager::enableChannels();
 
     if (ENABLE_STRESS_TESTER) { static StressParams stressParams = { &latestPB1, &latestPB2, &latestPB3, switchEffectMode, triggerPanicReset, &sampleRateToggleRequested }; xTaskCreatePinnedToCore(StressTester::StressTask, "StressTask", 4096, &stressParams, 1, NULL, 1); }
@@ -663,25 +693,21 @@ void loop() {
     
     pedals.process(latestPB1, latestPB2, latestPB3, isVolumeMode, INVERT_PB3);
     
-    // Dynamically retrieve real mapped outputs from PedalManager
     currentPB1 = pedals.getCalA(); 
     currentPB2 = pedals.getCalB(); 
     currentPB3 = pedals.getCalC(); 
     currentCC11 = 0;
     
+    // Trigger Async LUT Generation (0.001 ms block)
     static unsigned long lastLutUpdate = 0;
     unsigned long lutInterval = ENABLE_STRESS_TESTER ? 250 : 40;
     
     if(lutNeedsUpdate && (millis() - lastLutUpdate > lutInterval)) { 
         lutNeedsUpdate = false; 
-        DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
-        LUTManager::updateDynamicLUT(activeDSP->cp, activeDSP->w, activeDSP->activeMode, effectMemory, activeDSP->fbIdx, currentSampleRate.load(std::memory_order_acquire));
-        float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire); 
-        if(currentLUT) pitchShiftFactor.store(currentLUT[constrain(lastActivePedal, 0, 16383)], std::memory_order_release); 
+        asyncLutUpdateRequested.store(true, std::memory_order_release);
         lastLutUpdate = millis(); 
     }
     
-    // Safe DSP Parking Sequence around NVS Flash Writes
     if(!ENABLE_STRESS_TESTER && settingsNeedSaving && (millis()-lastParameterChangeTime>10000)) { 
         settingsNeedSaving=false; 
         
@@ -692,7 +718,6 @@ void loop() {
         AppSettings cs; 
         
         {
-            // Safe Parameter Array Updates via Spinlock Guard
             CriticalSectionGuard lock(MidiRouter::paramMux);
             for(int i=0; i<10; i++) { 
                 cs.fxMem[i]=activeDSP->fxMem[i]; 
@@ -727,6 +752,10 @@ void loop() {
         if (audioTaskHandle != NULL) {
             uint32_t freeStackWords = uxTaskGetStackHighWaterMark(audioTaskHandle);
             dsp_stack_watermark.store(freeStackWords * sizeof(StackType_t), std::memory_order_relaxed);
+        }
+        if (lutTaskHandle != NULL) {
+            uint32_t freeLutStackWords = uxTaskGetStackHighWaterMark(lutTaskHandle);
+            lut_stack_watermark.store(freeLutStackWords * sizeof(StackType_t), std::memory_order_relaxed);
         }
     #endif
 
@@ -773,7 +802,7 @@ void loop() {
         #ifdef ENABLE_ADVANCED_TELEMETRY
             dData.underflows = audio_underflow_count.load(std::memory_order_relaxed);
             dData.dmaCount = dma_success_count;
-            dData.stackWatermark = dsp_stack_watermark.load(std::memory_order_relaxed);
+            dData.stackWatermark = lut_stack_watermark.load(std::memory_order_relaxed);
         #else
             dData.underflows = 0; dData.dmaCount = 0; dData.stackWatermark = 0;
         #endif

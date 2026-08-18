@@ -25,7 +25,7 @@ class BoardHAL {
 private:
 #if defined(TARGET_LILYGO)
     inline static DisplayManager displayManager;
-    inline static FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar1{3};
+    // PAR 1 removed from here as it is now read safely via DMA stream
     inline static FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar2{11};
     inline static FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar3{12};
     inline static FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar4{13};
@@ -55,15 +55,15 @@ public:
 #endif
     }
 
-    static void fetchADC(adc_continuous_handle_t handle, volatile bool& isPaused, volatile int& pb1, volatile int& pb2, volatile int& pb3, std::atomic<int>& bat) {
+    static void fetchADC(adc_continuous_handle_t handle, volatile bool& isPaused, volatile int& pb1, volatile int& pb2, volatile int& pb3, volatile int& par1, std::atomic<int>& bat) {
 #if defined(TARGET_LILYGO)
-        PowerManager::fetchADCDMA(handle, isPaused, pb1, pb2, pb3, bat);
+        PowerManager::fetchADCDMA(handle, isPaused, pb1, pb2, pb3, par1, bat);
 #else
-        BananaHardware::fetchADCDMA(handle, isPaused, pb1, pb2, pb3, bat);
+        BananaHardware::fetchADCDMA(handle, isPaused, pb1, pb2, pb3, par1, bat);
 #endif
     }
 
-    static void updateExtraControls(int activeMode, volatile float* effectMemory, float fxParams[10][5], volatile bool& lutNeedsUpdate, volatile bool& dspNeedsCommit, std::atomic<int>& feedbackIntervalIdx, bool isKnobEditModeFlag) {
+    static void updateExtraControls(int activeMode, volatile float* effectMemory, float fxParams[10][5], volatile bool& lutNeedsUpdate, volatile bool& dspNeedsCommit, std::atomic<int>& feedbackIntervalIdx, bool isKnobEditModeFlag, int latestPar1) {
 #if defined(TARGET_LILYGO)
         auto processKnob = [&](FilteredAnalog<12, 4, uint32_t, uint32_t>& knob, int ccNum, int idx) {
             if (knob.update()) {
@@ -79,8 +79,19 @@ public:
             }
         };
 
-        // PAR 1 (GPIO 3) lives on ADC1. It is immune to the BLE lock and always safe to poll.
-        processKnob(filterPar1, 24, 0); 
+        // PAR 1 (GPIO 3) lives on ADC1. We poll it directly from the DMA buffer and filter it via software EMA.
+        static int stablePar1 = 2048;
+        stablePar1 = (stablePar1 * 7 + latestPar1) / 8;
+        int ccValPar1 = map(stablePar1, 0, 4095, 0, 127);
+        
+        if (ccValPar1 != lastCcOut[0]) {
+            Control_Surface.sendControlChange({24, Channel_1}, ccValPar1);
+            {
+                CriticalSectionGuard lock(MidiRouter::paramMux);
+                MidiRouter::updateParameter(24, ccValPar1, activeMode, effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+            }
+            lastCcOut[0] = ccValPar1;
+        }
 
         // PAR 2-5 live on ADC2. We strictly block them unless BLE is completely offline.
         if (isKnobEditModeFlag) {

@@ -161,7 +161,7 @@ std::atomic<float> ui_audio_level __attribute__((aligned(64))) {0.0f}, ui_output
 
 volatile bool isAdcPaused=false;
 adc_continuous_handle_t multifx_adc_handle = NULL;
-volatile int latestPB1=2048, latestPB2=2048, latestPB3=2048;
+volatile int latestPB1=2048, latestPB2=2048, latestPB3=2048, latestPar1=2048; // Added latestPar1
 std::atomic<int> latestBat{2048};
 
 const int BOOT_SENSE_PIN=0, BLE_TOGGLE_PIN=14;
@@ -221,9 +221,9 @@ bool commitDSPState() {
 }
 
 void calibratePBs() {
-    for(int i=0; i<50; i++) { BoardHAL::fetchADC(multifx_adc_handle, isAdcPaused, latestPB1, latestPB2, latestPB3, latestBat); vTaskDelay(pdMS_TO_TICKS(1)); }
+    for(int i=0; i<50; i++) { BoardHAL::fetchADC(multifx_adc_handle, isAdcPaused, latestPB1, latestPB2, latestPB3, latestPar1, latestBat); vTaskDelay(pdMS_TO_TICKS(1)); }
     long s1=0, s2=0, s3=0; 
-    for(int i=1; i<=250; i++) { BoardHAL::fetchADC(multifx_adc_handle, isAdcPaused, latestPB1, latestPB2, latestPB3, latestBat); s1+=latestPB1; s2+=latestPB2; s3+=latestPB3; } 
+    for(int i=1; i<=250; i++) { BoardHAL::fetchADC(multifx_adc_handle, isAdcPaused, latestPB1, latestPB2, latestPB3, latestPar1, latestBat); s1+=latestPB1; s2+=latestPB2; s3+=latestPB3; } 
     pedals.setCenters(s1/250, s2/250, s3/250);
 }
 
@@ -689,14 +689,16 @@ void setup() {
     dig_cfg.conv_mode = ADC_CONV_SINGLE_UNIT_1; 
     dig_cfg.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
 
-    adc_digi_pattern_config_t adc_pattern[4]={ 
+    // Added ADC_CHANNEL_2 (PAR 1) to DMA sequence
+    adc_digi_pattern_config_t adc_pattern[5]={ 
         {.atten=ADC_ATTEN_DB_12,.channel=ADC_CHANNEL_0,.unit=ADC_UNIT_1,.bit_width=SOC_ADC_DIGI_MAX_BITWIDTH}, 
         {.atten=ADC_ATTEN_DB_12,.channel=ADC_CHANNEL_1,.unit=ADC_UNIT_1,.bit_width=SOC_ADC_DIGI_MAX_BITWIDTH}, 
         {.atten=ADC_ATTEN_DB_12,.channel=ADC_CHANNEL_9,.unit=ADC_UNIT_1,.bit_width=SOC_ADC_DIGI_MAX_BITWIDTH}, 
-        {.atten=ADC_ATTEN_DB_12,.channel=ADC_CHANNEL_3,.unit=ADC_UNIT_1,.bit_width=SOC_ADC_DIGI_MAX_BITWIDTH} 
+        {.atten=ADC_ATTEN_DB_12,.channel=ADC_CHANNEL_3,.unit=ADC_UNIT_1,.bit_width=SOC_ADC_DIGI_MAX_BITWIDTH},
+        {.atten=ADC_ATTEN_DB_12,.channel=ADC_CHANNEL_2,.unit=ADC_UNIT_1,.bit_width=SOC_ADC_DIGI_MAX_BITWIDTH} 
     };
 
-    dig_cfg.pattern_num=4; 
+    dig_cfg.pattern_num=5; 
     dig_cfg.adc_pattern=adc_pattern; 
     ESP_ERROR_CHECK(adc_continuous_config(multifx_adc_handle, &dig_cfg)); 
     ESP_ERROR_CHECK(adc_continuous_start(multifx_adc_handle));
@@ -841,6 +843,12 @@ void loop() {
                         );
                         
                         vTaskDelay(pdMS_TO_TICKS(150)); // Allow TFT to process the frame
+                        
+                        // --- TEARDOWN PROTECTION 1: PARK THE DSP CORE BEFORE WRITING TO NVS ---
+                        dsp_is_paused.store(true, std::memory_order_release);
+                        while(!dsp_ack_parked.load(std::memory_order_acquire)) { 
+                            vTaskDelay(pdMS_TO_TICKS(1)); 
+                        }
 
                         AppSettings cs; 
                         {
@@ -856,8 +864,13 @@ void loop() {
                         
                         settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), &cs, sizeof(AppSettings));
                     }
+                    
                     // Commit mode swap and hardware reboot
                     preferences.putBool("knobEditMode", !isKnobEditMode);
+                    
+                    // --- TEARDOWN PROTECTION 2: DESTROY THE I2S DMA CHANNELS BEFORE REBOOT ---
+                    I2SManager::disableAndDestroyChannels();
+                    
                     ESP.restart(); 
                 #endif
             } 
@@ -882,11 +895,11 @@ void loop() {
     }
     
     if (!ENABLE_STRESS_TESTER) {
-        BoardHAL::fetchADC(multifx_adc_handle, isAdcPaused, latestPB1, latestPB2, latestPB3, latestBat);
+        BoardHAL::fetchADC(multifx_adc_handle, isAdcPaused, latestPB1, latestPB2, latestPB3, latestPar1, latestBat);
     }
     
     // Pass isKnobEditMode flag down to ensure ADC2 pins are unblocked appropriately
-    BoardHAL::updateExtraControls(activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx, isKnobEditMode);
+    BoardHAL::updateExtraControls(activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx, isKnobEditMode, latestPar1);
     
     bool currentBootState = (REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN)) != 0;
     if(!currentBootState && lastBootState) { switchEffectMode(activeEffectMode.load(std::memory_order_acquire) + 1); lastActivityTime = millis(); vTaskDelay(pdMS_TO_TICKS(50)); }

@@ -24,6 +24,7 @@ struct DisplayData {
     // UI Warning State Flags
     bool isKnobEditMode;
     bool showBleWarning;
+    bool showSavingScreen;
 };
 
 class DisplayManager {
@@ -68,7 +69,7 @@ private:
     // Prevents wasting 100% of render cost if no visual values have meaningfully changed
     bool checkIsDirty(const DisplayData& d) {
         // Trigger screen update instantly if warnings toggle
-        if (d.isKnobEditMode != cache.isKnobEditMode || d.showBleWarning != cache.showBleWarning) return true;
+        if (d.isKnobEditMode != cache.isKnobEditMode || d.showBleWarning != cache.showBleWarning || d.showSavingScreen != cache.showSavingScreen) return true;
         
         if (d.activeMode != cache.activeMode) return true;
         if (d.pb1 != cache.pb1 || d.pb2 != cache.pb2 || d.pb3 != cache.pb3 || d.cc11 != cache.cc11) return true;
@@ -235,8 +236,19 @@ public:
              d.underflows, d.dmaCount, d.stackWatermark);
 
         // --- 7. WARNING OVERLAYS (Drawn last to sit on top of UI) ---
-        if (d.showBleWarning) {
-            // Draw a prominent red box in the middle of the screen
+        if (d.showSavingScreen) {
+            spr.fillRect(60, 70, 200, 60, TFT_BLUE);
+            spr.drawRect(60, 70, 200, 60, TFT_WHITE);
+            
+            spr.setTextColor(TFT_WHITE, TFT_BLUE);
+            spr.setTextDatum(MC_DATUM);
+            
+            spr.drawString("SAVING...", 160, 92, 2);
+            spr.drawString("Please Wait", 160, 114, 2);
+            
+            spr.setTextColor(TFT_WHITE, TFT_BLACK); // Reset Color
+        } 
+        else if (d.showBleWarning) {
             spr.fillRect(60, 70, 200, 60, TFT_RED);
             spr.drawRect(60, 70, 200, 60, TFT_WHITE);
             

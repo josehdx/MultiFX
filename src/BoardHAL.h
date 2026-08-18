@@ -19,6 +19,7 @@
 // Expose the global state variables from main.cpp
 extern bool isKnobEditMode;
 extern bool showBleWarning;
+extern bool showSavingScreen;
 
 class BoardHAL {
 private:
@@ -97,7 +98,7 @@ public:
                          uint32_t sampleRate, uint32_t peakLatency, uint32_t underflows,
                          uint32_t stackWatermark, bool bleConnected, std::atomic<int>& latestBat) {
 #if defined(TARGET_LILYGO)
-        if (millis() - lastDisplayUpdate >= 33) {
+        if (millis() - lastDisplayUpdate >= 33 || showSavingScreen) {
             lastDisplayUpdate = millis();
             DisplayData dData;
             dData.batVoltage = PowerManager::getBatteryVoltage(latestBat.load(std::memory_order_relaxed));
@@ -118,6 +119,7 @@ public:
             // Pass warning flags to UI renderer
             dData.isKnobEditMode = isKnobEditMode;
             dData.showBleWarning = showBleWarning;
+            dData.showSavingScreen = showSavingScreen;
 
             displayManager.render(dData);
         }

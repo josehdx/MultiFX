@@ -2,17 +2,18 @@
 #include <Arduino.h>
 
 // =========================================================================
-// 🔒 EXPRESSION PEDAL HARDWARE CALIBRATION - DO NOT TOUCH 🔒
-// These values are perfectly tuned for TRS capacitance, insertion shorts, 
+// EXPRESSION PEDAL HARDWARE CALIBRATION - DO NOT TOUCH
+// These values are perfectly tuned for TRS capacitance, insertion shorts,
 // and mechanical slop. Modifying them will break pedal tracking.
 // =========================================================================
 const int TRS_UNPLUGGED_VOLTAGE = 4050; // Pin floats high when unplugged
 const int TRS_PLUGGED_VOLTAGE   = 3900; // Safe threshold for seated plug
 const int TRS_INSERTION_LOCKOUT = 300;  // 1.5s (300 frames) transient blind spot
-const int PEDAL_CENTER_FLEX     = 200;  // Dynamic bounds (Center ± 200)
+const int PEDAL_CENTER_FLEX     = 200;  // Dynamic bounds (Center +/- 200)
 const int PEDAL_OUTER_DEADZONE  = 150;  // Absorbs physical heel/toe slop
 const int PB3_DEFAULT_MIN       = 1000; // PB3 Base min limit
 const int PB3_DEFAULT_MAX       = 3000; // PB3 Base max limit
+
 const int CENTER_MIDI_VAL       = 8192; // 50% Neutral
 const int MAX_MIDI_VAL          = 16383;// 100% Toe / Full Volume
 const int MIN_MIDI_VAL          = 0;    // 0% Heel
@@ -37,9 +38,11 @@ private:
     // Movement Pick-Up Lock states for PB3 (Whammy and Volume Modes)
     bool pb3_whammy_lock = true;
     int pb3_whammy_ref = -1;
+    int locked_out_whammy = CENTER_MIDI_VAL;
     
     bool pb3_vol_lock = true;
     int pb3_vol_ref = -1;
+    int locked_out_vol = MAX_MIDI_VAL;
 
     int map_raw_deadzone(int raw, uint16_t center, uint16_t rMin, uint16_t rMax, int dZone) {
         int deadLower = center - dZone; 
@@ -83,11 +86,15 @@ public:
     void lockPB3Whammy() {
         pb3_whammy_lock = true;
         pb3_whammy_ref = -1;
+        calC = CENTER_MIDI_VAL;
+        lastMidiC = calC; // Seed tracking immediately to bypass hasMovedC() firing
     }
 
     void lockPB3Volume() {
         pb3_vol_lock = true;
         pb3_vol_ref = -1;
+        calC = MAX_MIDI_VAL;
+        lastMidiC = calC; // Seed tracking immediately to bypass hasMovedC() firing
     }
 
     void setCenters(int cA, int cB, int cC) {
@@ -199,9 +206,9 @@ public:
             if (pb3_whammy_lock) {
                 if (pb3_whammy_ref == -1) pb3_whammy_ref = calC;
                 if (abs(calC - pb3_whammy_ref) > 400) { 
-                    pb3_whammy_lock = false;
+                     pb3_whammy_lock = false;
                 } else {
-                    calC = CENTER_MIDI_VAL; // Lock at Center (0 pitch shift)
+                    calC = locked_out_whammy; // Lock at Center (0 pitch shift)
                 }
             }
         } else {
@@ -210,7 +217,7 @@ public:
                 if (abs(calC - pb3_vol_ref) > 400) {
                     pb3_vol_lock = false;
                 } else {
-                    calC = MAX_MIDI_VAL; // Lock at Toe Down (100% volume)
+                    calC = locked_out_vol; // Lock at Toe Down (100% volume)
                 }
             }
         }

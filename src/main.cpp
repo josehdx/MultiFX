@@ -79,6 +79,7 @@ std::atomic<uint32_t> currentSampleRate{96000};
 // --- MODE TRACKING GLOBALS ---
 bool isKnobEditMode = false;
 bool showBleWarning = false;
+bool showSavingScreen = false;
 unsigned long warningTimer = 0;
 
 const float LATENCY_WINDOWS[]={512.0f, 1024.0f, 2048.0f, 4096.0f};
@@ -166,7 +167,6 @@ std::atomic<int> latestBat{2048};
 const int BOOT_SENSE_PIN=0, BLE_TOGGLE_PIN=14;
 volatile uint16_t currentPB1=8192, currentPB2=8192, currentPB3=8192, currentCC11=0; 
 
-// --- FIX: Change global instantiation to dynamic pointers to bypass Control_Surface's automatic BLE boot ---
 #if !defined(FW_MODE_KNOBS_ONLY)
 BluetoothMIDI_Interface* btmidi = nullptr;
 #endif
@@ -187,7 +187,7 @@ void switchEffectMode(int newMode) {
         if (cmode == 7) isChorusMode = true; if (cmode == 8) isSwellMode = true; if (cmode == 9) isVibratoMode = true;
     } 
     #if defined(TARGET_BANANA)
-    Serial0.printf("[SYSTEM] Switched Effect Mode to: %d\n", cmode);
+    Serial.printf("[SYSTEM] Switched Effect Mode to: %d\n", cmode);
     #else
     Serial.printf("[SYSTEM] Switched Effect Mode to: %d\n", cmode);
     #endif
@@ -251,11 +251,7 @@ void toggleSampleRate() {
     I2SManager::disableAndDestroyChannels();
     uint32_t newSr = (currentSampleRate.load(std::memory_order_acquire) == 96000) ? 48000 : 96000;
     currentSampleRate.store(newSr, std::memory_order_release); settingsNeedSaving = false; lutNeedsUpdate = true; 
-    #if defined(TARGET_BANANA)
-    Serial0.printf("[SYSTEM] Toggling Sample Rate to %lu Hz...\n", newSr);
-    #else
     Serial.printf("[SYSTEM] Toggling Sample Rate to %lu Hz...\n", newSr);
-    #endif
     padVectorFilter.setLPF(1200.0f, (float)newSr);
     i2s_std_config_t stdConfig = BoardHAL::getI2SConfig(newSr);
     I2SManager::initChannels(stdConfig, HOP_SIZE);
@@ -584,16 +580,22 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                     dspAckCommit.store(true, std::memory_order_release);
                 }
             } else { 
- #ifdef ENABLE_ADVANCED_TELEMETRY 
+                #ifdef ENABLE_ADVANCED_TELEMETRY 
                  audio_underflow_count.fetch_add(1, std::memory_order_relaxed); 
- #endif 
-                 vTaskDelay(pdMS_TO_TICKS(1)); 
+                #endif 
+                 // DO NOT SLEEP: Push silent dummy frame to DMA to prevent underflow cascade
+                 memset(i2s_out_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
+                 size_t dummyBytes; 
+                 i2s_channel_write((i2s_chan_handle_t)I2SManager::tx_chan, i2s_out_block, HOP_SIZE*8, &dummyBytes, 0);
              }
         } else { 
- #ifdef ENABLE_ADVANCED_TELEMETRY 
+            #ifdef ENABLE_ADVANCED_TELEMETRY 
              audio_underflow_count.fetch_add(1, std::memory_order_relaxed); 
- #endif 
-             vTaskDelay(pdMS_TO_TICKS(1)); 
+            #endif 
+             // DO NOT SLEEP: Push silent dummy frame to DMA to prevent underflow cascade
+             memset(i2s_out_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
+             size_t dummyBytes; 
+             i2s_channel_write((i2s_chan_handle_t)I2SManager::tx_chan, i2s_out_block, HOP_SIZE*8, &dummyBytes, 0);
          }
     }
 }
@@ -603,9 +605,9 @@ void setup() {
     BoardHAL::init(); 
 
 #if defined(TARGET_BANANA)
-    Serial0.println("--- Hardware UART Initialized on GPIO 43 TX / GPIO 44 RX ---");
-    Serial0.print("Firmware Version: ");
-    Serial0.println(FW_VERSION);
+    Serial.println("--- Native USB Serial Initialized ---");
+    Serial.print("Firmware Version: ");
+    Serial.println(FW_VERSION);
 #endif
     Serial.print("Firmware Version: ");
     Serial.println(FW_VERSION);
@@ -818,6 +820,43 @@ void loop() {
             
             if (pressDuration >= 1000) { 
                 #if defined(FW_MODE_HYBRID)
+                    if (isKnobEditMode) {
+                        // --- 1. User is exiting Knob Mode: Save parameters securely before rebooting ---
+                        showSavingScreen = true;
+                        
+                        // Force UI to draw the "SAVING..." screen immediately
+                        DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
+                        uint32_t watermarkVal = 0;
+                        #ifdef ENABLE_ADVANCED_TELEMETRY
+                            watermarkVal = lut_stack_watermark.load(std::memory_order_relaxed);
+                        #endif
+                        
+                        BoardHAL::updateUI(
+                            activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
+                            ui_audio_level.load(std::memory_order_acquire), ui_output_level.load(std::memory_order_acquire),
+                            core0_dsp_load.load(std::memory_order_relaxed), core1_ctrl_load.load(std::memory_order_relaxed),
+                            currentSampleRate.load(std::memory_order_acquire), max_loop_latency_ms.exchange(0, std::memory_order_relaxed),
+                            audio_underflow_count.load(std::memory_order_relaxed), watermarkVal,
+                            currentBtState, latestBat
+                        );
+                        
+                        vTaskDelay(pdMS_TO_TICKS(150)); // Allow TFT to process the frame
+
+                        AppSettings cs; 
+                        {
+                            CriticalSectionGuard lock(MidiRouter::paramMux);
+                            for(int i=0; i<10; i++) { 
+                                cs.fxMem[i]=activeDSP->fxMem[i]; 
+                                for(int p=0; p<5; p++) cs.params[i][p]=activeDSP->params[i][p]; 
+                            }
+                        }
+                        
+                        uint16_t fxStates=0; 
+                        if(activeDSP->w) fxStates|=(1<<0); if(activeDSP->fz) fxStates|=(1<<1); if(activeDSP->fb) fxStates|=(1<<2); if(activeDSP->hr) fxStates|=(1<<3); if(activeDSP->cp) fxStates|=(1<<4); if(activeDSP->sy) fxStates|=(1<<5); if(activeDSP->pd) fxStates|=(1<<6); if(activeDSP->ch) fxStates|=(1<<7); if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9);
+                        
+                        settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), &cs, sizeof(AppSettings));
+                    }
+                    // Commit mode swap and hardware reboot
                     preferences.putBool("knobEditMode", !isKnobEditMode);
                     ESP.restart(); 
                 #endif
@@ -882,32 +921,7 @@ void loop() {
         lastLutUpdate = millis(); 
     }
     
-    if(!ENABLE_STRESS_TESTER && settingsNeedSaving && (millis()-lastParameterChangeTime>10000)) { 
-        settingsNeedSaving=false; 
-        dsp_is_paused.store(true, std::memory_order_release); 
-        while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-        
-        DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
-        AppSettings cs; 
-        {
-            CriticalSectionGuard lock(MidiRouter::paramMux);
-            for(int i=0; i<10; i++) { 
-                cs.fxMem[i]=activeDSP->fxMem[i]; 
-                for(int p=0; p<5; p++) cs.params[i][p]=activeDSP->params[i][p]; 
-            }
-        }
-        uint16_t fxStates=0; 
-        if(activeDSP->w) fxStates|=(1<<0); if(activeDSP->fz) fxStates|=(1<<1); if(activeDSP->fb) fxStates|=(1<<2); if(activeDSP->hr) fxStates|=(1<<3); if(activeDSP->cp) fxStates|=(1<<4); if(activeDSP->sy) fxStates|=(1<<5); if(activeDSP->pd) fxStates|=(1<<6); if(activeDSP->ch) fxStates|=(1<<7); if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9);
-        
-        settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), &cs, sizeof(AppSettings));
-        
-        dsp_is_paused.store(false, std::memory_order_release);
-        if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
-        if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
-        while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-    }
-    
-    if(sampleRateToggleRequested) { sampleRateToggleRequested=false; toggleSampleRate(); } if(pb2ToggleRequested) { pb2ToggleRequested=false; calibratePBs(); settingsNeedSaving=true; lastParameterChangeTime=millis(); }
+    if(sampleRateToggleRequested) { sampleRateToggleRequested=false; toggleSampleRate(); } if(pb2ToggleRequested) { pb2ToggleRequested=false; calibratePBs(); }
     if (dspNeedsCommit) { if (commitDSPState()) dspNeedsCommit = false; }
     
     unsigned long loopBusyTime = micros() - loop_start_time;

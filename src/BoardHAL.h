@@ -16,6 +16,10 @@
     #include "SerialMonitor.h"
 #endif
 
+// Expose the global state variables from main.cpp
+extern bool isKnobEditMode;
+extern bool showBleWarning;
+
 class BoardHAL {
 private:
 #if defined(TARGET_LILYGO)
@@ -58,7 +62,7 @@ public:
 #endif
     }
 
-    static void updateExtraControls(int activeMode, volatile float* effectMemory, float fxParams[10][5], volatile bool& lutNeedsUpdate, volatile bool& dspNeedsCommit, std::atomic<int>& feedbackIntervalIdx) {
+    static void updateExtraControls(int activeMode, volatile float* effectMemory, float fxParams[10][5], volatile bool& lutNeedsUpdate, volatile bool& dspNeedsCommit, std::atomic<int>& feedbackIntervalIdx, bool isKnobEditModeFlag) {
 #if defined(TARGET_LILYGO)
         auto processKnob = [&](FilteredAnalog<12, 4, uint32_t, uint32_t>& knob, int ccNum, int idx) {
             if (knob.update()) {
@@ -73,9 +77,17 @@ public:
                 }
             }
         };
-        processKnob(filterPar1, 24, 0); processKnob(filterPar2, 25, 1);
-        processKnob(filterPar3, 26, 2); processKnob(filterPar4, 27, 3);
-        processKnob(filterPar5, 28, 4);
+
+        // PAR 1 (GPIO 3) lives on ADC1. It is immune to the BLE lock and always safe to poll.
+        processKnob(filterPar1, 24, 0); 
+
+        // PAR 2-5 live on ADC2. We strictly block them unless BLE is completely offline.
+        if (isKnobEditModeFlag) {
+            processKnob(filterPar2, 25, 1);
+            processKnob(filterPar3, 26, 2); 
+            processKnob(filterPar4, 27, 3);
+            processKnob(filterPar5, 28, 4);
+        }
 #endif
     }
 
@@ -102,6 +114,11 @@ public:
             dData.freePSRAM = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
             dData.sampleRate = sampleRate; dData.peakLatency = peakLatency;
             dData.underflows = underflows; dData.dmaCount = 0; dData.stackWatermark = stackWatermark;
+            
+            // Pass warning flags to UI renderer
+            dData.isKnobEditMode = isKnobEditMode;
+            dData.showBleWarning = showBleWarning;
+
             displayManager.render(dData);
         }
 #elif defined(TARGET_BANANA)

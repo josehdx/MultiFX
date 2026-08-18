@@ -20,6 +20,10 @@ struct DisplayData {
     uint32_t sampleRate;
     uint32_t peakLatency;
     uint32_t underflows, dmaCount, stackWatermark;
+    
+    // UI Warning State Flags
+    bool isKnobEditMode;
+    bool showBleWarning;
 };
 
 class DisplayManager {
@@ -27,7 +31,6 @@ private:
     TFT_eSPI tft = TFT_eSPI();
     TFT_eSprite spr = TFT_eSprite(&tft);
     TFT_eSprite bgSpr = TFT_eSprite(&tft); // Added Background Sprite
-
     DisplayData cache = {};
     int lastRenderMode = -1;
 
@@ -47,15 +50,14 @@ private:
     // Calculates trig only for the moving needles and draws text to the active sprite
     void drawKnobDynamic(TFT_eSprite& s, int cx, int cy, int r, float normVal, bool isBipolar, const char* valStr) {
         float angleDeg = isBipolar ? (normVal * 135.0f) : (-135.0f + (normVal * 270.0f));
-        float rad = (angleDeg - 90.0f) * 0.0174532925f; // 0° = UP
-
+        float rad = (angleDeg - 90.0f) * 0.0174532925f; // 0  = UP
         int px = cx + (int)(cosf(rad) * (r - 3));
         int py = cy + (int)(sinf(rad) * (r - 3));
-
+        
         uint16_t color = isBipolar ? TFT_CYAN : TFT_GREEN;
         s.drawLine(cx, cy, px, py, color);
         s.fillCircle(px, py, 2, color);
-
+        
         if (valStr) {
             s.setTextDatum(TC_DATUM);
             s.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -65,6 +67,9 @@ private:
 
     // Prevents wasting 100% of render cost if no visual values have meaningfully changed
     bool checkIsDirty(const DisplayData& d) {
+        // Trigger screen update instantly if warnings toggle
+        if (d.isKnobEditMode != cache.isKnobEditMode || d.showBleWarning != cache.showBleWarning) return true;
+        
         if (d.activeMode != cache.activeMode) return true;
         if (d.pb1 != cache.pb1 || d.pb2 != cache.pb2 || d.pb3 != cache.pb3 || d.cc11 != cache.cc11) return true;
         if (fabsf(d.inMeter - cache.inMeter) > 0.02f || fabsf(d.outMeter - cache.outMeter) > 0.02f) return true;
@@ -149,10 +154,19 @@ public:
         // --- 1. TOP STATUS BAR ---
         spr.setTextDatum(TL_DATUM);
         spr.printf("%.2fV %d%%", d.batVoltage, d.batPercent);
+
         spr.setTextDatum(TC_DATUM);
         spr.drawString(MODE_NAMES[d.activeMode % 10], 160, 2, 2);
+
+        // Edit Mode Flag override for Bluetooth text area
         spr.setTextDatum(TR_DATUM);
-        spr.drawString(d.bleConnected ? "BT: CONN" : "BT: WAIT", 318, 2);
+        if (d.isKnobEditMode) {
+            spr.setTextColor(TFT_RED, TFT_BLACK);
+            spr.drawString("EDIT MODE", 318, 2);
+            spr.setTextColor(TFT_WHITE, TFT_BLACK); // Reset Color
+        } else {
+            spr.drawString(d.bleConnected ? "BT: CONN" : "BT: WAIT", 318, 2);
+        }
 
         // --- 2. VERTICAL VU METERS (IN Left | OUT Right) ---
         int inH = constrain((int)(d.inMeter * 90.0f), 0, 90);
@@ -204,22 +218,38 @@ public:
             for (int k = 0; k < activeCount; k++) {
                 int fxIdx = activeIndices[k];
                 int bx = startX + (k * (badgeW + 4));
+                
                 spr.fillRect(bx, 134, badgeW, 16, TFT_BLUE);
                 spr.setTextColor(TFT_WHITE, TFT_BLUE);
                 spr.setTextDatum(TC_DATUM);
                 spr.drawString(FX_NAMES[fxIdx], bx + (badgeW / 2), 138, 1);
             }
         }
-        spr.setTextColor(TFT_WHITE, TFT_BLACK);
+        spr.setTextColor(TFT_WHITE, TFT_BLACK); // Reset for diagnostic text
 
         // --- 6. SYSTEM DIAGNOSTICS BAR ---
         spr.setTextDatum(TL_DATUM);
-        spr.printf("CPU: %d%%  SRM:%dK  PSR:%dK  SR:%dkHz  PLL: %dms\n", 
-            (int)d.dspCoreLoad, d.freeSRAM, d.freePSRAM, d.sampleRate / 1000, d.peakLatency);
-        spr.printf("UDF: %d      DMA: %d      STK: %dB\n", 
-            d.underflows, d.dmaCount, d.stackWatermark);
+        spr.printf("CPU: %d%%  SRM:%dK  PSR:%dK  SR:%dkHz  PLL: %dms\n",
+             (int)d.dspCoreLoad, d.freeSRAM, d.freePSRAM, d.sampleRate / 1000, d.peakLatency);
+        spr.printf("UDF: %d      DMA: %d      STK: %dB\n",
+             d.underflows, d.dmaCount, d.stackWatermark);
 
-        // Push everything to the screen
+        // --- 7. WARNING OVERLAYS (Drawn last to sit on top of UI) ---
+        if (d.showBleWarning) {
+            // Draw a prominent red box in the middle of the screen
+            spr.fillRect(60, 70, 200, 60, TFT_RED);
+            spr.drawRect(60, 70, 200, 60, TFT_WHITE);
+            
+            spr.setTextColor(TFT_WHITE, TFT_RED);
+            spr.setTextDatum(MC_DATUM);
+            
+            spr.drawString("REBOOT REQUIRED", 160, 92, 2);
+            spr.drawString("To Enable BLE", 160, 114, 2);
+            
+            spr.setTextColor(TFT_WHITE, TFT_BLACK); // Reset Color
+        }
+
+        // Push everything to the physical screen
         spr.pushSprite(0, 0);
     }
 };

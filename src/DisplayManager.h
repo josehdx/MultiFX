@@ -1,6 +1,8 @@
 #ifndef DISPLAY_MANAGER_H
 #define DISPLAY_MANAGER_H
 
+#if defined(TARGET_LILYGO)
+
 #include <TFT_eSPI.h>
 #include <Arduino.h>
 #include <math.h>
@@ -25,6 +27,7 @@ struct DisplayData {
     bool isKnobEditMode;
     bool showBleWarning;
     bool showSavingScreen;
+    bool showKnobModeScreen;
 };
 
 class DisplayManager {
@@ -69,7 +72,10 @@ private:
     // Prevents wasting 100% of render cost if no visual values have meaningfully changed
     bool checkIsDirty(const DisplayData& d) {
         // Trigger screen update instantly if warnings toggle
-        if (d.isKnobEditMode != cache.isKnobEditMode || d.showBleWarning != cache.showBleWarning || d.showSavingScreen != cache.showSavingScreen) return true;
+        if (d.isKnobEditMode != cache.isKnobEditMode || 
+            d.showBleWarning != cache.showBleWarning || 
+            d.showSavingScreen != cache.showSavingScreen ||
+            d.showKnobModeScreen != cache.showKnobModeScreen) return true;
         
         if (d.activeMode != cache.activeMode) return true;
         if (d.pb1 != cache.pb1 || d.pb2 != cache.pb2 || d.pb3 != cache.pb3 || d.cc11 != cache.cc11) return true;
@@ -248,6 +254,18 @@ public:
             
             spr.setTextColor(TFT_WHITE, TFT_BLACK); // Reset Color
         } 
+        else if (d.showKnobModeScreen) {
+            spr.fillRect(60, 70, 200, 60, TFT_DARKGREEN);
+            spr.drawRect(60, 70, 200, 60, TFT_WHITE);
+            
+            spr.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+            spr.setTextDatum(MC_DATUM);
+            
+            spr.drawString("KNOB MODE", 160, 92, 2);
+            spr.drawString("Rebooting...", 160, 114, 2);
+            
+            spr.setTextColor(TFT_WHITE, TFT_BLACK); // Reset Color
+        }
         else if (d.showBleWarning) {
             spr.fillRect(60, 70, 200, 60, TFT_RED);
             spr.drawRect(60, 70, 200, 60, TFT_WHITE);
@@ -266,4 +284,6 @@ public:
     }
 };
 
-#endif
+#endif // TARGET_LILYGO
+
+#endif // DISPLAY_MANAGER_H

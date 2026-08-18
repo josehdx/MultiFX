@@ -20,6 +20,7 @@
 extern bool isKnobEditMode;
 extern bool showBleWarning;
 extern bool showSavingScreen;
+extern bool showKnobModeScreen;
 
 class BoardHAL {
 private:
@@ -109,7 +110,7 @@ public:
                          uint32_t sampleRate, uint32_t peakLatency, uint32_t underflows,
                          uint32_t stackWatermark, bool bleConnected, std::atomic<int>& latestBat) {
 #if defined(TARGET_LILYGO)
-        if (millis() - lastDisplayUpdate >= 33 || showSavingScreen) {
+        if (millis() - lastDisplayUpdate >= 33 || showSavingScreen || showKnobModeScreen) {
             lastDisplayUpdate = millis();
             DisplayData dData;
             dData.batVoltage = PowerManager::getBatteryVoltage(latestBat.load(std::memory_order_relaxed));
@@ -131,6 +132,7 @@ public:
             dData.isKnobEditMode = isKnobEditMode;
             dData.showBleWarning = showBleWarning;
             dData.showSavingScreen = showSavingScreen;
+            dData.showKnobModeScreen = showKnobModeScreen;
 
             displayManager.render(dData);
         }

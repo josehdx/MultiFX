@@ -80,6 +80,7 @@ std::atomic<uint32_t> currentSampleRate{96000};
 bool isKnobEditMode = false;
 bool showBleWarning = false;
 bool showSavingScreen = false;
+bool showKnobModeScreen = false;
 unsigned long warningTimer = 0;
 
 const float LATENCY_WINDOWS[]={512.0f, 1024.0f, 2048.0f, 4096.0f};
@@ -822,17 +823,17 @@ void loop() {
             
             if (pressDuration >= 1000) { 
                 #if defined(FW_MODE_HYBRID)
+                    DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
+                    uint32_t watermarkVal = 0;
+                    #ifdef ENABLE_ADVANCED_TELEMETRY
+                        watermarkVal = lut_stack_watermark.load(std::memory_order_relaxed);
+                    #endif
+
                     if (isKnobEditMode) {
                         // --- 1. User is exiting Knob Mode: Save parameters securely before rebooting ---
                         showSavingScreen = true;
                         
                         // Force UI to draw the "SAVING..." screen immediately
-                        DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
-                        uint32_t watermarkVal = 0;
-                        #ifdef ENABLE_ADVANCED_TELEMETRY
-                            watermarkVal = lut_stack_watermark.load(std::memory_order_relaxed);
-                        #endif
-                        
                         BoardHAL::updateUI(
                             activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
                             ui_audio_level.load(std::memory_order_acquire), ui_output_level.load(std::memory_order_acquire),
@@ -863,6 +864,21 @@ void loop() {
                         if(activeDSP->w) fxStates|=(1<<0); if(activeDSP->fz) fxStates|=(1<<1); if(activeDSP->fb) fxStates|=(1<<2); if(activeDSP->hr) fxStates|=(1<<3); if(activeDSP->cp) fxStates|=(1<<4); if(activeDSP->sy) fxStates|=(1<<5); if(activeDSP->pd) fxStates|=(1<<6); if(activeDSP->ch) fxStates|=(1<<7); if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9);
                         
                         settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), &cs, sizeof(AppSettings));
+                    } else {
+                        // --- 2. User is entering Knob Mode from BLE Mode: Display notification ---
+                        showKnobModeScreen = true;
+                        
+                        // Force UI to draw the "KNOB MODE / Rebooting..." screen immediately
+                        BoardHAL::updateUI(
+                            activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
+                            ui_audio_level.load(std::memory_order_acquire), ui_output_level.load(std::memory_order_acquire),
+                            core0_dsp_load.load(std::memory_order_relaxed), core1_ctrl_load.load(std::memory_order_relaxed),
+                            currentSampleRate.load(std::memory_order_acquire), max_loop_latency_ms.exchange(0, std::memory_order_relaxed),
+                            audio_underflow_count.load(std::memory_order_relaxed), watermarkVal,
+                            currentBtState, latestBat
+                        );
+                        
+                        vTaskDelay(pdMS_TO_TICKS(150)); // Allow TFT frame buffer to flush to ST7789
                     }
                     
                     // Commit mode swap and hardware reboot

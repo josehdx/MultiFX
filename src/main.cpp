@@ -12,6 +12,7 @@
 #include "AudioBufferManager.h"
 #include "InputManager.h"
 #include "StressTester.h"
+#include "BluetoothManager.h"
 
 // Hardware / Framework Includes
 #include "driver/gpio.h"

@@ -1,4 +1,4 @@
-// v4.3 LilyGO T-Display (Multiband Polyphonic Tracking, Hardened Concurrency, Display/PAR Knobs)
+// v4.32 LilyGO T-Display (Multiband Polyphonic Tracking, Hardened Concurrency, Display/PAR Knobs)
 #include <Arduino.h>
 #include <Control_Surface.h>
 #include "driver/gpio.h"
@@ -115,6 +115,11 @@ TaskHandle_t lutTaskHandle = NULL; StackType_t* lutTaskStack = nullptr; StaticTa
 std::atomic<bool> asyncLutUpdateRequested{false};
 volatile bool lutNeedsUpdate = false;
 
+// --- HARDENED LOCK-FREE LUT PING-PONG BUFFERS ---
+float* pitchLutBufferA = nullptr;
+float* pitchLutBufferB = nullptr;
+std::atomic<float*> activePitchLUT{nullptr};
+
 // MULTIBAND PHASE ACCUMULATORS
 uint32_t tap_w1_lo_1=0, tap_w1_lo_2=2048<<16, tap_w1_hi_1=0, tap_w1_hi_2=256<<16;
 uint32_t tap_w2_lo_1=0, tap_w2_lo_2=2048<<16, tap_w2_hi_1=0, tap_w2_hi_2=256<<16;
@@ -185,8 +190,10 @@ bool commitDSPState() {
     
     backBuffer->activeMode = activeEffectMode.load(std::memory_order_relaxed); backBuffer->latMode = latencyMode.load(std::memory_order_relaxed); backBuffer->fbIdx = feedbackIntervalIdx.load(std::memory_order_relaxed);
     backBuffer->w = isWhammyActive; backBuffer->fz = isFrozen; backBuffer->fb = isFeedbackActive; backBuffer->hr = isHarmonizerMode; backBuffer->cp = isCapoMode; backBuffer->sy = isSynthMode; backBuffer->pd = isPadMode; backBuffer->ch = isChorusMode; backBuffer->sw = isSwellMode; backBuffer->vb = isVibratoMode; backBuffer->vg = volumePedalGain;
+    
+    dspAckCommit.store(false, std::memory_order_release); 
     dspActiveState.store(backBuffer, std::memory_order_release);
-    dspWriteIndex = (dspWriteIndex + 1) & 1; dspAckCommit.store(false, std::memory_order_release); 
+    dspWriteIndex = (dspWriteIndex + 1) & 1; 
     return true;
 }
 
@@ -208,7 +215,11 @@ void cycleLatencyMode() {
     if (diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));
     globalAudioResetRequested.store(true, std::memory_order_release);
     dspNeedsCommit = true; std::atomic_thread_fence(std::memory_order_seq_cst);
+    
     dsp_is_paused.store(false, std::memory_order_release);
+    if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
+    if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
+    
     while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
     settingsNeedSaving = true; lastParameterChangeTime = millis();
 }
@@ -236,7 +247,12 @@ void toggleSampleRate() {
     
     I2SManager::enableChannels();
     globalAudioResetRequested.store(true, std::memory_order_release); hardwareSyncMuteFrames.store((newSr/HOP_SIZE)*0.40f, std::memory_order_release);
-    std::atomic_thread_fence(std::memory_order_seq_cst); dsp_is_paused.store(false, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_seq_cst); 
+    
+    dsp_is_paused.store(false, std::memory_order_release);
+    if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
+    if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
+    
     while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
     pedals.triggerSystemRecovery(); settingsNeedSaving=true; lastParameterChangeTime = millis();
 }
@@ -259,7 +275,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 Control_Surface.sendControlChange({19, Channel_1}, action.val); 
             } else { 
                 if (!asyncLutUpdateRequested.load(std::memory_order_acquire)) { 
-                    float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire); 
+                    float* currentLUT = activePitchLUT.load(std::memory_order_acquire); 
                     if (currentLUT) pitchShiftFactor.store(currentLUT[action.rawValue], std::memory_order_release); 
                 } 
             }
@@ -291,7 +307,7 @@ bool channelMessageCallback(ChannelMessage cm) {
                 pedals.lockPB3Volume(); lastActivePedal = 8192; volumePedalGain = (float)currentPB3 / 16383.0f; 
             } 
             if (!asyncLutUpdateRequested.load(std::memory_order_acquire)) {
-                float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire);
+                float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release); 
             }
             dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); 
@@ -344,7 +360,7 @@ void IRAM_ATTR LUTUpdateTask(void * pvParameters) {
     for(;;) {
         if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
             lut_ack_parked.store(true, std::memory_order_release);
-            while(dsp_is_paused.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(2)); }
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             lut_ack_parked.store(false, std::memory_order_release);
         }
 
@@ -357,10 +373,19 @@ void IRAM_ATTR LUTUpdateTask(void * pvParameters) {
                 for(int i=0; i<10; i++) safeEffectMemory[i] = effectMemory[i];
             }
             
+            float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
+            float* targetLUT = (currentLUT == pitchLutBufferA) ? pitchLutBufferB : pitchLutBufferA;
+            
             LUTManager::updateDynamicLUT(activeDSP->cp, activeDSP->w, activeDSP->activeMode, safeEffectMemory, activeDSP->fbIdx, currentSampleRate.load(std::memory_order_acquire)); 
             
-            float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire); 
-            if(currentLUT) pitchShiftFactor.store(currentLUT[constrain(lastActivePedal, 0, 16383)], std::memory_order_release); 
+            float* sourceLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire);
+            if(sourceLUT && targetLUT) {
+                memcpy(targetLUT, sourceLUT, 16384 * sizeof(float));
+            }
+            
+            std::atomic_thread_fence(std::memory_order_release);
+            activePitchLUT.store(targetLUT, std::memory_order_release);
+            pitchShiftFactor.store(targetLUT[constrain(lastActivePedal, 0, 16383)], std::memory_order_release); 
         }
         vTaskDelay(pdMS_TO_TICKS(15)); 
     }
@@ -377,13 +402,14 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
     
     // Crossover Filter States
     float cross_lp1 = 0.0f, cross_lp2 = 0.0f;
+    DSPCoreState* lastAckedDSP = nullptr;
     
     while (LUTManager::hannLUT == nullptr || LUTManager::lfoLUT == nullptr || LUTManager::synthLUT == nullptr || LUTManager::apf1Buffer == nullptr || LUTManager::apf2Buffer == nullptr || LUTManager::pitchSincLUT == nullptr) { vTaskDelay(pdMS_TO_TICKS(10)); }
     
     for(;;) {
         if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
             dsp_ack_parked.store(true, std::memory_order_release); 
-            while(dsp_is_paused.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(2)); } 
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY); 
             dsp_ack_parked.store(false, std::memory_order_release);
         }
         size_t bytesRead; i2s_channel_read((i2s_chan_handle_t)I2SManager::rx_chan, i2s_in_block, HOP_SIZE*2*sizeof(int32_t), &bytesRead, pdMS_TO_TICKS(10));
@@ -603,6 +629,11 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                 if(__builtin_expect(isMuted, 0)) memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
                 size_t bytesWrittenCount; 
                 i2s_channel_write((i2s_chan_handle_t)I2SManager::tx_chan, i2s_out_block, framesRead*8, &bytesWrittenCount, pdMS_TO_TICKS(20));
+
+                if (__builtin_expect(activeDSP != lastAckedDSP, 0)) {
+                    lastAckedDSP = activeDSP;
+                    dspAckCommit.store(true, std::memory_order_release);
+                }
             } else { 
 #ifdef ENABLE_ADVANCED_TELEMETRY 
                 audio_underflow_count.fetch_add(1, std::memory_order_relaxed); 
@@ -668,6 +699,21 @@ void setup() {
     sramPitchHigh=(int16_t*)heap_caps_aligned_alloc(64, SRAM_PITCH_BUF_SIZE*sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); 
     fbDelayBuffer=(int16_t*)heap_caps_aligned_alloc(64, FB_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); freezeBuffer=(int16_t*)heap_caps_aligned_alloc(64, FREEZE_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_SPIRAM); diffuserBuf = (float*)heap_caps_aligned_alloc(64, 1024 * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); i2s_in_block = (int32_t*)heap_caps_aligned_alloc(64, HOP_SIZE * 2 * sizeof(int32_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); i2s_out_block = (int32_t*)heap_caps_aligned_alloc(64, HOP_SIZE * 2 * sizeof(int32_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); inBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); envBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); fzOutBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); masterGainBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); w1Buf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); w2Buf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); w3Buf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); padFilterBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); dryBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); fbOutBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); sMixBuf = (float*)heap_caps_aligned_alloc(64, HOP_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     
+    // Allocate the twin LUT buffers permanently in external PSRAM
+    pitchLutBufferA = (float*)heap_caps_aligned_alloc(64, 16384 * sizeof(float), MALLOC_CAP_SPIRAM);
+    pitchLutBufferB = (float*)heap_caps_aligned_alloc(64, 16384 * sizeof(float), MALLOC_CAP_SPIRAM);
+    activePitchLUT.store(pitchLutBufferA, std::memory_order_release);
+
+    // Hardened Validation Check
+    if (!delayBuffer || !sramPitchLow || !sramPitchHigh || !fbDelayBuffer || 
+        !freezeBuffer || !diffuserBuf || !i2s_in_block || !i2s_out_block || 
+        !inBuf || !envBuf || !fzOutBuf || !masterGainBuf || !w1Buf || 
+        !w2Buf || !w3Buf || !padFilterBuf || !dryBuf || !fbOutBuf || 
+        !sMixBuf || !pitchLutBufferA || !pitchLutBufferB) {
+        Serial.println("CRITICAL: SPIRAM/SRAM Allocation Failed!");
+        while(1) { vTaskDelay(pdMS_TO_TICKS(100)); } 
+    }
+
     memset(i2s_in_block, 0, HOP_SIZE * 2 * sizeof(int32_t)); memset(i2s_out_block, 0, HOP_SIZE * 2 * sizeof(int32_t)); memset(inBuf, 0, HOP_SIZE * sizeof(float)); memset(envBuf, 0, HOP_SIZE * sizeof(float)); memset(fzOutBuf, 0, HOP_SIZE * sizeof(float)); memset(masterGainBuf, 0, HOP_SIZE * sizeof(float)); memset(w1Buf, 0, HOP_SIZE * sizeof(float)); memset(w2Buf, 0, HOP_SIZE * sizeof(float)); memset(w3Buf, 0, HOP_SIZE * sizeof(float)); memset(padFilterBuf, 0, HOP_SIZE * sizeof(float)); memset(dryBuf, 0, HOP_SIZE * sizeof(float)); memset(fbOutBuf, 0, HOP_SIZE * sizeof(float)); memset(sMixBuf, 0, HOP_SIZE * sizeof(float)); 
     memset(delayBuffer, 0, MAX_BUFFER_SIZE*sizeof(int16_t)); 
     memset(sramPitchLow, 0, SRAM_PITCH_BUF_SIZE*sizeof(int16_t)); 
@@ -679,7 +725,12 @@ void setup() {
     DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
     LUTManager::updateDynamicLUT(activeDSP->cp, activeDSP->w, activeDSP->activeMode, effectMemory, activeDSP->fbIdx, currentSampleRate.load(std::memory_order_acquire));
     
-    float* currLut = LUTManager::pitchShiftLUT.load(std::memory_order_acquire); if (currLut) pitchShiftFactor.store(currLut[8192], std::memory_order_release);
+    float* currLut = LUTManager::pitchShiftLUT.load(std::memory_order_acquire); 
+    if (currLut) {
+        memcpy(pitchLutBufferA, currLut, 16384 * sizeof(float));
+        pitchShiftFactor.store(pitchLutBufferA[8192], std::memory_order_release); 
+    }
+    
     padVectorFilter.setLPF(1200.0f, (float)currentSampleRate.load(std::memory_order_acquire));
 
     i2s_std_config_t stdConfig = PowerManager::getI2SConfig(currentSampleRate.load(std::memory_order_acquire));
@@ -798,7 +849,7 @@ void loop() {
             dspNeedsCommit = true;
         } else {
             if (!asyncLutUpdateRequested.load(std::memory_order_acquire)) {
-                float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire);
+                float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB3], std::memory_order_release);
             }
         }
@@ -838,6 +889,9 @@ void loop() {
         settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), &cs, sizeof(AppSettings));
         
         dsp_is_paused.store(false, std::memory_order_release);
+        if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
+        if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
+        
         while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
     }
     

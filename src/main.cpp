@@ -1,4 +1,4 @@
-// v4.1 LilyGO (Denormal Protected, CPU PSRAM Copy, Bitwise Accumulators)
+// v4.3 LilyGO T-Display (Multiband Polyphonic Tracking, Hardened Concurrency, Display/PAR Knobs)
 #include <Arduino.h>
 #include <Control_Surface.h>
 #include "driver/gpio.h"
@@ -70,7 +70,7 @@ std::atomic<bool> dsp_is_paused{false}, dsp_ack_parked{false}, lut_ack_parked{fa
 std::atomic<float> pitchShiftFactor{1.0f};
 std::atomic<uint32_t> currentSampleRate{96000}; 
 
-// Decoupled window sizes (Power-of-Two aligned for DSP SIMD mask compatibility)
+// Power-of-Two aligned for DSP SIMD mask compatibility
 const float LATENCY_WINDOWS[]={512.0f, 1024.0f, 2048.0f, 4096.0f};
 int32_t *i2s_in_block = nullptr, *i2s_out_block = nullptr;
 float *inBuf=nullptr, *envBuf=nullptr, *fzOutBuf=nullptr, *masterGainBuf=nullptr, *w1Buf=nullptr, *w2Buf=nullptr, *w3Buf=nullptr, *padFilterBuf=nullptr, *dryBuf=nullptr, *fbOutBuf=nullptr, *sMixBuf=nullptr;
@@ -120,7 +120,7 @@ uint32_t tap_w1_lo_1=0, tap_w1_lo_2=2048<<16, tap_w1_hi_1=0, tap_w1_hi_2=256<<16
 uint32_t tap_w2_lo_1=0, tap_w2_lo_2=2048<<16, tap_w2_hi_1=0, tap_w2_hi_2=256<<16;
 uint32_t tap_w3_1=0, tap_w3_2=256<<16, tap_w4_1=0, tap_w4_2=256<<16, tap_w5_1=0, tap_w5_2=256<<16;
 
-float currentWindowSize = 1024.0f; int freezeLength = 96000; bool wasFrozen = false;
+float currentWindowSize = 512.0f; int freezeLength = 96000; bool wasFrozen = false;
 volatile bool apfNeedsClear = false; volatile float freezeRamp = 0.0f;
 volatile float chorusLfoPhase=0.0f, feedbackLfoPhase=0.0f, vibratoLfoPhase=0.0f, swellGain=0.0f, feedbackRamp=0.0f; float fbHpfState=0.0f, feedbackFilter=0.0f; 
 
@@ -340,7 +340,6 @@ bool channelMessageCallback(ChannelMessage cm) {
     return false;
 }
 
-// --- BACKGROUND LUT TASK ---
 void IRAM_ATTR LUTUpdateTask(void * pvParameters) {
     for(;;) {
         if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
@@ -407,6 +406,7 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                 }
                 if(__builtin_expect(globalAudioResetRequested.load(std::memory_order_acquire), 0)) {
                     memset(activeDmaReadBuf, 0, HOP_SIZE * sizeof(int16_t)); memset(activeDmaWriteBuf, 0, HOP_SIZE * sizeof(int16_t));
+                    memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t));
                     synthEnv=0.0f; synthFilter=0.0f; synthBandpass=0.0f; padEnv=0.0f; inputEnvelope=0.0f; feedbackFilterVar=0.0f; smoothedVolGain=volumePedalGain; currentPitch=1.0f; freezeWriteIdxVar=0; freezePlayCounterVar=0; freezeStartIdxVar=0; activeFreezeLength=currentSampleRate.load(std::memory_order_acquire); fbDelayWriteIdx=0; writeIndex=0; sramWriteIdx=0; apfNeedsClear=true; input_dc_offset=0.0f; ui_audio_level.store(0.0f, std::memory_order_release); ui_output_level.store(0.0f, std::memory_order_release); freezeRamp=0.0f; feedbackRamp=0.0f; vibratoLfoPhase=0.0f; chorusLfoPhase=0.0f; feedbackLfoPhase=0.0f; dampState=0.0f; wowState=0.0f; diffuserIdx=0; if(diffuserBuf) memset(diffuserBuf, 0, 1024*sizeof(float));
                     cross_lp1 = 0.0f; cross_lp2 = 0.0f;
                     
@@ -416,8 +416,9 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                     tap_w3_1=0; tap_w3_2=halfWinFixed; tap_w4_1=0; tap_w4_2=halfWinFixed; tap_w5_1=0; tap_w5_2=halfWinFixed;
                     globalAudioResetRequested.store(false, std::memory_order_release); smoothed_delay_samples=0.0f; 
                     if(hardwareSyncMuteFrames.load(std::memory_order_acquire) < 10) hardwareSyncMuteFrames.store((currentSampleRate.load(std::memory_order_acquire)/HOP_SIZE)*0.40f, std::memory_order_release);
-                    padVectorFilter.reset();
+                    
                     lastPadCutoff = -1.0f;
+                    padVectorFilter.reset();
                 }
                 
                 int currentMute = hardwareSyncMuteFrames.load(std::memory_order_acquire); bool isMuted = false;
@@ -425,7 +426,8 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                 uint32_t start_cycles=xthal_get_ccount(); float srScale = 48000.0f / (float)currentSampleRate.load(std::memory_order_relaxed);
                 DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
                 for(int j=0; j<10; j++) for(int k=0; k<5; k++) c_fx[j][k] = activeDSP->params[j][k]; 
-                c_lat = activeDSP->latMode; c_act = activeDSP->activeMode; c_w = activeDSP->w; c_fz = activeDSP->fz; c_fb = activeDSP->fb; c_hr = activeDSP->hr; c_cp = activeDSP->cp; c_sy = activeDSP->sy; c_pd = activeDSP->pd; c_ch = activeDSP->ch; c_sw = activeDSP->sw; c_vb = activeDSP->vb; c_vg = activeDSP->vg; dspAckCommit.store(true, std::memory_order_release); 
+                c_lat = activeDSP->latMode; c_act = activeDSP->activeMode; c_w = activeDSP->w; c_fz = activeDSP->fz; c_fb = activeDSP->fb; c_hr = activeDSP->hr; c_cp = activeDSP->cp; c_sy = activeDSP->sy; c_pd = activeDSP->pd; c_ch = activeDSP->ch; c_sw = activeDSP->sw; c_vb = activeDSP->vb; c_vg = activeDSP->vg; 
+                
                 float c_pt = pitchShiftFactor.load(std::memory_order_acquire);
 
                 float targetWindow = LATENCY_WINDOWS[c_lat];
@@ -471,14 +473,10 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                 // Crossover alpha (~250Hz)
                 float cross_alpha = (currentSampleRate.load(std::memory_order_relaxed) == 96000) ? 0.0163f : 0.0326f;
 
-                // CPU Memory Block Pre-Fetch (Replaces DMA)
+                // CPU Memory Block Pre-Fetch
                 int prefetchIdx = (writeIndex - halfWindow + MAX_BUFFER_SIZE) & BUFFER_MASK;
                 if (__builtin_expect(MAX_BUFFER_SIZE - prefetchIdx >= HOP_SIZE, 1)) {
-                    uint32_t* pReadSrc = (uint32_t*)&delayBuffer[prefetchIdx];
-                    uint32_t* pReadDst = (uint32_t*)activeDmaWriteBuf;
-                    for (int k = 0; k < (HOP_SIZE >> 1); k++) {
-                        pReadDst[k] = pReadSrc[k];
-                    }
+                    memcpy(activeDmaWriteBuf, &delayBuffer[prefetchIdx], HOP_SIZE * sizeof(int16_t));
                 } else {
                     for (int i = 0; i < HOP_SIZE; i++) {
                         activeDmaWriteBuf[i] = delayBuffer[(prefetchIdx + i) & BUFFER_MASK];
@@ -507,7 +505,7 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                     
                     float delayIn=(localFrzRamp>0.0f)?__builtin_fmaf(procSample, (1.0f-localFrzRamp), fzOutBuf[i]):procSample; 
                     
-                    // --- MULTIBAND LINKWITZ-RILEY CROSSOVER (Denormal Protected) ---
+                    // --- MULTIBAND LINKWITZ-RILEY CROSSOVER ---
                     cross_lp1 = DSPEngine::AntiDenormal(cross_lp1 + cross_alpha * (delayIn - cross_lp1));
                     cross_lp2 = DSPEngine::AntiDenormal(cross_lp2 + cross_alpha * (cross_lp1 - cross_lp2));
                     float lowBand = cross_lp2;
@@ -555,7 +553,7 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                     int32_t step4=(int32_t)((1.0f-spd4)*65536.0f); tap_w4_1+=step4; tap_w4_2+=step4; 
                     int32_t step5=(int32_t)((1.0f-spd5)*65536.0f); tap_w5_1+=step5; tap_w5_2+=step5;
                     
-                    dryBuf[i] = (float)activeDmaReadBuf[i] * 3.0517578125e-5f; fbOutBuf[i]=fbOutNode; 
+                    dryBuf[i] = (float)activeDmaReadBuf[i] * 3.0517578125e-5f; fbOutNode = DSPEngine::AntiDenormal(fbOutNode); fbOutBuf[i]=fbOutNode; 
                     writeIndex=(writeIndex+1)&BUFFER_MASK; sramWriteIdx=(sramWriteIdx+1)&SRAM_PITCH_BUF_MASK;
                 }
                 vibratoLfoPhase=localVibPhase; chorusLfoPhase=localChoPhase; feedbackLfoPhase=localFbPhase; fbHpfState=localFbHpf;
@@ -564,14 +562,10 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                 activeDmaReadBuf = activeDmaWriteBuf; 
                 activeDmaWriteBuf = tempDmaPtr;
 
-                // CPU Memory Block Write (Replaces DMA)
+                // CPU Memory Block Write
                 int targetPsramIdx = (writeIndex - framesRead + MAX_BUFFER_SIZE) & BUFFER_MASK;
                 if (__builtin_expect(MAX_BUFFER_SIZE - targetPsramIdx >= HOP_SIZE, 1)) {
-                    uint32_t* pDst = (uint32_t*)&delayBuffer[targetPsramIdx];
-                    uint32_t* pSrc = (uint32_t*)sramDryBlock;
-                    for (int k = 0; k < (HOP_SIZE >> 1); k++) {
-                        pDst[k] = pSrc[k];
-                    }
+                    memcpy(&delayBuffer[targetPsramIdx], sramDryBlock, HOP_SIZE * sizeof(int16_t));
                 } else {
                     for (int i = 0; i < HOP_SIZE; i++) {
                         delayBuffer[(targetPsramIdx + i) & BUFFER_MASK] = sramDryBlock[i];
@@ -914,7 +908,7 @@ void loop() {
         
         #ifdef ENABLE_ADVANCED_TELEMETRY
             dData.underflows = audio_underflow_count.load(std::memory_order_relaxed);
-            dData.dmaCount = 0; // Hardware DMA removed for CPU Copy
+            dData.dmaCount = 0; // Hardware DMA removed for CPU Copy parity
             dData.stackWatermark = lut_stack_watermark.load(std::memory_order_relaxed);
         #else
             dData.underflows = 0; dData.dmaCount = 0; dData.stackWatermark = 0;

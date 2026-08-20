@@ -4,6 +4,13 @@
 #define ENABLE_ADVANCED_TELEMETRY 
 
 #include <Arduino.h>
+
+#if defined(TARGET_BANANA)
+    #define ENABLE_STRESS_TESTER true
+#else
+    #define ENABLE_STRESS_TESTER false 
+#endif
+
 #include <atomic>
 #include "freertos/FreeRTOS.h"
 #include "driver/i2s_std.h"
@@ -15,6 +22,8 @@
 #include "PedalManager.h"
 #include "SettingsManager.h"
 #include "DSPEngine.h"
+
+#include "MonoPolyTracker.h"
 
 #define HOP_SIZE 64
 #define MAX_BUFFER_SIZE 65536
@@ -32,6 +41,9 @@ struct AppSettings {
     float fxMem[10];
     float params[10][5];
 };
+
+extern std::atomic<bool> isMonoPolyActive;
+extern std::atomic<int> monoPolyAlgo; // 0 = TD-PSOLA, 1 = YIN Synth, etc.
 
 extern VectorBiquadS3 padVectorFilter;
 extern Preferences preferences;

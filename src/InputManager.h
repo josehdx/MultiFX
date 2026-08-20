@@ -26,7 +26,8 @@ public:
 
                         if (isKnobEditMode) {
                             showSavingScreen = true;
-                            BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11, ui_audio_level.load(std::memory_order_acquire), ui_output_level.load(std::memory_order_acquire), core0_dsp_load.load(std::memory_order_relaxed), core1_ctrl_load.load(std::memory_order_relaxed), currentSampleRate.load(std::memory_order_acquire), max_loop_latency_ms.exchange(0, std::memory_order_relaxed), audio_underflow_count.load(std::memory_order_relaxed), watermarkVal, currentBtState, latestBat);
+                            // BRIDGED FLAG ADDED HERE
+                            BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11, ui_audio_level.load(std::memory_order_acquire), ui_output_level.load(std::memory_order_acquire), core0_dsp_load.load(std::memory_order_relaxed), core1_ctrl_load.load(std::memory_order_relaxed), currentSampleRate.load(std::memory_order_acquire), max_loop_latency_ms.exchange(0, std::memory_order_relaxed), audio_underflow_count.load(std::memory_order_relaxed), watermarkVal, currentBtState, latestBat, isMonoPolyActive.load(std::memory_order_acquire));
                             vTaskDelay(pdMS_TO_TICKS(150)); 
                             
                             dsp_is_paused.store(true, std::memory_order_release);
@@ -44,7 +45,8 @@ public:
                             settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), &cs, sizeof(AppSettings));
                         } else {
                             showKnobModeScreen = true;
-                            BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11, ui_audio_level.load(std::memory_order_acquire), ui_output_level.load(std::memory_order_acquire), core0_dsp_load.load(std::memory_order_relaxed), core1_ctrl_load.load(std::memory_order_relaxed), currentSampleRate.load(std::memory_order_acquire), max_loop_latency_ms.exchange(0, std::memory_order_relaxed), audio_underflow_count.load(std::memory_order_relaxed), watermarkVal, currentBtState, latestBat);
+                            // BRIDGED FLAG ADDED HERE
+                            BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11, ui_audio_level.load(std::memory_order_acquire), ui_output_level.load(std::memory_order_acquire), core0_dsp_load.load(std::memory_order_relaxed), core1_ctrl_load.load(std::memory_order_relaxed), currentSampleRate.load(std::memory_order_acquire), max_loop_latency_ms.exchange(0, std::memory_order_relaxed), audio_underflow_count.load(std::memory_order_relaxed), watermarkVal, currentBtState, latestBat, isMonoPolyActive.load(std::memory_order_acquire));
                             vTaskDelay(pdMS_TO_TICKS(150)); 
                         }
                         

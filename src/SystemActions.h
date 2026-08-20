@@ -16,7 +16,7 @@ inline void switchEffectMode(int newMode) {
         if (cmode == 1) isFrozen = true; if (cmode == 2) isFeedbackActive = true; if (cmode == 3) isHarmonizerMode = true;
         if (cmode == 4) isCapoMode = true; if (cmode == 5) isSynthMode = true; if (cmode == 6) isPadMode = true;
         if (cmode == 7) isChorusMode = true; if (cmode == 8) isSwellMode = true; if (cmode == 9) isVibratoMode = true;
-    } 
+    }
     Serial.printf("[SYSTEM] Switched Effect Mode to: %d\n", cmode);
     dspNeedsCommit = true; lutNeedsUpdate = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
 }
@@ -34,10 +34,10 @@ inline bool commitDSPState() {
     DSPCoreState* backBuffer = &dspStates[dspWriteIndex];
     {
         CriticalSectionGuard lock(MidiRouter::paramMux);
-        for(int i=0; i<10; i++) { 
-             backBuffer->fxMem[i] = effectMemory[i]; 
-             for(int j=0; j<5; j++) backBuffer->params[i][j] = fxParams[i][j]; 
-         }
+        for(int i=0; i<10; i++) {  
+            backBuffer->fxMem[i] = effectMemory[i];  
+            for(int j=0; j<5; j++) backBuffer->params[i][j] = fxParams[i][j];  
+        }
     }
     backBuffer->activeMode = activeEffectMode.load(std::memory_order_relaxed); backBuffer->latMode = latencyMode.load(std::memory_order_relaxed); backBuffer->fbIdx = feedbackIntervalIdx.load(std::memory_order_relaxed);
     backBuffer->w = isWhammyActive; backBuffer->fz = isFrozen; backBuffer->fb = isFeedbackActive; backBuffer->hr = isHarmonizerMode; backBuffer->cp = isCapoMode; backBuffer->sy = isSynthMode; backBuffer->pd = isPadMode; backBuffer->ch = isChorusMode; backBuffer->sw = isSwellMode; backBuffer->vb = isVibratoMode; backBuffer->vg = volumePedalGain;
@@ -75,13 +75,24 @@ inline void cycleLatencyMode() {
 inline void toggleSampleRate() {
     dsp_is_paused.store(true, std::memory_order_release);
     while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-    I2SManager::disableAndDestroyChannels();
+    
     uint32_t newSr = (currentSampleRate.load(std::memory_order_acquire) == 96000) ? 48000 : 96000;
-    currentSampleRate.store(newSr, std::memory_order_release); settingsNeedSaving = false; lutNeedsUpdate = true; 
-    Serial.printf("[SYSTEM] Toggling Sample Rate to %lu Hz...\n", newSr);
+    currentSampleRate.store(newSr, std::memory_order_release); 
+    settingsNeedSaving = false; 
+    lutNeedsUpdate = true; 
+    
+    Serial.printf("[SYSTEM] Reconfiguring I2S Clock to %lu Hz...\n", newSr);
     padVectorFilter.setLPF(1200.0f, (float)newSr);
-    i2s_std_config_t stdConfig = BoardHAL::getI2SConfig(newSr);
-    I2SManager::initChannels(stdConfig, HOP_SIZE);
+    
+    i2s_channel_disable((i2s_chan_handle_t)I2SManager::tx_chan);
+    i2s_channel_disable((i2s_chan_handle_t)I2SManager::rx_chan);
+
+    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(newSr);
+    clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
+    
+    i2s_channel_reconfig_std_clock((i2s_chan_handle_t)I2SManager::tx_chan, &clk_cfg);
+    i2s_channel_reconfig_std_clock((i2s_chan_handle_t)I2SManager::rx_chan, &clk_cfg);
+
     freezeLength = newSr;
     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
     memset(sramPitchLow, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t)); 
@@ -89,13 +100,22 @@ inline void toggleSampleRate() {
     memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); 
     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t)); 
     if(diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float)); 
+    
     vTaskDelay(pdMS_TO_TICKS(30));
-    I2SManager::enableChannels();
-    globalAudioResetRequested.store(true, std::memory_order_release); hardwareSyncMuteFrames.store((newSr/HOP_SIZE)*0.40f, std::memory_order_release);
+    
+    i2s_channel_enable((i2s_chan_handle_t)I2SManager::tx_chan);
+    i2s_channel_enable((i2s_chan_handle_t)I2SManager::rx_chan);
+
+    globalAudioResetRequested.store(true, std::memory_order_release); 
+    hardwareSyncMuteFrames.store((newSr/HOP_SIZE)*0.40f, std::memory_order_release);
     std::atomic_thread_fence(std::memory_order_seq_cst); 
     dsp_is_paused.store(false, std::memory_order_release);
+    
     if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
     if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
+    
     while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-    pedals.triggerSystemRecovery(); settingsNeedSaving=true; lastParameterChangeTime = millis();
+    pedals.triggerSystemRecovery(); 
+    settingsNeedSaving = true; 
+    lastParameterChangeTime = millis();
 }

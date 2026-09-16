@@ -139,8 +139,8 @@ public:
             while(1) vTaskDelay(100); 
         }
         
-        // --- STACK IN SPIRAM, TCB IN INTERNAL SRAM ---
-        lutTaskStack = (StackType_t*)heap_caps_aligned_alloc(16, 3072, MALLOC_CAP_SPIRAM); 
+        // --- STACK AND TCB IN INTERNAL SRAM ---
+        lutTaskStack = (StackType_t*)heap_caps_aligned_alloc(16, 3072, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); 
         lutTaskTCB   = (StaticTask_t*)heap_caps_aligned_alloc(16, sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         // ---------------------------------------------
         

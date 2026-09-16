@@ -27,7 +27,7 @@ public:
 
         tData.activeMode = activeDSP->activeMode;
         tData.isMonoPolyActive = isMonoPolyActive.load(std::memory_order_acquire);
-        tData.monoPolyAlgo = constrain((int)(fxParams[activeDSP->activeMode][0] * 4.99f), 0, 4);
+        tData.monoPolyAlgo = constrain((int)(activeDSP->params[activeDSP->activeMode % 10][0] * 4.99f), 0, 4);
 
         tData.fxStates[0] = activeDSP->w;  tData.fxStates[1] = activeDSP->fz; tData.fxStates[2] = activeDSP->fb; 
         tData.fxStates[3] = activeDSP->hr; tData.fxStates[4] = activeDSP->cp; tData.fxStates[5] = activeDSP->sy; 
@@ -49,7 +49,7 @@ public:
         tData.peakLoopLatency = max_loop_latency_ms.exchange(0, std::memory_order_relaxed);
 
         static unsigned long lastTelemetryPrint = 0;
-        if (millis() - lastTelemetryPrint >= 2000) {
+        if (millis() - lastTelemetryPrint >= 10000) {
             lastTelemetryPrint = millis(); 
             serialMonitor.printMetrics(tData); 
         }

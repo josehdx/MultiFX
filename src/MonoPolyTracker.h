@@ -20,7 +20,7 @@ private:
     
     float analysisBuffer[2048] __attribute__((aligned(16))) = {0.0f};     
     int writeIdx = 0;          
-    float detectedT0 = 0.0f;     
+    float detectedT0 = 200.0f; // Default safe period (~240 Hz)
     int sweepCounter = 0;     
     bool lastVoicedState = false;     
     
@@ -173,6 +173,7 @@ private:
 
     // --- ALGO 0: TD-PSOLA ---     
     inline float executeTDPSOLA(float sample, float targetPitch, float T0, float p_frm, float p_tol) __attribute__((always_inline)) {         
+        if (T0 < 2.0f || targetPitch < 0.01f) return 0.0f;
         float T1 = T0 / targetPitch;          
         synthesisPhase += 1.0f;                  
         
@@ -248,7 +249,7 @@ private:
     inline float executeVarDelay(float sample, float targetPitch, float T0, float p_win, float p_zc, float p_trn, float sr) __attribute__((always_inline)) {         
         varDelayBuffer[varWriteIdx] = sample;                  
         float absSample = fabsf(sample);         
-        vdEnv = __builtin_fmaf(absSample - vdEnv, (absSample > vdEnv) ? 0.2f : 0.001f, vdEnv);         
+        vdEnv = __builtin_fmaxf(0.0f, __builtin_fmaf(absSample - vdEnv, (absSample > vdEnv) ? 0.2f : 0.001f, vdEnv));         
         float transientSpike = absSample / (vdEnv + 0.001f);                   
         if (p_trn > 0.05f && transientSpike > (10.0f - p_trn * 8.0f)) vdTransientMix = 1.0f;          
         vdTransientMix *= 0.995f;          
@@ -277,7 +278,7 @@ private:
     // --- ALGO 4: MONO PHASE VOCODER ---     
     inline float executePhaseVocoder(float sample, float targetPitch, float p_blr, float p_phs, float p_trn, float sr) __attribute__((always_inline)) {         
         float absSample = fabsf(sample);         
-        pvEnv = __builtin_fmaf(absSample - pvEnv, (absSample > pvEnv) ? 0.2f : 0.001f, pvEnv);         
+        pvEnv = __builtin_fmaxf(0.0f, __builtin_fmaf(absSample - pvEnv, (absSample > pvEnv) ? 0.2f : 0.001f, pvEnv));         
         float transientSpike = absSample / (pvEnv + 0.001f);         
         if (p_trn > 0.05f && transientSpike > (10.0f - p_trn * 8.0f)) pvTransientMix = 1.0f;         
         pvTransientMix *= 0.995f;         
@@ -317,7 +318,7 @@ private:
                 deltaPhase = deltaPhase - 6.2831853f * roundf(deltaPhase * 0.1591549f);                 
                 float trueFreq = ((float)k * 6.2831853f / 512.0f) + (deltaPhase / (float)hopSize);                 
                 int newBin = (int)((float)k * currentShift);                                  
-                if (newBin <= 256) {                     
+                if (newBin >= 0 && newBin <= 256) {                     
                     float blur = 1.0f - (p_blr * 0.8f);                      
                     pvMagWorkspace[newBin] += mag * blur;                      
                     float synthPhase = pvSumPhase[k] + trueFreq * (float)hopSize * currentShift;                     

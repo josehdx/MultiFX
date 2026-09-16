@@ -31,13 +31,11 @@ inline void triggerPanicReset() {
 
 inline bool commitDSPState() {
     if (!dspAckCommit.load(std::memory_order_acquire)) return false; 
+    CriticalSectionGuard lock(MidiRouter::paramMux);
     DSPCoreState* backBuffer = &dspStates[dspWriteIndex];
-    {
-        CriticalSectionGuard lock(MidiRouter::paramMux);
-        for(int i=0; i<10; i++) {  
-            backBuffer->fxMem[i] = effectMemory[i];  
-            for(int j=0; j<5; j++) backBuffer->params[i][j] = fxParams[i][j];  
-        }
+    for(int i=0; i<10; i++) {  
+        backBuffer->fxMem[i] = effectMemory[i];  
+        for(int j=0; j<5; j++) backBuffer->params[i][j] = fxParams[i][j];  
     }
     backBuffer->activeMode = activeEffectMode.load(std::memory_order_relaxed); backBuffer->latMode = latencyMode.load(std::memory_order_relaxed); backBuffer->fbIdx = feedbackIntervalIdx.load(std::memory_order_relaxed);
     backBuffer->w = isWhammyActive; backBuffer->fz = isFrozen; backBuffer->fb = isFeedbackActive; backBuffer->hr = isHarmonizerMode; backBuffer->cp = isCapoMode; backBuffer->sy = isSynthMode; backBuffer->pd = isPadMode; backBuffer->ch = isChorusMode; backBuffer->sw = isSwellMode; backBuffer->vb = isVibratoMode; backBuffer->vg = volumePedalGain;

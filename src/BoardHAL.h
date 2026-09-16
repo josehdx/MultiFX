@@ -46,6 +46,7 @@ public:
     // Fully updated signature to match global volatile int and std::atomic types
     static void fetchADC(adc_continuous_handle_t handle, volatile bool& isPaused, volatile int& pb1, volatile int& pb2, volatile int& pb3, volatile int& par1, std::atomic<int>& bat) {
         if (isPaused) return;
+        if (adcLock.test_and_set(std::memory_order_acquire)) return;
         
         uint32_t ret_num = 0;
         uint8_t result[256] = {0};
@@ -66,6 +67,7 @@ public:
                 }
             }
         }
+        adcLock.clear(std::memory_order_release);
     }
 
     static void updateExtraControls(int activeMode, volatile float* effectMemory, volatile float fxParams[10][5], volatile bool& lutNeedsUpdate, volatile bool& dspNeedsCommit, std::atomic<int>& feedbackIntervalIdx, bool isKnobEditMode, uint16_t latestPar1) {

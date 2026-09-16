@@ -35,6 +35,7 @@ public:
 
     static void fetchADCDMA(adc_continuous_handle_t handle, volatile bool& isPaused, volatile int& pb1, volatile int& pb2, volatile int& pb3, volatile int& par1, std::atomic<int>& bat) {
         if(isPaused) return; 
+        if (adcLock.test_and_set(std::memory_order_acquire)) return;
         uint8_t result[128] __attribute__((aligned(4))); 
         uint32_t ret_num = 0; 
         esp_err_t err; 
@@ -62,6 +63,7 @@ public:
                 break; 
             }
         }
+        adcLock.clear(std::memory_order_release);
     }
 };
 

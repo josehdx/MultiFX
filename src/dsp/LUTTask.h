@@ -12,6 +12,8 @@ static void IRAM_ATTR LUTUpdateTask(void * pvParameters) {
 
         if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
             lut_ack_parked.store(true, std::memory_order_release);
+            // --- ARCHITECTURAL FIX 2: Clear lingering unpark signals to prevent immediate wakeups ---
+            ulTaskNotifyValueClear(NULL, UINT32_MAX);
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             lut_ack_parked.store(false, std::memory_order_release);
         }
@@ -23,16 +25,19 @@ static void IRAM_ATTR LUTUpdateTask(void * pvParameters) {
                 CriticalSectionGuard lock(MidiRouter::paramMux);
                 for(int i=0; i<10; i++) safeEffectMemory[i] = effectMemory[i];
             }
+            
             float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
             float* targetLUT = (currentLUT == pitchLutBufferA) ? pitchLutBufferB : pitchLutBufferA;
+            
             LUTManager::updateDynamicLUT(activeDSP->cp, activeDSP->w, activeDSP->activeMode, safeEffectMemory, activeDSP->fbIdx, currentSampleRate.load(std::memory_order_acquire));
+            
             float* sourceLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire);
             if(sourceLUT && targetLUT) { memcpy(targetLUT, sourceLUT, 16384 * sizeof(float)); }
+            
             std::atomic_thread_fence(std::memory_order_release);
             activePitchLUT.store(targetLUT, std::memory_order_release);
             pitchShiftFactor.store(targetLUT[constrain(lastActivePedal, 0, 16383)], std::memory_order_release);
         }
-
         vTaskDelay(pdMS_TO_TICKS(15));
     }
 }

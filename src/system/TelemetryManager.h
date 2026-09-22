@@ -1,5 +1,4 @@
 #pragma once
-
 #include <Arduino.h>
 #include "SystemState.h"
 #include "SerialMonitor.h"
@@ -20,7 +19,7 @@ public:
         tData.batVoltage = 4.00f; tData.batPercent = 100; tData.isCharging = false;
         
     #if !defined(FW_MODE_KNOBS_ONLY)
-        tData.bleConnected = btmidi != nullptr ? btmidi->isConnected() : false; 
+        tData.bleConnected = btmidi != nullptr ? btmidi->isConnected() : false;
     #else
         tData.bleConnected = false;
     #endif
@@ -41,7 +40,7 @@ public:
     #ifdef ENABLE_ADVANCED_TELEMETRY
         tData.audioUnderflows = audio_underflow_count.load(std::memory_order_relaxed);
         tData.dmaTransfers = 0;
-        tData.dspStackWatermark = dsp_stack_watermark.load(std::memory_order_relaxed); 
+        tData.dspStackWatermark = dsp_stack_watermark.load(std::memory_order_relaxed);
     #else
         tData.audioUnderflows = 0; tData.dmaTransfers = 0; tData.dspStackWatermark = 0;
     #endif
@@ -49,7 +48,9 @@ public:
         tData.peakLoopLatency = max_loop_latency_ms.exchange(0, std::memory_order_relaxed);
 
         static unsigned long lastTelemetryPrint = 0;
-        if (millis() - lastTelemetryPrint >= 10000) {
+        
+        // Changed to 500ms for much faster debug serial printing
+        if (millis() - lastTelemetryPrint >= 500) {
             lastTelemetryPrint = millis(); 
             serialMonitor.printMetrics(tData); 
         }

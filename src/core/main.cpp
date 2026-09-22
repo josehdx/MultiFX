@@ -2,7 +2,7 @@
 #include <Preferences.h>
 #include <Update.h>
 #include "esp_log.h"
-#define FW_VERSION "v5.00" // Updated to match your latest OTA log
+#define FW_VERSION "v5.00"
 
 // Core System Includes
 #include "SystemState.h"
@@ -26,7 +26,7 @@ void setup() {
     Serial.begin(115200); 
     Serial0.begin(115200);
     
-    BoardHAL::init();                  
+    BoardHAL::init();
     
     Serial.println("\n--- HARDWARE SYSTEM INITIALIZED ---");
     Serial.print("Firmware Version: ");
@@ -38,11 +38,11 @@ void setup() {
     // 1. Run OTA check BEFORE USB MSC mounts
     FirmwareManager::checkAndApplyUpdate();
 
-    // 2. Initialize USB Storage
-    USBMscManager::init();
-
-    // 3. Complete system boot sequence
+    // 2. Complete system boot sequence
     SystemBootloader::run();
+
+    // 3. Initialize USB Storage AFTER tasks are spawned to prevent boot deadlocks
+    USBMscManager::init();
 }
 
 void loop() {
@@ -61,6 +61,7 @@ void loop() {
 #if !defined(FW_MODE_KNOBS_ONLY)
     if (btmidi) btConnected = btmidi->isConnected();
 #endif
+
     InputManager::processInputs(btConnected);
     InputManager::processPedals();
 
@@ -95,9 +96,15 @@ void loop() {
 
     // 7. Auto-save settings to NVS
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) {
+        
+        dsp_is_paused.store(true, std::memory_order_release);
+        while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+
         AppSettings currentSettings;
-        for(int i = 0; i < 10; i++) { 
-             currentSettings.fxMem[i] = effectMemory[i];
+        memset(&currentSettings, 0, sizeof(AppSettings)); 
+
+        for(int i = 0; i < 10; i++) {
+              currentSettings.fxMem[i] = effectMemory[i];
              for(int p = 0; p < 5; p++) {
                 currentSettings.params[i][p] = fxParams[i][p];
              }
@@ -105,6 +112,10 @@ void loop() {
         preferences.putBytes("dspData", &currentSettings, sizeof(AppSettings));
         settingsNeedSaving = false;
         Serial0.println("[SYSTEM] Settings auto-saved to NVS.");
+
+        dsp_is_paused.store(false, std::memory_order_release);
+        if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
+        if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
     }
 
     // 8. Panic reset handling

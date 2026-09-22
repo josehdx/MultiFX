@@ -1,5 +1,4 @@
 #pragma once
-
 #include "SystemState.h"
 #include "LUTManager.h"
 #include "AudioPipeline.h"
@@ -8,8 +7,8 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
     DSPCoreState* lastAckedDSP = nullptr;
 
     while (LUTManager::hannLUT == nullptr || LUTManager::lfoLUT == nullptr || LUTManager::synthLUT == nullptr || LUTManager::apf1Buffer == nullptr || LUTManager::apf2Buffer == nullptr || LUTManager::pitchSincLUT == nullptr) { 
-        vTaskDelay(pdMS_TO_TICKS(10)); 
-    }
+         vTaskDelay(pdMS_TO_TICKS(10)); 
+     }
 
     for(;;) {
 #ifdef ENABLE_ADVANCED_TELEMETRY
@@ -19,6 +18,8 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
 
         if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
             dsp_ack_parked.store(true, std::memory_order_release);
+            // --- ARCHITECTURAL FIX 2: Clear lingering unpark signals to prevent immediate wakeups ---
+            ulTaskNotifyValueClear(NULL, UINT32_MAX);
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             dsp_ack_parked.store(false, std::memory_order_release);
         }
@@ -34,7 +35,6 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
                 if(__builtin_expect(panicResetRequested.load(std::memory_order_acquire), 0)) {
                     AudioPipeline::handlePanicReset();
                 }
-
                 if(__builtin_expect(globalAudioResetRequested.load(std::memory_order_acquire), 0)) {
                     AudioPipeline::handleGlobalReset();
                 }
@@ -56,6 +56,7 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
 
                 // --- 3. HARDWARE MUTE & I2S WRITE ---
                 if(__builtin_expect(isMuted, 0)) memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
+                
                 size_t bytesWrittenCount;
                 i2s_channel_write((i2s_chan_handle_t)I2SManager::tx_chan, i2s_out_block, framesRead*8, &bytesWrittenCount, pdMS_TO_TICKS(20));
                 
@@ -63,7 +64,6 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
                     lastAckedDSP = activeDSP;
                     dspAckCommit.store(true, std::memory_order_release);
                 }
-
             } else {
 #ifdef ENABLE_ADVANCED_TELEMETRY
                 audio_underflow_count.fetch_add(1, std::memory_order_relaxed);

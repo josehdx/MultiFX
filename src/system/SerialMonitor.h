@@ -1,4 +1,3 @@
-// SerialMonitor.h
 #ifndef SERIAL_MONITOR_H
 #define SERIAL_MONITOR_H
 
@@ -28,7 +27,7 @@ struct TelemetryData {
 class SerialMonitor {
 private:
     unsigned long lastPrintTime = 0;
-    const unsigned long PRINT_INTERVAL_MS = 1000; // 1-second interval for stress test logging
+    const unsigned long PRINT_INTERVAL_MS = 500; // 0.5-second interval
     const char* EFFECT_NAMES[10] = {"WHAMMY", "FREEZE", "FEEDBACK", "HARMONY", "CAPO", "SYNTH", "PAD", "CHORUS", "SWELL", "VIBRATO"};
     const char* MONO_ALGOS[5] = {"TD-PSOLA", "YIN SYNTH", "ECKF", "VAR DELAY", "VOCODER"};
 
@@ -36,9 +35,10 @@ public:
     void printMetrics(const TelemetryData& data) {
         if (millis() - lastPrintTime >= PRINT_INTERVAL_MS) {
             lastPrintTime = millis();
-                        
+            
             uint32_t freeSRAM = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
             uint32_t freePSRAM = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024;
+
             char activeFxStr[128] = "";
             int count = 0;
             for (int i = 0; i < 10; i++) {
@@ -58,6 +58,7 @@ public:
             Serial0.printf("External PSRAM   : %luK Free\n", freePSRAM);
             Serial0.printf("Sample Rate      : %lu Hz\n", data.sampleRate);
             Serial0.printf("Latency Mode     : %d\n", data.latencyMode);
+            
             Serial0.printf("Battery State    : %.2fV (%d%%) - Charging: %s\n",
                   data.batVoltage, data.batPercent, data.isCharging ? "YES" : "NO");
             Serial0.printf("BLE MIDI Conn    : %s\n", data.bleConnected ? "CONNECTED" : "WAITING");
@@ -70,12 +71,13 @@ public:
                 Serial0.printf("Active Mode      : %s (%d)\n",
                       EFFECT_NAMES[data.activeMode % 10], data.activeMode);
             }
-
+            
             Serial0.printf("Active Effects   : %s\n", activeFxStr);
             Serial0.printf("Pedal Vals       : PB1:%d | PB2:%d | PB3:%d | CC11:%d\n",
                   data.pb1, data.pb2, data.pb3, data.cc11);
             Serial0.printf("Audio Meters     : IN: %.3f | OUT: %.3f\n",
                   data.inMeter, data.outMeter);
+
             Serial0.println("--- SYSTEM STARVATION & DIAGNOSTICS ---");
             Serial0.printf("Audio Underflows : %lu\n", data.audioUnderflows);
             Serial0.printf("DSP Min Stack RAM: %lu Bytes\n", data.dspStackWatermark);
@@ -84,5 +86,4 @@ public:
         }
     }
 };
-
 #endif

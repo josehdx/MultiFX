@@ -2,6 +2,7 @@
 #include <Preferences.h>
 #include <Update.h>
 #include "esp_log.h"
+
 #define FW_VERSION "v5.00"
 
 // Core System Includes
@@ -25,12 +26,17 @@ void setup() {
     
     Serial.begin(115200); 
     Serial0.begin(115200);
-    
+
     BoardHAL::init();
+    
+    #if defined(TARGET_LILYGO)
+    displayManager.begin();
+    #endif
     
     Serial.println("\n--- HARDWARE SYSTEM INITIALIZED ---");
     Serial.print("Firmware Version: ");
     Serial.println(FW_VERSION);
+    
     Serial0.println("\n--- HARDWARE UART0 INITIALIZED ---");
     Serial0.print("Firmware Version: ");
     Serial0.println(FW_VERSION);
@@ -61,7 +67,6 @@ void loop() {
 #if !defined(FW_MODE_KNOBS_ONLY)
     if (btmidi) btConnected = btmidi->isConnected();
 #endif
-
     InputManager::processInputs(btConnected);
     InputManager::processPedals();
 
@@ -89,30 +94,31 @@ void loop() {
                             audio_underflow_count.load(std::memory_order_relaxed),
                             watermarkVal, btConnected, latestBat,
                             isMonoPolyActive.load(std::memory_order_acquire));
-
+                            
         // 6. Output periodic serial telemetry
         TelemetryManager::report(activeDSP);
     }
 
     // 7. Auto-save settings to NVS
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) {
-        
+                 
         dsp_is_paused.store(true, std::memory_order_release);
         while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
-
+        
         AppSettings currentSettings;
-        memset(&currentSettings, 0, sizeof(AppSettings)); 
-
+        memset(&currentSettings, 0, sizeof(AppSettings));
+        
         for(int i = 0; i < 10; i++) {
-              currentSettings.fxMem[i] = effectMemory[i];
+             currentSettings.fxMem[i] = effectMemory[i];
              for(int p = 0; p < 5; p++) {
                 currentSettings.params[i][p] = fxParams[i][p];
              }
         }
+        
         preferences.putBytes("dspData", &currentSettings, sizeof(AppSettings));
         settingsNeedSaving = false;
         Serial0.println("[SYSTEM] Settings auto-saved to NVS.");
-
+        
         dsp_is_paused.store(false, std::memory_order_release);
         if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
         if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
@@ -123,6 +129,6 @@ void loop() {
         Serial0.println("[SYSTEM] Executing Panic Reset...");
         panicResetRequested.store(false, std::memory_order_release);
     }
-
+    
     vTaskDelay(pdMS_TO_TICKS(5));
 }

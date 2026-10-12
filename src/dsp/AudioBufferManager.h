@@ -5,14 +5,15 @@ class AudioBufferManager {
 public:
     static void allocate() {
         delayBuffer=(int16_t*)heap_caps_aligned_alloc(64, MAX_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_SPIRAM); 
-        sramPitchLow=(int16_t*)heap_caps_aligned_alloc(64, SRAM_PITCH_BUF_SIZE*sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); 
-        sramPitchHigh=(int16_t*)heap_caps_aligned_alloc(64, SRAM_PITCH_BUF_SIZE*sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); 
-        fbDelayBuffer=(int16_t*)heap_caps_aligned_alloc(64, FB_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); 
-        freezeBuffer=(int16_t*)heap_caps_aligned_alloc(64, FREEZE_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_SPIRAM); 
         
-        // --- MOVED TO PSRAM ---
+        // --- MOVED BACK TO PSRAM TO PREVENT THREAD STARVATION ---
+        sramPitchLow=(int16_t*)heap_caps_aligned_alloc(64, SRAM_PITCH_BUF_SIZE*sizeof(int16_t), MALLOC_CAP_SPIRAM); 
+        sramPitchHigh=(int16_t*)heap_caps_aligned_alloc(64, SRAM_PITCH_BUF_SIZE*sizeof(int16_t), MALLOC_CAP_SPIRAM); 
+        fbDelayBuffer=(int16_t*)heap_caps_aligned_alloc(64, FB_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_SPIRAM); 
+        // --------------------------------------------------------
+
+        freezeBuffer=(int16_t*)heap_caps_aligned_alloc(64, FREEZE_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_SPIRAM);         
         diffuserBuf = (float*)heap_caps_aligned_alloc(64, 1024 * sizeof(float), MALLOC_CAP_SPIRAM); 
-        // ----------------------
         
         i2s_in_block = (int32_t*)heap_caps_aligned_alloc(64, HOP_SIZE * 2 * sizeof(int32_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); 
         i2s_out_block = (int32_t*)heap_caps_aligned_alloc(64, HOP_SIZE * 2 * sizeof(int32_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); 
@@ -36,11 +37,11 @@ public:
             !freezeBuffer || !diffuserBuf || !i2s_in_block || !i2s_out_block || 
             !inBuf || !envBuf || !fzOutBuf || !masterGainBuf || !w1Buf || 
             !w2Buf || !w3Buf || !padFilterBuf || !dryBuf || !fbOutBuf || 
-            !sMixBuf || !pitchLutBufferA || !pitchLutBufferB) { 
+            !sMixBuf || !pitchLutBufferA || !pitchLutBufferB) {
             
             Serial.println("CRITICAL: SPIRAM/SRAM Allocation Failed!");
-            while(1) { vTaskDelay(pdMS_TO_TICKS(100)); } 
-        } 
+            while(1) { vTaskDelay(pdMS_TO_TICKS(100)); }
+        }
         
         memset(i2s_in_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
         memset(i2s_out_block, 0, HOP_SIZE * 2 * sizeof(int32_t));

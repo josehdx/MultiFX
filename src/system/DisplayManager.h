@@ -77,7 +77,7 @@ private:
         if (label) {
             s.setTextDatum(TC_DATUM);
             s.setTextColor(TFT_WHITE, TFT_BLACK);
-            s.drawString(label, cx, cy - r - 10, 1);
+            s.drawString(label, cx, cy - r - 9, 1);
         }
     }
 
@@ -147,8 +147,9 @@ public:
         spr.setColorDepth(16);
         bgSpr.setColorDepth(16);
         
-        spr.createSprite(320, 240);
-        bgSpr.createSprite(320, 240);
+        // Match the 320x170 hardware resolution of the LilyGO T-Display S3
+        spr.createSprite(320, 170);
+        bgSpr.createSprite(320, 170);
         
         spr.setTextColor(TFT_WHITE, TFT_BLACK);
         lastRenderMode = -1;
@@ -176,29 +177,28 @@ public:
             lastRenderMode = -1; 
         }
 
-        // FULL BACKGROUND RE-DRAW
+        // FULL BACKGROUND RE-DRAW (Expanded to fully utilize 170px height)
         if (d.activeMode != lastRenderMode) {
             bgSpr.fillSprite(TFT_BLACK);
             bgSpr.setTextColor(TFT_WHITE, TFT_BLACK);
             
-            // Restoring the UI grid lines
+            // Re-spaced UI grid lines
             bgSpr.drawFastHLine(0, 18, 320, TFT_WHITE);
-            bgSpr.drawFastHLine(15, 74, 290, TFT_DARKGREY);
-            bgSpr.drawFastHLine(0, 130, 320, TFT_DARKGREY);
-            bgSpr.drawFastHLine(0, 154, 320, TFT_WHITE);
-            bgSpr.drawFastHLine(0, 192, 320, TFT_WHITE); // Added separator line for diagnostics
+            bgSpr.drawFastHLine(15, 78, 290, TFT_DARKGREY);
+            bgSpr.drawFastHLine(0, 142, 320, TFT_DARKGREY);
             
             // Draw VU Meter Boxes
-            bgSpr.drawRect(2, 24, 10, 92, TFT_WHITE);
+            bgSpr.drawRect(2, 24, 10, 106, TFT_WHITE);
             bgSpr.setTextDatum(TC_DATUM);
-            bgSpr.drawString("IN", 7, 118, 1);
-            bgSpr.drawRect(308, 24, 10, 92, TFT_WHITE);
-            bgSpr.drawString("OUT", 313, 118, 1);
+            bgSpr.drawString("IN", 7, 132, 1);
+            bgSpr.drawRect(308, 24, 10, 106, TFT_WHITE);
+            bgSpr.drawString("OUT", 313, 132, 1);
             
-            drawKnobStatic(bgSpr, pbCenters[0], 42, 13, "PB1");
-            drawKnobStatic(bgSpr, pbCenters[1], 42, 13, "PB2");
-            drawKnobStatic(bgSpr, pbCenters[2], 42, 13, "PB3");
-            drawKnobStatic(bgSpr, pbCenters[3], 42, 13, "CC11");
+            // Pedal Knobs (Expanded Radius & Spacing)
+            drawKnobStatic(bgSpr, pbCenters[0], 48, 14, "PB1");
+            drawKnobStatic(bgSpr, pbCenters[1], 48, 14, "PB2");
+            drawKnobStatic(bgSpr, pbCenters[2], 48, 14, "PB3");
+            drawKnobStatic(bgSpr, pbCenters[3], 48, 14, "CC11");
             
             const char* currentNames[5];
             if (d.isMonoPolyActive) {
@@ -208,8 +208,9 @@ public:
                 for (int i = 0; i < 5; i++) currentNames[i] = POLY_LABELS[actMode][i];
             }
 
+            // Parameter Knobs
             for (int i = 0; i < 5; i++) {
-                drawKnobStatic(bgSpr, parCenters[i], 102, 10, currentNames[i]);
+                drawKnobStatic(bgSpr, parCenters[i], 110, 12, currentNames[i]);
             }
             
             lastRenderMode = d.activeMode;
@@ -217,11 +218,16 @@ public:
             lastMonoPolyAlgo = monoAlgo;
         }
 
-        spr.pushImage(0, 0, 320, 240, (uint16_t*)bgSpr.getPointer());
+        // Push static background to main sprite
+        spr.pushImage(0, 0, 320, 170, (uint16_t*)bgSpr.getPointer());
 
         // --- 1. TOP STATUS BAR ---
         spr.setTextDatum(TL_DATUM);
-        spr.printf("%.2fV %d%%", d.batVoltage, d.batPercent);
+        spr.setTextColor(TFT_WHITE, TFT_BLACK);
+        
+        char batBuf[32];
+        snprintf(batBuf, sizeof(batBuf), "%.2fV %d%%", d.batVoltage, d.batPercent);
+        spr.drawString(batBuf, 5, 2, 2); 
 
         spr.setTextDatum(TC_DATUM);
         char headerBuf[64];
@@ -238,18 +244,18 @@ public:
         spr.setTextDatum(TR_DATUM);
         if (d.isKnobEditMode) {
             spr.setTextColor(TFT_RED, TFT_BLACK);
-            spr.drawString("KNOB MODE", 318, 2);
+            spr.drawString("KNOB MODE", 318, 2, 2);
             spr.setTextColor(TFT_WHITE, TFT_BLACK);
         } else {
-            spr.drawString(d.bleConnected ? "BT: CONN" : "BT: WAIT", 318, 2);
+            spr.drawString(d.bleConnected ? "BT: CONN" : "BT: WAIT", 318, 2, 2);
         }
 
         // --- 2. VERTICAL VU METERS ---
-        int inH = constrain((int)(d.inMeter * 90.0f), 0, 90);
-        int outH = constrain((int)(d.outMeter * 90.0f), 0, 90);
+        int inH = constrain((int)(d.inMeter * 104.0f), 0, 104);
+        int outH = constrain((int)(d.outMeter * 104.0f), 0, 104);
         
-        spr.fillRect(3, 115 - inH, 8, inH, TFT_GREEN);
-        spr.fillRect(309, 115 - outH, 8, outH, TFT_GREEN);
+        spr.fillRect(3, 129 - inH, 8, inH, TFT_GREEN);
+        spr.fillRect(309, 129 - outH, 8, outH, TFT_GREEN);
 
         // --- 3. TOP ROW: PBs ---
         float pb1_norm = ((float)d.pb1 - 8192.0f) / 8191.5f;
@@ -259,16 +265,16 @@ public:
 
         char buf[16];
         snprintf(buf, sizeof(buf), "%d%%", (int)(pb1_norm * 100.0f));
-        drawKnobDynamic(spr, pbCenters[0], 42, 13, pb1_norm, true, buf);
+        drawKnobDynamic(spr, pbCenters[0], 48, 14, pb1_norm, true, buf);
 
         snprintf(buf, sizeof(buf), "%d%%", (int)(pb2_norm * 100.0f));
-        drawKnobDynamic(spr, pbCenters[1], 42, 13, pb2_norm, true, buf);
+        drawKnobDynamic(spr, pbCenters[1], 48, 14, pb2_norm, true, buf);
 
         snprintf(buf, sizeof(buf), "%d%%", (int)(pb3_norm * 100.0f));
-        drawKnobDynamic(spr, pbCenters[2], 42, 13, pb3_norm, false, buf);
+        drawKnobDynamic(spr, pbCenters[2], 48, 14, pb3_norm, false, buf);
 
         snprintf(buf, sizeof(buf), "%d%%", (int)(cc11_norm * 100.0f));
-        drawKnobDynamic(spr, pbCenters[3], 42, 13, cc11_norm, false, buf);
+        drawKnobDynamic(spr, pbCenters[3], 48, 14, cc11_norm, false, buf);
 
         // --- 4. MIDDLE ROW: PARAMS ---
         for (int i = 0; i < 5; i++) {
@@ -282,7 +288,7 @@ public:
                 isBip = false;
             }
 
-            drawKnobDynamic(spr, parCenters[i], 102, 10, constrain(pNorm, isBip ? -1.0f : 0.0f, 1.0f), isBip, buf);
+            drawKnobDynamic(spr, parCenters[i], 110, 12, constrain(pNorm, isBip ? -1.0f : 0.0f, 1.0f), isBip, buf);
         }
 
         // --- 5. DYNAMIC FX BADGES ---
@@ -302,60 +308,66 @@ public:
                 int bx = startX + (k * (badgeW + 4));
                 
                 uint16_t bColor = (fxIdx == 0 && d.isMonoPolyActive) ? TFT_DARKGREY : TFT_BLUE;
-                spr.fillRect(bx, 134, badgeW, 16, bColor);
+                spr.fillRect(bx, 148, badgeW, 16, bColor);
                 spr.setTextColor(TFT_WHITE, bColor);
                 spr.setTextDatum(TC_DATUM);
-                spr.drawString(FX_NAMES[fxIdx], bx + (badgeW / 2), 138, 1);
+                spr.drawString(FX_NAMES[fxIdx], bx + (badgeW / 2), 156, 1);
             }
         }
-        spr.setTextColor(TFT_WHITE, TFT_BLACK);
 
-        // --- 6. SYSTEM DIAGNOSTICS BAR ---
-        spr.setTextDatum(TL_DATUM);
-        char diagBuf1[128];
-        char diagBuf2[128];
-        snprintf(diagBuf1, sizeof(diagBuf1), "CPU: %d%%  SRM:%dK  PSR:%dK  SR:%dkHz  PLL: %dms", 
-                (int)d.dspCoreLoad, d.freeSRAM, d.freePSRAM, d.sampleRate / 1000, d.peakLatency);
-        snprintf(diagBuf2, sizeof(diagBuf2), "UDF: %d      DMA: %d      STK: %dB", 
-                d.underflows, d.dmaCount, d.stackWatermark);
+        // --- 6. CENTER TELEMETRY OVERLAY ---
+        // Draws a floating black box in the exact middle of the screen
+        spr.fillRect(20, 50, 280, 60, TFT_BLACK); 
+        spr.drawRect(20, 50, 280, 60, TFT_YELLOW); 
         
-        spr.drawString(diagBuf1, 5, 200, 1);
-        spr.drawString(diagBuf2, 5, 215, 1);
+        spr.setTextDatum(TL_DATUM);
+        spr.setTextColor(TFT_YELLOW, TFT_BLACK); 
+        
+        char diagBuf1[128], diagBuf2[128], debugBuf[128];
+        
+        snprintf(diagBuf1, sizeof(diagBuf1), "CPU: %d%%  SRM:%dK  PSR:%dK  SR:%dkHz", 
+                (int)d.dspCoreLoad, d.freeSRAM, d.freePSRAM, d.sampleRate / 1000);
+                
+        snprintf(diagBuf2, sizeof(diagBuf2), "UDF: %d  LAT: %dms  STK: %dB", 
+                d.underflows, d.peakLatency, d.stackWatermark);
+                
+        snprintf(debugBuf, sizeof(debugBuf), "DEBUG -> PB1:%d PB2:%d PB3:%d CC:%d", 
+                d.pb1, d.pb2, d.pb3, d.cc11);
+        
+        spr.drawString(diagBuf1, 26, 56, 1);
+        spr.drawString(diagBuf2, 26, 74, 1);
+        spr.drawString(debugBuf, 26, 92, 1);
 
         // --- 7. WARNING OVERLAYS ---
         if (d.showSavingScreen) {
-            spr.fillRect(60, 70, 200, 60, TFT_BLUE);
-            spr.drawRect(60, 70, 200, 60, TFT_WHITE);
+            spr.fillRect(60, 45, 200, 60, TFT_BLUE);
+            spr.drawRect(60, 45, 200, 60, TFT_WHITE);
             
             spr.setTextColor(TFT_WHITE, TFT_BLUE);
             spr.setTextDatum(MC_DATUM);
             
-            spr.drawString("ENABLING BLE", 160, 92, 2);
-            spr.drawString("Rebooting...", 160, 114, 2);
+            spr.drawString("ENABLING BLE", 160, 65, 2);
+            spr.drawString("Rebooting...", 160, 85, 2);
             
-            spr.setTextColor(TFT_WHITE, TFT_BLACK);
         } else if (d.showKnobModeScreen) {
-            spr.fillRect(60, 70, 200, 60, TFT_DARKGREEN);
-            spr.drawRect(60, 70, 200, 60, TFT_WHITE);
+            spr.fillRect(60, 45, 200, 60, TFT_DARKGREEN);
+            spr.drawRect(60, 45, 200, 60, TFT_WHITE);
             
             spr.setTextColor(TFT_WHITE, TFT_DARKGREEN);
             spr.setTextDatum(MC_DATUM);
             
-            spr.drawString("KNOB MODE", 160, 92, 2);
-            spr.drawString("Rebooting...", 160, 114, 2);
+            spr.drawString("KNOB MODE", 160, 65, 2);
+            spr.drawString("Rebooting...", 160, 85, 2);
             
-            spr.setTextColor(TFT_WHITE, TFT_BLACK);
         } else if (d.showBleWarning) {
-            spr.fillRect(60, 70, 200, 60, TFT_RED);
-            spr.drawRect(60, 70, 200, 60, TFT_WHITE);
+            spr.fillRect(60, 45, 200, 60, TFT_RED);
+            spr.drawRect(60, 45, 200, 60, TFT_WHITE);
             
             spr.setTextColor(TFT_WHITE, TFT_RED);
             spr.setTextDatum(MC_DATUM);
             
-            spr.drawString("HOLD TO ENABLE BLE", 160, 92, 2);
-            spr.drawString("Reboot Required", 160, 114, 2);
-            
-            spr.setTextColor(TFT_WHITE, TFT_BLACK);
+            spr.drawString("HOLD TO ENABLE BLE", 160, 65, 2);
+            spr.drawString("Reboot Required", 160, 85, 2);
         }
 
         spr.pushSprite(0, 0);

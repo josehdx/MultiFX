@@ -37,7 +37,6 @@ public:
         I2SManager::initChannels(BoardHAL::getI2SConfig(currentSampleRate.load(std::memory_order_acquire)), HOP_SIZE);
 
         Serial0.println("[INIT 2/8] Setting up Analog Inputs (Bypassing ESP32-S3 DMA Bug)...");
-        // We use analogRead() inside BoardHAL instead of continuous DMA to support ADC2 safely.
         analogReadResolution(12);
 
         Serial0.println("[INIT 3/8] Initializing NVS Flash...");
@@ -49,7 +48,10 @@ public:
         ESP_ERROR_CHECK(err);
 
         settingsMgr.init(preferences);
-        isKnobEditMode = preferences.getBool("knobEditMode", true);
+        
+        // REVERTED: Default to BLE mode (false) if no setting exists
+        isKnobEditMode = preferences.getBool("knobEditMode", false);
+        
 #if defined(FW_MODE_KNOBS_ONLY)
         isKnobEditMode = true;
 #endif

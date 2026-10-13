@@ -54,8 +54,7 @@ void setup() {
 void loop() {
     Control_Surface.loop();
 
-    // 1. Check for USB flush timeouts to unpark the DSP after a file copy
-    USBMscManager::handleCacheFlush();
+
 
     // 2. Fetch raw ADC values from hardware DMA (when stress tester is disabled)
 #if !ENABLE_STRESS_TESTER

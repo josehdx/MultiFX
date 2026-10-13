@@ -59,7 +59,6 @@ private:
         {"ALGO", "FFT",  "PHS",  "TRN",  "MIX"}
     };
 
-    // Dedicated parameter labels for standard polyphonic effects
     const char* POLY_LABELS[10][5] = {
         {"DRY",  "WET",  "TOE",  "HEEL", "MODE"}, // 0: WHAMMY
         {"APF",  "ATTK", "REL",  "FADE", "MIX"},  // 1: FREEZE
@@ -129,15 +128,12 @@ public:
     void begin() {
         Serial0.println("[TFT] Powering up LCD (GPIO 15) and Backlight (GPIO 38)...");
         
-        // 1. Power on the display logic
         pinMode(15, OUTPUT);
         digitalWrite(15, HIGH); 
         
-        // 2. Configure and enable the backlight BEFORE tft.init()
         pinMode(38, OUTPUT);
         digitalWrite(38, HIGH); 
 
-        // 3. CRITICAL: The ST7789 requires >120ms to stabilize after power-on
         delay(150); 
         
         Serial0.println("[TFT] Initializing TFT_eSPI driver...");
@@ -145,7 +141,6 @@ public:
         tft.setRotation(1);
         tft.fillScreen(TFT_BLACK);
         
-        // Ensure backlight stays pinned HIGH in case the library reset it
         digitalWrite(38, HIGH); 
         
         Serial0.println("[TFT] Allocating Sprites...");
@@ -181,15 +176,19 @@ public:
             lastRenderMode = -1; 
         }
 
+        // FULL BACKGROUND RE-DRAW
         if (d.activeMode != lastRenderMode) {
             bgSpr.fillSprite(TFT_BLACK);
             bgSpr.setTextColor(TFT_WHITE, TFT_BLACK);
             
+            // Restoring the UI grid lines
             bgSpr.drawFastHLine(0, 18, 320, TFT_WHITE);
             bgSpr.drawFastHLine(15, 74, 290, TFT_DARKGREY);
             bgSpr.drawFastHLine(0, 130, 320, TFT_DARKGREY);
             bgSpr.drawFastHLine(0, 154, 320, TFT_WHITE);
+            bgSpr.drawFastHLine(0, 192, 320, TFT_WHITE); // Added separator line for diagnostics
             
+            // Draw VU Meter Boxes
             bgSpr.drawRect(2, 24, 10, 92, TFT_WHITE);
             bgSpr.setTextDatum(TC_DATUM);
             bgSpr.drawString("IN", 7, 118, 1);
@@ -239,20 +238,20 @@ public:
         spr.setTextDatum(TR_DATUM);
         if (d.isKnobEditMode) {
             spr.setTextColor(TFT_RED, TFT_BLACK);
-            spr.drawString("EDIT MODE", 318, 2);
+            spr.drawString("KNOB MODE", 318, 2);
             spr.setTextColor(TFT_WHITE, TFT_BLACK);
         } else {
             spr.drawString(d.bleConnected ? "BT: CONN" : "BT: WAIT", 318, 2);
         }
 
-        // --- 2. VERTICAL VU METERS (IN Left | OUT Right) ---
+        // --- 2. VERTICAL VU METERS ---
         int inH = constrain((int)(d.inMeter * 90.0f), 0, 90);
         int outH = constrain((int)(d.outMeter * 90.0f), 0, 90);
         
         spr.fillRect(3, 115 - inH, 8, inH, TFT_GREEN);
         spr.fillRect(309, 115 - outH, 8, outH, TFT_GREEN);
 
-        // --- 3. TOP ROW: 4 CIRCULAR PBs ---
+        // --- 3. TOP ROW: PBs ---
         float pb1_norm = ((float)d.pb1 - 8192.0f) / 8191.5f;
         float pb2_norm = ((float)d.pb2 - 8192.0f) / 8191.5f;
         float pb3_norm = (float)d.pb3 / 16383.0f;
@@ -271,7 +270,7 @@ public:
         snprintf(buf, sizeof(buf), "%d%%", (int)(cc11_norm * 100.0f));
         drawKnobDynamic(spr, pbCenters[3], 42, 13, cc11_norm, false, buf);
 
-        // --- 4. MIDDLE ROW: 5 CIRCULAR PARAMS ---
+        // --- 4. MIDDLE ROW: PARAMS ---
         for (int i = 0; i < 5; i++) {
             snprintf(buf, sizeof(buf), "%.2f", d.paramVals[i]);
             bool isBip = (i == 0 && d.paramVals[i] < 0.0f) || (i == 0);
@@ -331,8 +330,8 @@ public:
             spr.setTextColor(TFT_WHITE, TFT_BLUE);
             spr.setTextDatum(MC_DATUM);
             
-            spr.drawString("SAVING...", 160, 92, 2);
-            spr.drawString("Please Wait", 160, 114, 2);
+            spr.drawString("ENABLING BLE", 160, 92, 2);
+            spr.drawString("Rebooting...", 160, 114, 2);
             
             spr.setTextColor(TFT_WHITE, TFT_BLACK);
         } else if (d.showKnobModeScreen) {
@@ -353,8 +352,8 @@ public:
             spr.setTextColor(TFT_WHITE, TFT_RED);
             spr.setTextDatum(MC_DATUM);
             
-            spr.drawString("REBOOT REQUIRED", 160, 92, 2);
-            spr.drawString("To Enable BLE", 160, 114, 2);
+            spr.drawString("HOLD TO ENABLE BLE", 160, 92, 2);
+            spr.drawString("Reboot Required", 160, 114, 2);
             
             spr.setTextColor(TFT_WHITE, TFT_BLACK);
         }

@@ -2,15 +2,16 @@
 #include <Arduino.h>
 #include "SystemState.h"
 #include "PowerManager.h"
-#include "esp_adc/adc_continuous.h"
 #include "driver/i2s_std.h"
+
+// We no longer need the continuous DMA header
+// #include "esp_adc/adc_continuous.h"
 
 #if defined(TARGET_LILYGO)
 #include "DisplayManager.h"
 extern DisplayManager displayManager;
 #endif
 
-// External state flags managed by the main system loop
 extern bool showSavingScreen;
 extern bool showKnobModeScreen;
 extern bool showBleWarning;
@@ -52,37 +53,34 @@ public:
                 },
             },
         };
-        
-        // Ensure the Master Clock multiple aligns with the DAC requirements
         std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
         return std_cfg;
     }
 
-    // Fully updated signature to match global volatile int and std::atomic types
+    // Notice we keep the original signature so we don't break main.cpp, but 'handle' is ignored
     static void fetchADC(adc_continuous_handle_t handle, volatile bool& isPaused, volatile int& pb1, volatile int& pb2, volatile int& pb3, volatile int& par1, std::atomic<int>& bat) {
         if (isPaused) return;
-        if (adcLock.test_and_set(std::memory_order_acquire)) return;
         
-        uint32_t ret_num = 0;
-        uint8_t result[256] = {0};
+        // Fast, non-blocking single-shot reads bypass the ADC2 DMA silicon bugs
+        pb1 = analogRead(1);
+        pb2 = analogRead(2);
         
-        esp_err_t ret = adc_continuous_read(handle, result, 256, &ret_num, 0);
-        if (ret == ESP_OK) {
-            for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
-                adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result[i];
-                uint32_t chan_num = p->type2.channel;
-                uint32_t data = p->type2.data;
-                
-                switch(chan_num) {
-                    case ADC_CHANNEL_0: pb1 = data; break;
-                    case ADC_CHANNEL_1: pb2 = data; break;
-                    case ADC_CHANNEL_9: pb3 = data; break;
-                    case ADC_CHANNEL_3: par1 = data; break;
-                    case ADC_CHANNEL_2: bat.store(data, std::memory_order_relaxed); break;
-                }
-            }
-        }
-        adcLock.clear(std::memory_order_release);
+#if defined(TARGET_LILYGO)
+        par1 = analogRead(3);
+        pb3 = analogRead(10);
+        latestPar2 = analogRead(11);
+        latestPar3 = analogRead(12);
+        latestPar4 = analogRead(13);
+        latestPar5 = analogRead(16);
+        bat.store(analogRead(4), std::memory_order_relaxed);
+#else
+        par1 = analogRead(3);
+        latestPar2 = analogRead(4);
+        pb3 = analogRead(5);
+        latestPar3 = analogRead(6);
+        latestPar4 = analogRead(7);
+        latestPar5 = analogRead(11);
+#endif
     }
 
     static void updateExtraControls(int activeMode, volatile float* effectMemory, volatile float fxParams[10][5], volatile bool& lutNeedsUpdate, volatile bool& dspNeedsCommit, std::atomic<int>& feedbackIntervalIdx, bool isKnobEditMode, uint16_t latestPar1) {
@@ -101,64 +99,44 @@ public:
             lastDisplayUpdate = millis();
             
             DisplayData dData;
+            
             dData.batVoltage = PowerManager::getBatteryVoltage(batVal);
             dData.batPercent = PowerManager::getBatteryPercentage(dData.batVoltage);
+            
             dData.bleConnected = bleConnected;
             dData.activeMode = activeDSP->activeMode;
             
-            // Map active effects states
-            for(int i = 0; i < 10; i++) {
-                dData.fxStates[i] = (&activeDSP->w)[i];
-            }
+            for(int i = 0; i < 10; i++) { dData.fxStates[i] = (&activeDSP->w)[i]; }
             
             dData.pb1 = pb1; 
             dData.pb2 = pb2; 
             dData.pb3 = pb3; 
             dData.cc11 = cc11;
             
-            // Map parameter values 
-            for(int i = 0; i < 5; i++) {
-                dData.paramVals[i] = activeDSP->params[activeDSP->activeMode][i];
-            }
+            for(int i = 0; i < 5; i++) { dData.paramVals[i] = activeDSP->params[activeDSP->activeMode][i]; }
             
-            // Default names (overridden dynamically in DisplayManager if MonoPoly is active)
-            dData.paramNames[0] = "P1"; 
-            dData.paramNames[1] = "P2"; 
-            dData.paramNames[2] = "P3"; 
-            dData.paramNames[3] = "P4"; 
-            dData.paramNames[4] = "P5";
+            dData.paramNames[0] = "P1"; dData.paramNames[1] = "P2"; dData.paramNames[2] = "P3"; 
+            dData.paramNames[3] = "P4"; dData.paramNames[4] = "P5";
             
-            dData.inMeter = inMeter; 
-            dData.outMeter = outMeter;
-            
-            dData.dspCoreLoad = dspLoad; 
-            dData.ctrlCoreLoad = ctrlLoad;
+            dData.inMeter = inMeter; dData.outMeter = outMeter;
+            dData.dspCoreLoad = dspLoad; dData.ctrlCoreLoad = ctrlLoad;
             
             dData.freeSRAM = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
             dData.freePSRAM = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-            
-            dData.sampleRate = sampleRate; 
-            dData.peakLatency = peakLatency;
-            
-            dData.underflows = underflows; 
-            dData.dmaCount = 0; 
+            dData.sampleRate = sampleRate; dData.peakLatency = peakLatency;
+            dData.underflows = underflows; dData.dmaCount = 0; 
             dData.stackWatermark = stackWatermark;
             
             dData.isKnobEditMode = isKnobEditMode;
             dData.showBleWarning = showBleWarning;
             dData.showSavingScreen = showSavingScreen;
             dData.showKnobModeScreen = showKnobModeScreen;
-            
-            // Propagate MonoPoly active state flag
             dData.isMonoPolyActive = isMonoPolyActiveFlag;
-            
-            // Map Whammy limits for the MonoPoly UI background header
             dData.whammyToe = activeDSP->fxMem[0];
             dData.whammyHeel = activeDSP->fxMem[1];
 
             displayManager.render(dData);
         }
-
 #endif
     }
 };

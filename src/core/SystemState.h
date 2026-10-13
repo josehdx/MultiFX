@@ -123,3 +123,4 @@ extern BluetoothMIDI_Interface* btmidi;
 extern USBMIDI_Interface usbmidi;
 extern MIDI_PipeFactory<4> pipes;
 extern PedalManager pedals;
+extern volatile int latestPar2, latestPar3, latestPar4, latestPar5;

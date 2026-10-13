@@ -7,6 +7,9 @@
 #include <Arduino.h>
 #include <math.h>
 
+// Set to 'false' to hide the yellow telemetry overlay box
+#define SHOW_TELEMETRY true
+
 struct DisplayData {
     float batVoltage;
     int batPercent;
@@ -316,27 +319,29 @@ public:
         }
 
         // --- 6. CENTER TELEMETRY OVERLAY ---
-        // Draws a floating black box in the exact middle of the screen
-        spr.fillRect(20, 50, 280, 60, TFT_BLACK); 
-        spr.drawRect(20, 50, 280, 60, TFT_YELLOW); 
-        
-        spr.setTextDatum(TL_DATUM);
-        spr.setTextColor(TFT_YELLOW, TFT_BLACK); 
-        
-        char diagBuf1[128], diagBuf2[128], debugBuf[128];
-        
-        snprintf(diagBuf1, sizeof(diagBuf1), "CPU: %d%%  SRM:%dK  PSR:%dK  SR:%dkHz", 
-                (int)d.dspCoreLoad, d.freeSRAM, d.freePSRAM, d.sampleRate / 1000);
-                
-        snprintf(diagBuf2, sizeof(diagBuf2), "UDF: %d  LAT: %dms  STK: %dB", 
-                d.underflows, d.peakLatency, d.stackWatermark);
-                
-        snprintf(debugBuf, sizeof(debugBuf), "DEBUG -> PB1:%d PB2:%d PB3:%d CC:%d", 
-                d.pb1, d.pb2, d.pb3, d.cc11);
-        
-        spr.drawString(diagBuf1, 26, 56, 1);
-        spr.drawString(diagBuf2, 26, 74, 1);
-        spr.drawString(debugBuf, 26, 92, 1);
+        if (SHOW_TELEMETRY) {
+            // Draws a floating black box in the exact middle of the screen
+            spr.fillRect(20, 50, 280, 60, TFT_BLACK); 
+            spr.drawRect(20, 50, 280, 60, TFT_YELLOW); 
+            
+            spr.setTextDatum(TL_DATUM);
+            spr.setTextColor(TFT_YELLOW, TFT_BLACK); 
+            
+            char diagBuf1[128], diagBuf2[128], debugBuf[128];
+            
+            snprintf(diagBuf1, sizeof(diagBuf1), "CPU: %d%%  SRM:%dK  PSR:%dK  SR:%dkHz", 
+                    (int)d.dspCoreLoad, d.freeSRAM, d.freePSRAM, d.sampleRate / 1000);
+                    
+            snprintf(diagBuf2, sizeof(diagBuf2), "UDF: %d  LAT: %dms  STK: %dB", 
+                    d.underflows, d.peakLatency, d.stackWatermark);
+                    
+            snprintf(debugBuf, sizeof(debugBuf), "DEBUG -> PB1:%d PB2:%d PB3:%d CC:%d", 
+                    d.pb1, d.pb2, d.pb3, d.cc11);
+            
+            spr.drawString(diagBuf1, 26, 56, 1);
+            spr.drawString(diagBuf2, 26, 74, 1);
+            spr.drawString(debugBuf, 26, 92, 1);
+        }
 
         // --- 7. WARNING OVERLAYS ---
         if (d.showSavingScreen) {

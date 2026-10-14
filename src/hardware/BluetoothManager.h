@@ -27,7 +27,6 @@ private:
     static inline bool hasTarget = false;
     static inline bool doConnect = false;
     static inline unsigned long reconnectLockoutUntil = 0;
-    static inline unsigned long ghostConnectionWatchdog = 0;
 
     static inline NimBLEClient* pClient = nullptr;
     static inline NimBLEServer* pServer = nullptr;
@@ -62,12 +61,12 @@ private:
     }
 
     static void handleDiscoveredDevice(const NimBLEAdvertisedDevice* advertisedDevice) {
+        if (!advertisedDevice) return;
         packetCount++;
+        
         std::string nameStr = advertisedDevice->getName();
         std::string addrStr = advertisedDevice->getAddress().toString();
         int rssi = advertisedDevice->getRSSI();
-
-        bool hasMidiUUID = advertisedDevice->isAdvertisingService(midiServiceUUID);
 
         if (nameStr.length() > 0) {
             snprintf(bleLastSeenStr, sizeof(bleLastSeenStr), "%s (%ddBm)", nameStr.c_str(), rssi);
@@ -80,15 +79,22 @@ private:
         if (doConnect || hasTarget || isMvaveConnected || millis() < reconnectLockoutUntil) return;
 
         bool isMatch = false;
-        if (hasMidiUUID) {
-            isMatch = true;
-        } else if (nameStr.length() > 0) {
+
+        // Check name first to avoid parsing payload fields on unknown devices
+        if (nameStr.length() > 0) {
             String upper = nameStr.c_str();
             upper.toUpperCase();
             if (upper.indexOf("FOOTCTRL") != -1  || upper.indexOf("CHOCOLATE") != -1 ||
                 upper.indexOf("M-VAVE") != -1    || upper.indexOf("FOOT") != -1      ||
                 upper.indexOf("CTRL") != -1      || upper.indexOf("CUBE") != -1      ||
                 upper.indexOf("MIDI") != -1) {
+                isMatch = true;
+            }
+        }
+
+        // Secondary check: verify advertised Service UUID
+        if (!isMatch && advertisedDevice->haveServiceUUID()) {
+            if (advertisedDevice->isAdvertisingService(midiServiceUUID)) {
                 isMatch = true;
             }
         }
@@ -100,8 +106,8 @@ private:
             strlcpy(bleTargetStr, nameStr.length() > 0 ? nameStr.c_str() : addrStr.c_str(), sizeof(bleTargetStr));
             
             snprintf(bleEventDebug, sizeof(bleEventDebug), "BLE: PEDAL FOUND!");
-            dualLog("[BLE ACTION] Target %s found. Halting scanner...\n", bleTargetStr);
-            NimBLEDevice::getScan()->stop();
+            dualLog("[BLE ACTION] Target %s found.\n", bleTargetStr);
+            // Scan stop is handled safely in process() on the main loop
         }
     }
 
@@ -143,15 +149,6 @@ public:
         void onDiscovered(const NimBLEAdvertisedDevice* advertisedDevice) override {
             handleDiscoveredDevice(advertisedDevice);
         }
-        void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
-            handleDiscoveredDevice(advertisedDevice);
-        }
-        void onScanEnd(const NimBLEScanResults& results, int reason) override {
-            if (!doConnect && !hasTarget && !isMvaveConnected && millis() >= reconnectLockoutUntil) {
-                // Restart scanner with 40% duty cycle to prevent radio starvation
-                NimBLEDevice::getScan()->start(5000, false, true);
-            }
-        }
     };
     static inline ScanCallbacks scanCB;
 
@@ -165,14 +162,12 @@ public:
                 snprintf(bleEventDebug, sizeof(bleEventDebug), "MAC: CONNECTED!");
                 dualLog("\n[BLE SERVER] Host 1 (Mac/iOS) connected!\n");
             } else if (count >= 2) {
-                // The M-Vave connected to our Server acting as a Central
                 isMvaveConnected = true;
                 strlcpy(blePedalStatusStr, "CONN", sizeof(blePedalStatusStr));
                 snprintf(bleEventDebug, sizeof(bleEventDebug), "PEDAL (REV): CONN!");
                 dualLog("\n[BLE SERVER] Host 2 (M-Vave Central) connected!\n");
             }
             
-            // Allow Mac/Pedal to negotiate connection interval before fetching data
             server->updateConnParams(connInfo.getConnHandle(), 12, 24, 0, 400);
         }
 
@@ -185,8 +180,6 @@ public:
                 strlcpy(bleHostStatusStr, "WAIT", sizeof(bleHostStatusStr));
                 strlcpy(blePedalStatusStr, "WAIT", sizeof(blePedalStatusStr));
             } else if (count == 1) {
-                // One device dropped, one is still connected. 
-                // We drop the second "Pedal" flag but keep the Host flag active.
                 isMvaveConnected = false;
                 strlcpy(blePedalStatusStr, "WAIT", sizeof(blePedalStatusStr));
             }
@@ -196,7 +189,6 @@ public:
             snprintf(bleEventDebug, sizeof(bleEventDebug), "MAC DISC (0x%02X)", hciCode);
             dualLog("[BLE SERVER] Device disconnected (0x%02X - %s).\n", hciCode, getHciReasonString(hciCode));
             
-            // Explicitly restart advertising immediately
             NimBLEDevice::getAdvertising()->start();
         }
     };
@@ -204,9 +196,6 @@ public:
 
     class ServerCharCallbacks : public NimBLECharacteristicCallbacks {
         void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
-            // If Mac sends data, refresh the ghost connection watchdog
-            ghostConnectionWatchdog = millis();
-            
             NimBLEAttValue val = pChar->getValue();
             if (val.length() >= 5) {
                 const uint8_t* pData = val.data();
@@ -222,7 +211,6 @@ public:
         dualLog("\n[BLE INIT] Initializing Dual-Role NimBLE Stack on Core 1...\n");
         NimBLEDevice::init("Whammy_S3");
         
-        // 0 dBm to prevent battery rail voltage drops
         NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
         strlcpy(bleInitStep, "2: createServer()", sizeof(bleInitStep));
@@ -259,11 +247,10 @@ public:
 
         strlcpy(bleInitStep, "4: getScan()", sizeof(bleInitStep));
         NimBLEScan* pScan = NimBLEDevice::getScan();
-        pScan->setScanCallbacks(&scanCB, true);
-        pScan->setActiveScan(true);
+        pScan->setScanCallbacks(&scanCB, false);
+        pScan->setActiveScan(false);
+        pScan->setMaxResults(0); // Disables internal device storage to prevent memory corruption
         
-        // 40% Duty Cycle. Gives the ESP32 radio 60ms out of every 100ms 
-        // to maintain the Mac's connection and broadcast the Server Advertisement.
         pScan->setInterval(100); 
         pScan->setWindow(40);   
         
@@ -271,7 +258,7 @@ public:
         snprintf(bleScanDebug, sizeof(bleScanDebug), "SCAN: LISTENING...");
         
         strlcpy(bleInitStep, "5: pScan->start()", sizeof(bleInitStep));
-        if (pScan->start(5000, false, true)) {
+        if (pScan->start(0, false, true)) { // Continuous scan with 0 timeout
             strlcpy(bleInitStep, "6: SUCCESS (Scanning)", sizeof(bleInitStep));
         } else {
             strlcpy(bleInitStep, "ERR: SCAN FAILED", sizeof(bleInitStep));
@@ -288,14 +275,13 @@ public:
     }
 
     static void process() {
-        // Failsafe: If Mac is disconnected but advertising stopped, force it back on
         if (!isHostConnected && !NimBLEDevice::getAdvertising()->isAdvertising()) {
             NimBLEDevice::getAdvertising()->start();
         }
 
         if (!doConnect && !hasTarget && !isMvaveConnected && 
             millis() >= reconnectLockoutUntil && !NimBLEDevice::getScan()->isScanning()) {
-            NimBLEDevice::getScan()->start(5000, false, true);
+            NimBLEDevice::getScan()->start(0, false, true);
         }
 
         if (doConnect && hasTarget) {
@@ -311,8 +297,6 @@ public:
             if (!pClient) {
                 pClient = NimBLEDevice::createClient();
                 pClient->setClientCallbacks(&clientCB);
-                
-                // Widen connection parameters to absorb M-Vave initial bursts
                 pClient->setConnectionParams(12, 40, 0, 500); 
                 pClient->setConnectTimeout(5000);
             }
@@ -342,7 +326,6 @@ public:
                 snprintf(bleLatchedDiscReason, sizeof(bleLatchedDiscReason), "FAIL 0x%02X: %s", hciCode, getHciReasonString(hciCode));
                 dualLog("[BLE ERROR] Connection failed (rc: 0x%02X - %s).\n", hciCode, getHciReasonString(hciCode));
                 
-                // Immediately destroy the client so NimBLE reclaims the connection slot
                 NimBLEDevice::deleteClient(pClient);
                 pClient = nullptr;
                 

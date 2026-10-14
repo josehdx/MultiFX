@@ -18,7 +18,8 @@ extern bool showBleWarning;
 // =========================================================================
 // HARDWARE MODE TOGGLE
 // 1 = UART Debugging on GPIO 17 & 18 (I2S Disabled on those pins)
-// 0 = Original I2S DAC/ADC mode on GPIO 17 & 18 (UART Logging Disabled)
+// 0 = Full I2S Audio Mode (GPIO 43=MCLK, 44=BCLK, 18=WS, 17=DIN)
+//     NOTE: Serial0 MUST be detached in Mode 0 to prevent seizing GPIO 43/44!
 // =========================================================================
 #define ENABLE_SERIAL_DEBUG 0
 
@@ -29,7 +30,10 @@ public:
     #if ENABLE_SERIAL_DEBUG
         Serial0.begin(115200, SERIAL_8N1, 18, 17);
     #else
-        Serial0.begin(115200, SERIAL_8N1, -1, -1);
+        // Disables UART0 completely so it releases GPIO 43 (MCLK) and GPIO 44 (BCLK)
+        Serial0.end();
+        pinMode(43, OUTPUT);
+        pinMode(44, OUTPUT);
     #endif
 #else
         Serial0.begin(115200, SERIAL_8N1, 44, 43);

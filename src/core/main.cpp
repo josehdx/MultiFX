@@ -25,20 +25,19 @@ void dispatchBleMidi(uint8_t header, uint8_t data1, uint8_t data2) {
 }
 
 void setup() {
-    esp_log_level_set("task_wdt", ESP_LOG_NONE);
-    
+    esp_log_level_set("task_wdt", ESP_LOG_NONE); 
+
 #if defined(TARGET_LILYGO)
-    // Critical: Power on LilyGO peripheral & LCD rail immediately for battery boot
+    // Power on LilyGO peripheral & LCD rail immediately for battery boot
     pinMode(15, OUTPUT);
     digitalWrite(15, HIGH);
 #endif
 
     Serial.begin(115200);
-    Serial0.begin(115200);
+    // Serial0 initialization removed here to prevent seizing I2S clock GPIOs 43 & 44
     BoardHAL::init();
     
     FirmwareManager::checkAndApplyUpdate();
-
     SystemBootloader::run();
 
 #if defined(TARGET_LILYGO)
@@ -92,7 +91,6 @@ void loop() {
                             watermarkVal, btConnected, latestBat,
                             isMonoPolyActive.load(std::memory_order_acquire));
 #endif
-
         TelemetryManager::report(activeDSP);
     }
 

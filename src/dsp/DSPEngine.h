@@ -4,7 +4,6 @@
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
-
 #include "dsps_mul.h"
 #include "dsps_add.h"
 #include "dsps_biquad.h"
@@ -24,17 +23,20 @@ struct __attribute__((aligned(64))) VectorBiquadS3 {
         float a0 = 1.0f + alpha;
 
         coeffs[0] = ((1.0f - cosw0) / 2.0f) / a0; 
-        coeffs[1] = (1.0f - cosw0) / a0;          
+        coeffs[1] = (1.0f - cosw0) / a0;                   
         coeffs[2] = ((1.0f - cosw0) / 2.0f) / a0; 
-        coeffs[3] = (-2.0f * cosw0) / a0;         
-        coeffs[4] = (1.0f - alpha) / a0;          
+        coeffs[3] = (-2.0f * cosw0) / a0;                  
+        coeffs[4] = (1.0f - alpha) / a0;               
     }
 
     void inline process(const float* input, float* output, int len) {
         dsps_biquad_f32_aes3(input, output, len, coeffs, delay_state);
     }
 
-    void reset() { delay_state[0] = 0.0f; delay_state[1] = 0.0f; }
+    void reset() {
+        delay_state[0] = 0.0f;
+        delay_state[1] = 0.0f;
+    }
 };
 
 class DSPEngine {
@@ -61,22 +63,19 @@ public:
         uint32_t fracInt = tapPhase & 0xFFFF;
         int lutIdxFrac = (fracInt >> 6) << 2;
         int startIdx = (currentSramWriteIdx - T - 2 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
-
         float rawSum;
         const float* sincPtr = &pitchSincLUT[lutIdxFrac];
-
         if (__builtin_expect(startIdx <= SRAM_PITCH_BUF_MASK - 3, 1)) {
-            rawSum = __builtin_fmaf((float)sramBuffer[startIdx + 3], sincPtr[0],
-                     __builtin_fmaf((float)sramBuffer[startIdx + 2], sincPtr[1],
-                     __builtin_fmaf((float)sramBuffer[startIdx + 1], sincPtr[2],
+            rawSum = __builtin_fmaf((float)sramBuffer[startIdx + 3], sincPtr[0], 
+                     __builtin_fmaf((float)sramBuffer[startIdx + 2], sincPtr[1], 
+                     __builtin_fmaf((float)sramBuffer[startIdx + 1], sincPtr[2], 
                                     (float)sramBuffer[startIdx]     * sincPtr[3])));
         } else {
-            rawSum = __builtin_fmaf((float)sramBuffer[(startIdx + 3) & SRAM_PITCH_BUF_MASK], sincPtr[0],
-                     __builtin_fmaf((float)sramBuffer[(startIdx + 2) & SRAM_PITCH_BUF_MASK], sincPtr[1],
-                     __builtin_fmaf((float)sramBuffer[(startIdx + 1) & SRAM_PITCH_BUF_MASK], sincPtr[2],
+            rawSum = __builtin_fmaf((float)sramBuffer[(startIdx + 3) & SRAM_PITCH_BUF_MASK], sincPtr[0], 
+                     __builtin_fmaf((float)sramBuffer[(startIdx + 2) & SRAM_PITCH_BUF_MASK], sincPtr[1], 
+                     __builtin_fmaf((float)sramBuffer[(startIdx + 1) & SRAM_PITCH_BUF_MASK], sincPtr[2], 
                                     (float)sramBuffer[(startIdx + 0) & SRAM_PITCH_BUF_MASK] * sincPtr[3])));
         }
-
         int hannIdx = ((uint32_t)(T * hannIntMult) >> 16) & 4095;
         float scale = hannLUT[hannIdx] * 3.0517578125e-5f;
         return AntiDenormal(rawSum * scale);
@@ -91,46 +90,39 @@ public:
         uint32_t fracInt1 = tapPhase1 & 0xFFFF;
         int lutIdxFrac1 = (fracInt1 >> 6) << 2;
         int startIdx1 = (currentSramWriteIdx - T1 - 2 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
-
         int T2 = (int)(tapPhase2 >> 16) & windowMask;
         uint32_t fracInt2 = tapPhase2 & 0xFFFF;
         int lutIdxFrac2 = (fracInt2 >> 6) << 2;
         int startIdx2 = (currentSramWriteIdx - T2 - 2 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
-
         float rawSum1, rawSum2;
         const float* sincPtr1 = &pitchSincLUT[lutIdxFrac1];
         const float* sincPtr2 = &pitchSincLUT[lutIdxFrac2];
-
         if (__builtin_expect(startIdx1 <= SRAM_PITCH_BUF_MASK - 3, 1)) {
-            rawSum1 = __builtin_fmaf((float)sramBuffer[startIdx1 + 3], sincPtr1[0],
-                      __builtin_fmaf((float)sramBuffer[startIdx1 + 2], sincPtr1[1],
-                      __builtin_fmaf((float)sramBuffer[startIdx1 + 1], sincPtr1[2],
+            rawSum1 = __builtin_fmaf((float)sramBuffer[startIdx1 + 3], sincPtr1[0], 
+                      __builtin_fmaf((float)sramBuffer[startIdx1 + 2], sincPtr1[1], 
+                      __builtin_fmaf((float)sramBuffer[startIdx1 + 1], sincPtr1[2], 
                                      (float)sramBuffer[startIdx1]     * sincPtr1[3])));
         } else {
-            rawSum1 = __builtin_fmaf((float)sramBuffer[(startIdx1 + 3) & SRAM_PITCH_BUF_MASK], sincPtr1[0],
-                      __builtin_fmaf((float)sramBuffer[(startIdx1 + 2) & SRAM_PITCH_BUF_MASK], sincPtr1[1],
-                      __builtin_fmaf((float)sramBuffer[(startIdx1 + 1) & SRAM_PITCH_BUF_MASK], sincPtr1[2],
+            rawSum1 = __builtin_fmaf((float)sramBuffer[(startIdx1 + 3) & SRAM_PITCH_BUF_MASK], sincPtr1[0], 
+                      __builtin_fmaf((float)sramBuffer[(startIdx1 + 2) & SRAM_PITCH_BUF_MASK], sincPtr1[1], 
+                      __builtin_fmaf((float)sramBuffer[(startIdx1 + 1) & SRAM_PITCH_BUF_MASK], sincPtr1[2], 
                                      (float)sramBuffer[(startIdx1 + 0) & SRAM_PITCH_BUF_MASK] * sincPtr1[3])));
         }
-
         if (__builtin_expect(startIdx2 <= SRAM_PITCH_BUF_MASK - 3, 1)) {
-            rawSum2 = __builtin_fmaf((float)sramBuffer[startIdx2 + 3], sincPtr2[0],
-                      __builtin_fmaf((float)sramBuffer[startIdx2 + 2], sincPtr2[1],
-                      __builtin_fmaf((float)sramBuffer[startIdx2 + 1], sincPtr2[2],
+            rawSum2 = __builtin_fmaf((float)sramBuffer[startIdx2 + 3], sincPtr2[0], 
+                      __builtin_fmaf((float)sramBuffer[startIdx2 + 2], sincPtr2[1], 
+                      __builtin_fmaf((float)sramBuffer[startIdx2 + 1], sincPtr2[2], 
                                      (float)sramBuffer[startIdx2]     * sincPtr2[3])));
         } else {
-            rawSum2 = __builtin_fmaf((float)sramBuffer[(startIdx2 + 3) & SRAM_PITCH_BUF_MASK], sincPtr2[0],
-                      __builtin_fmaf((float)sramBuffer[(startIdx2 + 2) & SRAM_PITCH_BUF_MASK], sincPtr2[1],
-                      __builtin_fmaf((float)sramBuffer[(startIdx2 + 1) & SRAM_PITCH_BUF_MASK], sincPtr2[2],
+            rawSum2 = __builtin_fmaf((float)sramBuffer[(startIdx2 + 3) & SRAM_PITCH_BUF_MASK], sincPtr2[0], 
+                      __builtin_fmaf((float)sramBuffer[(startIdx2 + 2) & SRAM_PITCH_BUF_MASK], sincPtr2[1], 
+                      __builtin_fmaf((float)sramBuffer[(startIdx2 + 1) & SRAM_PITCH_BUF_MASK], sincPtr2[2], 
                                      (float)sramBuffer[(startIdx2 + 0) & SRAM_PITCH_BUF_MASK] * sincPtr2[3])));
         }
-
         int hannIdx1 = ((uint32_t)(T1 * hannIntMult) >> 16) & 4095;
         int hannIdx2 = ((uint32_t)(T2 * hannIntMult) >> 16) & 4095;
-
         float scale1 = hannLUT[hannIdx1] * 3.0517578125e-5f;
         float scale2 = hannLUT[hannIdx2] * 3.0517578125e-5f;
-
         return AntiDenormal(rawSum1 * scale1 + rawSum2 * scale2);
     }
 
@@ -144,34 +136,29 @@ public:
     {
         if (__builtin_expect(isnan(input_dc_offset) || isinf(input_dc_offset), 0)) input_dc_offset = 0.0f;
         if (__builtin_expect(isnan(inputEnvelope) || isinf(inputEnvelope), 0)) inputEnvelope = 0.0f;
-
         float pitchInc = 0.0f;
         if (__builtin_expect(fabsf(targetPitch - currentPitch) < 1e-6f, 1)) { 
             currentPitch = targetPitch; 
         } else { 
             pitchInc = (targetPitch - currentPitch) * (1.0f / (float)framesRead); 
         }
-
         float localPitch = currentPitch, localDC = input_dc_offset, localEnv = inputEnvelope;
         float localSwell = localSwellGain, localSmVol = smoothedVolGain;
-
         #pragma GCC unroll 4
         for(int i = 0; i < framesRead; i++) {
             localPitch += pitchInc;
-            float raw_in = ((float)(i2s_in_block[i * 2] & 0xFFFFFF00) * normFactor);
+            // Explicit (int32_t) cast prevents unsigned promotion from stripping sign bit on negative values
+            float raw_in = ((float)(int32_t)(i2s_in_block[i * 2] & 0xFFFFFF00) * normFactor);
             localDC = AntiDenormal(__builtin_fmaf(raw_in, dc_alpha, localDC * (1.0f - dc_alpha)));
             float inSample = raw_in - localDC;
             localEnv = AntiDenormal(__builtin_fmaf(fabsf(inSample), envAttack, __builtin_fmaf(localEnv, envRetain, 1e-9f)));
-
             FX_Swell::process(swellActive, localEnv, p_sw_thr, p_sw_att, p_sw_rel, srScale, localSwell);
-
             localSmVol = __builtin_fmaf(localVolGain, vol_alpha, __builtin_fmaf(localSmVol, (1.0f - vol_alpha), 1e-9f));
             envBuf[i] = localEnv; 
             masterGainBuf[i] = localSwell * localSmVol;
             inBuf[i] = inSample; 
             fzOutBuf[i] = 0.0f;
         }
-
         currentPitch = localPitch; 
         input_dc_offset = localDC; 
         inputEnvelope = localEnv;
@@ -189,7 +176,6 @@ public:
         float& peakInputVal, float& peakOutputVal) 
     {
         float localPeakIn = peakInputVal, localPeakOut = peakOutputVal;
-
         #pragma GCC ivdep
         #pragma GCC unroll 4
         for(int i = 0; i < framesRead; i++) {
@@ -203,23 +189,18 @@ public:
                 sMix = __builtin_fmaf(padFilterBuf[i], g_pad, sMix);
                 sMix = __builtin_fmaf(fzOutBuf[i], g_frz, sMix);
                 sMix = __builtin_fmaf(fbOutBuf[i], g_fb, sMix);
-
                 float x = __builtin_fmaxf(-1.15f, __builtin_fminf(sMix * 0.85f, 1.15f));
                 sMix = __builtin_fmaf(1.5f, x, -0.5f * x * x * x);
             }
-
             sMix *= masterGainBuf[i];
             sMixBuf[i] = sMix;
-
             float abs_in = fabsf(inBuf[i]), abs_out = fabsf(sMix);
             if(__builtin_expect(abs_in > localPeakIn, 0)) localPeakIn = abs_in;
             if(__builtin_expect(abs_out > localPeakOut, 0)) localPeakOut = abs_out;
-
             int32_t finalOut = (int32_t)(__builtin_fmaxf(-0.999f, __builtin_fminf(sMix, 0.999f)) * 2147483520.0f) & 0xFFFFFF00;
             i2s_out_block[i * 2]     = finalOut; 
             i2s_out_block[i * 2 + 1] = finalOut;
         }
-
         peakInputVal = localPeakIn; 
         peakOutputVal = localPeakOut;
     }

@@ -20,7 +20,7 @@ extern bool showBleWarning;
 // 1 = UART Debugging on GPIO 17 & 18 (I2S Disabled on those pins)
 // 0 = Original I2S DAC/ADC mode on GPIO 17 & 18 (UART Logging Disabled)
 // =========================================================================
-#define ENABLE_SERIAL_DEBUG 1
+#define ENABLE_SERIAL_DEBUG 0
 
 class BoardHAL {
 public:

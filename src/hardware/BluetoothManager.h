@@ -223,7 +223,7 @@ public:
         NimBLEDevice::init("Whammy_S3");
         
         // 0 dBm to prevent battery rail voltage drops
-        NimBLEDevice::setPower(ESP_PWR_LVL_N0);
+        NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
         strlcpy(bleInitStep, "2: createServer()", sizeof(bleInitStep));
         pServer = NimBLEDevice::createServer();

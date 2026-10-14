@@ -1,7 +1,9 @@
 #pragma once
+
 #include "SystemState.h"
 #include "LUTManager.h"
 #include "SpinlockGuard.h"
+#include "MidiRouter.h"
 
 static void IRAM_ATTR LUTUpdateTask(void * pvParameters) {
     for(;;) {
@@ -21,6 +23,7 @@ static void IRAM_ATTR LUTUpdateTask(void * pvParameters) {
         if (asyncLutUpdateRequested.exchange(false, std::memory_order_acq_rel)) {
             DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
             float safeEffectMemory[10];
+
             {
                 CriticalSectionGuard lock(MidiRouter::paramMux);
                 for(int i=0; i<10; i++) safeEffectMemory[i] = effectMemory[i];
@@ -38,6 +41,7 @@ static void IRAM_ATTR LUTUpdateTask(void * pvParameters) {
             activePitchLUT.store(targetLUT, std::memory_order_release);
             pitchShiftFactor.store(targetLUT[constrain(lastActivePedal, 0, 16383)], std::memory_order_release);
         }
+
         vTaskDelay(pdMS_TO_TICKS(15));
     }
 }

@@ -1,6 +1,8 @@
 #pragma once
+
 #include "SystemState.h"
 #include "SystemActions.h"
+#include "MidiRouter.h"
 
 class InputManager {
 public:
@@ -35,34 +37,34 @@ public:
                         if (!isKnobEditMode) {
                             showKnobModeScreen = true; // Show the green "KNOB MODE / Rebooting..." screen
                             
-                            BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11, 
-                                               ui_audio_level.load(std::memory_order_acquire), 
-                                               ui_output_level.load(std::memory_order_acquire), 
-                                               core0_dsp_load.load(std::memory_order_relaxed), 
-                                               core1_ctrl_load.load(std::memory_order_relaxed), 
-                                               currentSampleRate.load(std::memory_order_acquire), 
-                                               max_loop_latency_ms.exchange(0, std::memory_order_relaxed), 
-                                               audio_underflow_count.load(std::memory_order_relaxed), 
-                                               watermarkVal, currentBtState, latestBat, 
-                                               isMonoPolyActive.load(std::memory_order_acquire));
-                                               
-                            vTaskDelay(pdMS_TO_TICKS(150));
+                            BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
+                                                ui_audio_level.load(std::memory_order_acquire),
+                                                ui_output_level.load(std::memory_order_acquire),
+                                                core0_dsp_load.load(std::memory_order_relaxed),
+                                                core1_ctrl_load.load(std::memory_order_relaxed),
+                                                currentSampleRate.load(std::memory_order_acquire),
+                                                max_loop_latency_ms.exchange(0, std::memory_order_relaxed),
+                                                audio_underflow_count.load(std::memory_order_relaxed),
+                                                watermarkVal, currentBtState, latestBat,
+                                                isMonoPolyActive.load(std::memory_order_acquire));
                             
+                            vTaskDelay(pdMS_TO_TICKS(150));
+                        
                         // If currently in Knob Mode (true), we want to switch TO BLE Mode
                         } else {
                             showSavingScreen = true; // Show the blue "ENABLING BLE / Rebooting..." screen
                             
-                            BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11, 
-                                               ui_audio_level.load(std::memory_order_acquire), 
-                                               ui_output_level.load(std::memory_order_acquire), 
-                                               core0_dsp_load.load(std::memory_order_relaxed), 
-                                               core1_ctrl_load.load(std::memory_order_relaxed), 
-                                               currentSampleRate.load(std::memory_order_acquire), 
-                                               max_loop_latency_ms.exchange(0, std::memory_order_relaxed), 
-                                               audio_underflow_count.load(std::memory_order_relaxed), 
-                                               watermarkVal, currentBtState, latestBat, 
-                                               isMonoPolyActive.load(std::memory_order_acquire));
-                                               
+                            BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
+                                                ui_audio_level.load(std::memory_order_acquire),
+                                                ui_output_level.load(std::memory_order_acquire),
+                                                core0_dsp_load.load(std::memory_order_relaxed),
+                                                core1_ctrl_load.load(std::memory_order_relaxed),
+                                                currentSampleRate.load(std::memory_order_acquire),
+                                                max_loop_latency_ms.exchange(0, std::memory_order_relaxed),
+                                                audio_underflow_count.load(std::memory_order_relaxed),
+                                                watermarkVal, currentBtState, latestBat,
+                                                isMonoPolyActive.load(std::memory_order_acquire));
+                            
                             vTaskDelay(pdMS_TO_TICKS(150));
                             
                             // Safe park DSP before saving settings to prevent corruption
@@ -83,12 +85,12 @@ public:
                             if(activeDSP->fb) fxStates|=(1<<2); if(activeDSP->hr) fxStates|=(1<<3); 
                             if(activeDSP->cp) fxStates|=(1<<4); if(activeDSP->sy) fxStates|=(1<<5); 
                             if(activeDSP->pd) fxStates|=(1<<6); if(activeDSP->ch) fxStates|=(1<<7); 
-                            if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9);
+                            if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9); 
                             
-                            settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, 
-                                             constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, 
-                                             isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), 
-                                             &cs, sizeof(AppSettings));
+                            settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode,
+                                              constrain(activeDSP->fbIdx,0,4), isPB2WiperMode,
+                                              isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire),
+                                              &cs, sizeof(AppSettings));
                         }
                         
                         // FLIP THE SAVED NVS STATE

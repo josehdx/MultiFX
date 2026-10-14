@@ -1,5 +1,5 @@
-#ifndef MIDI_ROUTER_H
-#define MIDI_ROUTER_H
+#pragma once
+
 #include <Arduino.h>
 #include <atomic>
 #include "freertos/FreeRTOS.h"
@@ -32,10 +32,12 @@ struct MidiAction {
 class MidiRouter {
 public:
     inline static portMUX_TYPE paramMux = portMUX_INITIALIZER_UNLOCKED;
+
     static inline MidiAction parseMessage(uint8_t data1, uint8_t data2) {
         MidiAction action;
         action.cc = data1;
         action.val = data2;
+
         switch (data1) {
             case 0: action.event = MidiEvent::PREV_MODE; break;
             case 1: action.event = MidiEvent::NEXT_MODE; break;
@@ -68,6 +70,7 @@ public:
         }
         return action;
     }
+
     static inline void updateParameter(
         uint8_t cc, 
         uint8_t val, 
@@ -78,10 +81,11 @@ public:
         volatile bool& dspNeedsCommit, 
         std::atomic<int>& feedbackIntervalIdx) 
     {
-        int paramIdx = cc - 24; 
+        int paramIdx = cc - 24;
         if (paramIdx < 0 || paramIdx >= 5) return;
         
         float normalizedVal = (float)val / 127.0f;
+
         {
             CriticalSectionGuard lock(paramMux);
             fxParams[currentMode][paramIdx] = normalizedVal;
@@ -91,8 +95,8 @@ public:
                 feedbackIntervalIdx.store(fbIdx, std::memory_order_release);
             }
         }
+
         lutNeedsUpdate = true;
         dspNeedsCommit = true;
     }
 };
-#endif

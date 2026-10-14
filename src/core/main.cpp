@@ -14,85 +14,73 @@
 #include "TelemetryManager.h"
 #include "InputManager.h"
 
-// Instantiate DisplayManager when building for LilyGO
 #if defined(TARGET_LILYGO)
 #include "DisplayManager.h"
 DisplayManager displayManager;
 #endif
 
+void dispatchBleMidi(uint8_t header, uint8_t data1, uint8_t data2) {
+    ChannelMessage cm(MIDIMessage(header, data1, data2, Cable_1));
+    channelMessageCallback(cm);
+}
+
 void setup() {
-    // Silence harmless task_wdt reset warnings during high-load stress testing
     esp_log_level_set("task_wdt", ESP_LOG_NONE);
     
+#if defined(TARGET_LILYGO)
+    // Critical: Power on LilyGO peripheral & LCD rail immediately for battery boot
+    pinMode(15, OUTPUT);
+    digitalWrite(15, HIGH);
+#endif
+
     Serial.begin(115200);
     Serial0.begin(115200);
     BoardHAL::init();
     
-    #if defined(TARGET_LILYGO)
-    displayManager.begin();
-    #endif
-    
-    Serial.println("\n--- HARDWARE SYSTEM INITIALIZED ---");
-    Serial.print("Firmware Version: ");
-    Serial.println(FW_VERSION);
-    
-    Serial0.println("\n--- HARDWARE UART0 INITIALIZED ---");
-    Serial0.print("Firmware Version: ");
-    Serial0.println(FW_VERSION);
-
-    // 1. Run OTA check BEFORE USB MSC mounts
     FirmwareManager::checkAndApplyUpdate();
 
-    // 2. Complete system boot sequence
     SystemBootloader::run();
 
-    // 3. Initialize USB Storage AFTER tasks are spawned to prevent boot deadlocks
+#if defined(TARGET_LILYGO)
+    displayManager.begin();
+#endif
+
     USBMscManager::init();
 }
 
 void loop() {
     Control_Surface.loop();
 
-    // 2. Fetch raw ADC values from hardware DMA (when stress tester is disabled)
+#if !defined(FW_MODE_KNOBS_ONLY)
+    BluetoothManager::process();
+#endif
+
 #if !ENABLE_STRESS_TESTER
     BoardHAL::fetchADC(multifx_adc_handle, isAdcPaused, latestPB1, latestPB2, latestPB3, latestPar1, latestBat);
 #endif
 
-    // 3. Bluetooth Connection Monitoring & Supervision Timeout Control
     bool btConnected = false;
 #if !defined(FW_MODE_KNOBS_ONLY)
-    if (btmidi) btConnected = btmidi->isConnected();
-    
-    // Single static state tracker for BLE status
-    static bool lastBtConnected = false;
-    if (btConnected && !lastBtConnected) {
-        snprintf(bleEventDebug, sizeof(bleEventDebug), "BLE: CONNECTED");
-        BluetoothManager::tightenBLETimeout();
-    } else if (!btConnected && lastBtConnected) {
-        snprintf(bleEventDebug, sizeof(bleEventDebug), "BLE: DISCONNECTED (TIMEOUT/DROP)");
-        BluetoothManager::forceAdvertising();
-    }
-    lastBtConnected = btConnected;
+    btConnected = BluetoothManager::isMvaveConnected || BluetoothManager::isHostConnected;
 #endif
 
-    // 4. Map raw ADC / Stress-test values through PedalManager calibration & process GPIO buttons
     InputManager::processInputs(btConnected);
     InputManager::processPedals();
 
-    // 5. Commit pending DSP state changes (syncs MonoPoly/Whammy state overrides)
     if (dspNeedsCommit) {
         if (commitDSPState()) {
             dspNeedsCommit = false;
         }
     }
 
-    // 6. Update LilyGO TFT display if enabled
     DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
     if (activeDSP) {
         uint32_t watermarkVal = 0;
 #ifdef ENABLE_ADVANCED_TELEMETRY
         watermarkVal = lut_stack_watermark.load(std::memory_order_relaxed);
 #endif
+
+#if defined(TARGET_LILYGO)
         BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
                             ui_audio_level.load(std::memory_order_acquire),
                             ui_output_level.load(std::memory_order_acquire),
@@ -103,38 +91,34 @@ void loop() {
                             audio_underflow_count.load(std::memory_order_relaxed),
                             watermarkVal, btConnected, latestBat,
                             isMonoPolyActive.load(std::memory_order_acquire));
+#endif
 
-        // Output periodic serial telemetry
         TelemetryManager::report(activeDSP);
     }
 
-    // 7. Auto-save settings to NVS
-    if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) { 
+    if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) {
         dsp_is_paused.store(true, std::memory_order_release);
         while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
         
         AppSettings currentSettings;
         memset(&currentSettings, 0, sizeof(AppSettings));
         
-        for(int i = 0; i < 10; i++) { 
-             currentSettings.fxMem[i] = effectMemory[i]; 
-             for(int p = 0; p < 5; p++) {
-                currentSettings.params[i][p] = fxParams[i][p]; 
-             }
+        for(int i = 0; i < 10; i++) {
+            currentSettings.fxMem[i] = effectMemory[i];
+            for(int p = 0; p < 5; p++) {
+                currentSettings.params[i][p] = fxParams[i][p];
+            }
         }
         
         preferences.putBytes("dspData", &currentSettings, sizeof(AppSettings));
         settingsNeedSaving = false;
-        Serial0.println("[SYSTEM] Settings auto-saved to NVS.");
         
         dsp_is_paused.store(false, std::memory_order_release);
         if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
         if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
     }
 
-    // 8. Panic reset handling
     if (panicResetRequested.load(std::memory_order_acquire)) {
-        Serial0.println("[SYSTEM] Executing Panic Reset...");
         panicResetRequested.store(false, std::memory_order_release);
     }
     

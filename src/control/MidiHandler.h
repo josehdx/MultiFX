@@ -1,15 +1,17 @@
 #pragma once
+
 #include "SystemState.h"
 #include "SystemActions.h"
+#include "MidiRouter.h"
 
 inline char lastMidiDebug[64] = "MIDI: WAITING FOR PACKET...";
 
 inline bool channelMessageCallback(ChannelMessage cm) {
     lastActivityTime = millis();
     
-    // 1. RAW MIDI LOGGER
+    // 1. RAW MIDI LOGGER: Mirror ONLY to Hardware UART0 to prevent CDC fallback duplicates
     snprintf(lastMidiDebug, sizeof(lastMidiDebug), "RX -> H:0x%02X D1:%03d D2:%03d", cm.header, cm.data1, cm.data2);
-    Serial0.println(lastMidiDebug);
+    Serial0.println(lastMidiDebug); 
 
     // 2. STRICT FILTER: Allow CC (0xB0) on Channel 1
     if (cm.header != 0xB0) return false;
@@ -21,10 +23,15 @@ inline bool channelMessageCallback(ChannelMessage cm) {
     
     switch (action.event) {
         case MidiEvent::EXPRESSION_UPDATE:
-            currentCC11 = action.rawValue; currentPB3 = action.rawValue; lastActivePedal = action.rawValue;
+            currentCC11 = action.rawValue; 
+            currentPB3 = action.rawValue; 
+            lastActivePedal = action.rawValue;
+
             pedals.updateLastMidiC();
+
             if (isVolumeMode) {
-                volumePedalGain = (float)action.rawValue / 16383.0f; dspNeedsCommit = true;
+                volumePedalGain = (float)action.rawValue / 16383.0f; 
+                dspNeedsCommit = true;
                 Control_Surface.sendControlChange({19, Channel_1}, action.val);
             } else {
                 if (!asyncLutUpdateRequested.load(std::memory_order_acquire)) {
@@ -37,7 +44,8 @@ inline bool channelMessageCallback(ChannelMessage cm) {
         case MidiEvent::KNOB_UPDATE: {
             CriticalSectionGuard lock(MidiRouter::paramMux);
             MidiRouter::updateParameter(action.cc, action.val, currentMode, effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
-            settingsNeedSaving = true; lastParameterChangeTime = millis();
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
             break;
         }
 
@@ -58,7 +66,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             break;
 
         case MidiEvent::SR_TOGGLE: 
-            // FIX: Execute the sample rate reconfiguration directly
             toggleSampleRate(); 
             break;
 
@@ -71,16 +78,24 @@ inline bool channelMessageCallback(ChannelMessage cm) {
         case MidiEvent::VOL_MODE_TOGGLE:
             isVolumeMode = !isVolumeMode;
             if (!isVolumeMode) {
-                volumePedalGain = 1.0f; pedals.lockPB3Whammy(); currentPB3 = 8192; lastActivePedal = 8192;
+                volumePedalGain = 1.0f; 
+                pedals.lockPB3Whammy(); 
+                currentPB3 = 8192; 
+                lastActivePedal = 8192;
                 Control_Surface.sendPitchBend(Channel_3, 8192);
             } else {
-                pedals.lockPB3Volume(); lastActivePedal = 8192; volumePedalGain = (float)currentPB3 / 16383.0f;
+                pedals.lockPB3Volume(); 
+                lastActivePedal = 8192; 
+                volumePedalGain = (float)currentPB3 / 16383.0f;
             }
+
             if (!asyncLutUpdateRequested.load(std::memory_order_acquire)) {
                 float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release);
             }
-            dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
+            dspNeedsCommit = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
             break;
 
         case MidiEvent::TOGGLE_EFFECT:
@@ -89,6 +104,7 @@ inline bool channelMessageCallback(ChannelMessage cm) {
                 isMonoPolyActive.store(newState, std::memory_order_release);
                 if (newState) isWhammyActive = false;
             }
+
             if (action.targetEffect == 1) isFrozen = !isFrozen;
             else if (action.targetEffect == 2) isFeedbackActive = !isFeedbackActive;
             else if (action.targetEffect == 3) isHarmonizerMode = !isHarmonizerMode;
@@ -103,7 +119,10 @@ inline bool channelMessageCallback(ChannelMessage cm) {
                 isWhammyActive = !isWhammyActive;
                 if (currentMode == 4 && isCapoMode) lutNeedsUpdate = true;
             }
-            dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
+
+            dspNeedsCommit = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
             break;
 
         case MidiEvent::STEP_PARAM_UP:
@@ -120,11 +139,16 @@ inline bool channelMessageCallback(ChannelMessage cm) {
                     effectMemory[currentMode] = constrain(effectMemory[currentMode] + step, -24.0f, 24.0f);
                 }
             }
-            lutNeedsUpdate = true; dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
+            lutNeedsUpdate = true; 
+            dspNeedsCommit = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
             break;
         }
 
-        case MidiEvent::NONE: break;
+        case MidiEvent::NONE: 
+            break;
     }
+
     return false;
 }

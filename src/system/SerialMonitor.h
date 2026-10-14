@@ -3,21 +3,35 @@
 
 #include <Arduino.h>
 
+extern char lastMidiDebug[64];
+
 struct TelemetryData {
     float dspCoreLoad;
     float ctrlCoreLoad;
     uint32_t sampleRate;
     int latencyMode;
+
     float batVoltage;
     int batPercent;
     bool isCharging;
+
     bool bleConnected;
+    bool bleHostConnected;
+    bool blePedalConnected;
+    char bleHostStatus[16];
+    char blePedalStatus[16];
+    char bleTarget[32];
+    char bleLastSeen[32];
+    uint32_t blePackets;
+
     int activeMode;
-    bool isMonoPolyActive; // Added flag for MonoPoly override state
-    int monoPolyAlgo;      // Added algorithm index
+    bool isMonoPolyActive;
+    int monoPolyAlgo;
     bool fxStates[10];
+
     uint16_t pb1, pb2, pb3, cc11;
     float inMeter, outMeter;
+
     uint32_t audioUnderflows;
     uint32_t dspStackWatermark;
     uint32_t peakLoopLatency;
@@ -27,12 +41,27 @@ struct TelemetryData {
 class SerialMonitor {
 private:
     unsigned long lastPrintTime = 0;
-    const unsigned long PRINT_INTERVAL_MS = 500; // 0.5-second interval
+    const unsigned long PRINT_INTERVAL_MS = 1000;
+
     const char* EFFECT_NAMES[10] = {"WHAMMY", "FREEZE", "FEEDBACK", "HARMONY", "CAPO", "SYNTH", "PAD", "CHORUS", "SWELL", "VIBRATO"};
     const char* MONO_ALGOS[5] = {"TD-PSOLA", "YIN SYNTH", "ECKF", "VAR DELAY", "VOCODER"};
 
+    void dualPrintf(const char* fmt, ...) {
+        char buf[256];
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, args);
+        va_end(args);
+        
+        Serial0.print(buf); 
+    }
+
+    void dualPrintln(const char* str) {
+        Serial0.println(str); 
+    }
+
 public:
-    void printMetrics(const TelemetryData& data) {
+    void printMetrics(const TelemetryData& data, const char* bleInitStep) {
         if (millis() - lastPrintTime >= PRINT_INTERVAL_MS) {
             lastPrintTime = millis();
             
@@ -50,39 +79,43 @@ public:
             }
             if (count == 0) strcpy(activeFxStr, "ALL BYPASSED");
 
-            // Output to Native USB CDC
-            Serial.println("================ TELEMETRY DEBUGGER ================");
-            Serial.printf("DSP Core 0 Load  : %d%%\n", (int)data.dspCoreLoad);
-            Serial.printf("Ctrl Core 1 Load : %d%%\n", (int)data.ctrlCoreLoad);
-            Serial.printf("Internal SRAM    : %luK Free\n", freeSRAM);
-            Serial.printf("External PSRAM   : %luK Free\n", freePSRAM);
-            Serial.printf("Sample Rate      : %lu Hz\n", data.sampleRate);
-            Serial.printf("Latency Mode     : %d\n", data.latencyMode);
+            dualPrintln("\n================ TELEMETRY DEBUGGER ================");
+            dualPrintf("DSP Core 0 Load  : %d%%\n", (int)data.dspCoreLoad);
+            dualPrintf("Ctrl Core 1 Load : %d%%\n", (int)data.ctrlCoreLoad);
+            dualPrintf("Internal SRAM    : %luK Free\n", freeSRAM);
+            dualPrintf("External PSRAM   : %luK Free\n", freePSRAM);
+            dualPrintf("Sample Rate      : %lu Hz\n", data.sampleRate);
+            dualPrintf("Latency Mode     : %d\n", data.latencyMode);
             
-            Serial.printf("Battery State    : %.2fV (%d%%) - Charging: %s\n", 
-                  data.batVoltage, data.batPercent, data.isCharging ? "YES" : "NO");
-            Serial.printf("BLE MIDI Conn    : %s\n", data.bleConnected ? "CONNECTED" : "WAITING");
+            dualPrintf("Battery State    : %.2fV (%d%%) - Charging: %s\n", 
+                        data.batVoltage, data.batPercent, data.isCharging ? "YES" : "NO");
 
-            // Format Mode String based on MonoPoly Override State
+            dualPrintln("----------- DUAL-ROLE BLE TELEMETRY -----------");
+            dualPrintf("Init Sequence    : %s\n", bleInitStep);
+            dualPrintf("Host (Mac/iOS)   : %s\n", data.bleHostConnected ? "CONNECTED" : "WAITING");
+            dualPrintf("Pedal (M-Vave)   : %s\n", data.blePedalConnected ? "CONNECTED" : "WAITING");
+            dualPrintf("Total Packets    : %lu\n", data.blePackets);
+            dualPrintf("Target Pedal     : %s\n", data.bleTarget[0] ? data.bleTarget : "NONE");
+            dualPrintf("Last Scanned BLE : %s\n", data.bleLastSeen[0] ? data.bleLastSeen : "WAITING...");
+            dualPrintf("Last MIDI Packet : %s\n", lastMidiDebug);
+
+            dualPrintln("-------------- AUDIO & DSP ENGINE -------------");
             if (data.isMonoPolyActive) {
                 int algo = constrain(data.monoPolyAlgo, 0, 4);
-                Serial.printf("Active Mode      : MONOPOLY [%s] (Override)\n", MONO_ALGOS[algo]);
+                dualPrintf("Active Mode      : MONOPOLY [%s] (Override)\n", MONO_ALGOS[algo]);
             } else {
-                Serial.printf("Active Mode      : %s (%d)\n", 
-                      EFFECT_NAMES[data.activeMode % 10], data.activeMode);
+                dualPrintf("Active Mode      : %s (%d)\n", EFFECT_NAMES[data.activeMode % 10], data.activeMode);
             }
             
-            Serial.printf("Active Effects   : %s\n", activeFxStr);
-            Serial.printf("Pedal Vals       : PB1:%d | PB2:%d | PB3:%d | CC11:%d\n", 
-                  data.pb1, data.pb2, data.pb3, data.cc11);
-            Serial.printf("Audio Meters     : IN: %.3f | OUT: %.3f\n", 
-                  data.inMeter, data.outMeter);
-                  
-            Serial.println("--- SYSTEM STARVATION & DIAGNOSTICS ---");
-            Serial.printf("Audio Underflows : %lu\n", data.audioUnderflows);
-            Serial.printf("DSP Min Stack RAM: %lu Bytes\n", data.dspStackWatermark);
-            Serial.printf("Peak Loop Latency: %lu ms\n", data.peakLoopLatency);
-            Serial.printf("DMA Transfers    : %lu\n\n", data.dmaTransfers);
+            dualPrintf("Active Effects   : %s\n", activeFxStr);
+            dualPrintf("Pedal Vals       : PB1:%d | PB2:%d | PB3:%d | CC11:%d\n", 
+                        data.pb1, data.pb2, data.pb3, data.cc11);
+            dualPrintf("Audio Meters     : IN: %.3f | OUT: %.3f\n", data.inMeter, data.outMeter);
+
+            dualPrintf("Audio Underflows : %lu\n", data.audioUnderflows);
+            dualPrintf("DSP Min Stack RAM: %lu Bytes\n", data.dspStackWatermark);
+            dualPrintf("Peak Loop Latency: %lu ms\n", data.peakLoopLatency);
+            dualPrintln("====================================================");
         }
     }
 };

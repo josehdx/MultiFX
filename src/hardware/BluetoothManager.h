@@ -112,7 +112,7 @@ public:
             strlcpy(blePedalStatusStr, "CONN", sizeof(blePedalStatusStr));
             snprintf(bleEventDebug, sizeof(bleEventDebug), "PEDAL LINKED!");
             snprintf(bleScanDebug, sizeof(bleScanDebug), "PEDAL: %s", bleTargetStr);
-            dualLog("\n[BLE SUCCESS] Connected to M-Vave Pedal!\n");
+            dualLog("\n[BLE SUCCESS] Connected to M-Vave Pedal (As Client)!\n");
         }
 
         void onDisconnect(NimBLEClient* client, int reason) override {
@@ -157,23 +157,44 @@ public:
 
     class ServerCallbacks : public NimBLEServerCallbacks {
         void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
-            isHostConnected = true;
-            strlcpy(bleHostStatusStr, "CONN", sizeof(bleHostStatusStr));
-            snprintf(bleEventDebug, sizeof(bleEventDebug), "MAC: CONNECTED!");
-            dualLog("\n[BLE SERVER] macOS / iOS Host connected!\n");
+            int count = server->getConnectedCount();
             
-            // Allow Mac to negotiate connection interval before fetching data
+            if (count == 1) {
+                isHostConnected = true;
+                strlcpy(bleHostStatusStr, "CONN", sizeof(bleHostStatusStr));
+                snprintf(bleEventDebug, sizeof(bleEventDebug), "MAC: CONNECTED!");
+                dualLog("\n[BLE SERVER] Host 1 (Mac/iOS) connected!\n");
+            } else if (count >= 2) {
+                // The M-Vave connected to our Server acting as a Central
+                isMvaveConnected = true;
+                strlcpy(blePedalStatusStr, "CONN", sizeof(blePedalStatusStr));
+                snprintf(bleEventDebug, sizeof(bleEventDebug), "PEDAL (REV): CONN!");
+                dualLog("\n[BLE SERVER] Host 2 (M-Vave Central) connected!\n");
+            }
+            
+            // Allow Mac/Pedal to negotiate connection interval before fetching data
             server->updateConnParams(connInfo.getConnHandle(), 12, 24, 0, 400);
         }
 
         void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
-            isHostConnected = false;
-            strlcpy(bleHostStatusStr, "WAIT", sizeof(bleHostStatusStr));
+            int count = server->getConnectedCount();
+            
+            if (count == 0) {
+                isHostConnected = false;
+                isMvaveConnected = false;
+                strlcpy(bleHostStatusStr, "WAIT", sizeof(bleHostStatusStr));
+                strlcpy(blePedalStatusStr, "WAIT", sizeof(blePedalStatusStr));
+            } else if (count == 1) {
+                // One device dropped, one is still connected. 
+                // We drop the second "Pedal" flag but keep the Host flag active.
+                isMvaveConnected = false;
+                strlcpy(blePedalStatusStr, "WAIT", sizeof(blePedalStatusStr));
+            }
             
             int hciCode = reason & 0xFF;
             snprintf(bleLatchedDiscReason, sizeof(bleLatchedDiscReason), "M-DISC 0x%02X: %s", hciCode, getHciReasonString(hciCode));
             snprintf(bleEventDebug, sizeof(bleEventDebug), "MAC DISC (0x%02X)", hciCode);
-            dualLog("[BLE SERVER] Host disconnected (0x%02X - %s).\n", hciCode, getHciReasonString(hciCode));
+            dualLog("[BLE SERVER] Device disconnected (0x%02X - %s).\n", hciCode, getHciReasonString(hciCode));
             
             // Explicitly restart advertising immediately
             NimBLEDevice::getAdvertising()->start();
@@ -189,7 +210,7 @@ public:
             NimBLEAttValue val = pChar->getValue();
             if (val.length() >= 5) {
                 const uint8_t* pData = val.data();
-                dualLog("[MAC -> MIDI] 0x%02X %03d %03d\n", pData[2], pData[3], pData[4]);
+                dualLog("[MAC/PEDAL -> MIDI] 0x%02X %03d %03d\n", pData[2], pData[3], pData[4]);
                 dispatchBleMidi(pData[2], pData[3], pData[4]);
             }
         }
@@ -241,7 +262,7 @@ public:
         pScan->setScanCallbacks(&scanCB, true);
         pScan->setActiveScan(true);
         
-        // FIX: 40% Duty Cycle. Gives the ESP32 radio 60ms out of every 100ms 
+        // 40% Duty Cycle. Gives the ESP32 radio 60ms out of every 100ms 
         // to maintain the Mac's connection and broadcast the Server Advertisement.
         pScan->setInterval(100); 
         pScan->setWindow(40);   
@@ -320,6 +341,10 @@ public:
                 snprintf(bleEventDebug, sizeof(bleEventDebug), "PEDAL FAIL (0x%02X)", hciCode);
                 snprintf(bleLatchedDiscReason, sizeof(bleLatchedDiscReason), "FAIL 0x%02X: %s", hciCode, getHciReasonString(hciCode));
                 dualLog("[BLE ERROR] Connection failed (rc: 0x%02X - %s).\n", hciCode, getHciReasonString(hciCode));
+                
+                // Immediately destroy the client so NimBLE reclaims the connection slot
+                NimBLEDevice::deleteClient(pClient);
+                pClient = nullptr;
                 
                 hasTarget = false;
                 reconnectLockoutUntil = millis() + 1500;

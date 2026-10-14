@@ -11,20 +11,25 @@ extern char bleEventDebug[64];
 extern char bleScanDebug[64];
 extern char bleLatchedDiscReason[64];
 
-#define SHOW_TELEMETRY true
+#define SHOW_TELEMETRY false
 
 struct DisplayData {
     float batVoltage;
     int batPercent;
+
     bool bleConnected;
     bool bleHostConnected;
     bool blePedalConnected;
+
     int activeMode;
     bool fxStates[10];
+
     uint16_t pb1, pb2, pb3, cc11;
     float paramVals[5];
     const char* paramNames[5];
+
     float inMeter, outMeter;
+
     float dspCoreLoad, ctrlCoreLoad;
     uint32_t freeSRAM, freePSRAM;
     uint32_t sampleRate;
@@ -53,7 +58,6 @@ private:
     char cachedBleEvent[64] = "";
     char cachedBleScan[64] = "";
     char cachedDiscReason[64] = "";
-
     int lastRenderMode = -1;
     bool lastMonoPolyActive = false;
     int lastMonoPolyAlgo = -1;
@@ -69,7 +73,6 @@ private:
         {"ALGO", "WIN",  "Z-C",  "TRN",  "MIX"},
         {"ALGO", "FFT",  "PHS",  "TRN",  "MIX"}
     };
-
     const char* POLY_LABELS[10][5] = {
         {"DRY",  "WET",  "TOE",  "HEEL", "MODE"},
         {"APF",  "ATTK", "REL",  "FADE", "MIX"},
@@ -143,17 +146,19 @@ private:
         for (int i = 0; i < 10; i++) {
             if (d.fxStates[i] != cache.fxStates[i]) return true;
         }
+
         for (int i = 0; i < 5; i++) {
             if (fabsf(d.paramVals[i] - cache.paramVals[i]) > 0.005f) return true;
         }
+
         return false;
     }
 
 public:
     void begin() {
         pinMode(15, OUTPUT);
-        digitalWrite(15, HIGH);  
-        
+        digitalWrite(15, HIGH); 
+          
         pinMode(38, OUTPUT);
         digitalWrite(38, HIGH); 
         delay(150); 
@@ -161,6 +166,7 @@ public:
         tft.init();
         tft.setRotation(1);
         tft.fillScreen(TFT_BLACK);
+
         digitalWrite(38, HIGH); 
         
         spr.setColorDepth(16);
@@ -170,6 +176,7 @@ public:
         bgSpr.createSprite(320, 170);
         
         spr.setTextColor(TFT_WHITE, TFT_BLACK);
+
         lastRenderMode = -1;
         lastMonoPolyActive = false;
         lastMonoPolyAlgo = -1;
@@ -196,6 +203,7 @@ public:
 
         if (d.activeMode != lastRenderMode) {
             bgSpr.fillSprite(TFT_BLACK);
+
             bgSpr.setTextColor(TFT_WHITE, TFT_BLACK);
             
             bgSpr.drawFastHLine(0, 18, 320, TFT_WHITE);
@@ -251,23 +259,20 @@ public:
         }
         spr.drawString(headerBuf, 160, 2, 2);
         
-        spr.setTextColor(TFT_WHITE, TFT_BLACK);
         spr.setTextDatum(TR_DATUM);
         if (d.isKnobEditMode) {
             spr.setTextColor(TFT_RED, TFT_BLACK);
             spr.drawString("KNOB MODE", 318, 2, 2);
-            spr.setTextColor(TFT_WHITE, TFT_BLACK);
         } else {
-            char btStatusBuf[32];
-            snprintf(btStatusBuf, sizeof(btStatusBuf), "M:%s P:%s", 
-                     d.bleHostConnected ? "ON" : "--", 
-                     d.blePedalConnected ? "ON" : "--");
-            uint16_t col = (d.bleHostConnected && d.blePedalConnected) ? TFT_GREEN : 
-                           (d.bleHostConnected || d.blePedalConnected) ? TFT_CYAN : TFT_DARKGREY;
-            spr.setTextColor(col, TFT_BLACK);
-            spr.drawString(btStatusBuf, 318, 2, 2);
-            spr.setTextColor(TFT_WHITE, TFT_BLACK);
+            // BLE PC (Mac -> ESP32 Server connection)
+            spr.setTextColor(d.bleHostConnected ? TFT_GREEN : TFT_RED, TFT_BLACK);
+            spr.drawString("BLE PC", 318, 1, 1);
+            
+            // BLE client (ESP32 Client -> M-Vave Server connection)
+            spr.setTextColor(d.blePedalConnected ? TFT_GREEN : TFT_RED, TFT_BLACK);
+            spr.drawString("BLE client", 318, 10, 1);
         }
+        spr.setTextColor(TFT_WHITE, TFT_BLACK); // Reset to default
 
         int inH = constrain((int)(d.inMeter * 104.0f), 0, 104);
         int outH = constrain((int)(d.outMeter * 104.0f), 0, 104);
@@ -281,6 +286,7 @@ public:
         float cc11_norm = (float)d.cc11 / 16383.0f;
 
         char buf[16];
+
         snprintf(buf, sizeof(buf), "%d%%", (int)(pb1_norm * 100.0f));
         drawKnobDynamic(spr, pbCenters[0], 48, 14, pb1_norm, true, buf);
 
@@ -295,6 +301,7 @@ public:
 
         for (int i = 0; i < 5; i++) {
             snprintf(buf, sizeof(buf), "%.2f", d.paramVals[i]);
+
             bool isBip = (i == 0 && d.paramVals[i] < 0.0f) || (i == 0);
             float pNorm = isBip ? (d.paramVals[i] / 24.0f) : d.paramVals[i];
             
@@ -321,6 +328,7 @@ public:
             for (int k = 0; k < activeCount; k++) {
                 int fxIdx = activeIndices[k];
                 int bx = startX + (k * (badgeW + 4));
+
                 uint16_t bColor = (fxIdx == 0 && d.isMonoPolyActive) ? TFT_DARKGREY : TFT_BLUE;
                 
                 spr.fillRect(bx, 148, badgeW, 16, bColor);
@@ -331,33 +339,23 @@ public:
         }
 
         if (SHOW_TELEMETRY) {
-            spr.fillRect(20, 36, 280, 102, TFT_BLACK); 
-            spr.drawRect(20, 36, 280, 102, TFT_YELLOW);
+            // Shrunk background to only fit the two primary hardware metrics lines
+            spr.fillRect(20, 36, 280, 34, TFT_BLACK); 
+            spr.drawRect(20, 36, 280, 34, TFT_YELLOW);
             
             spr.setTextDatum(TL_DATUM);
             spr.setTextColor(TFT_YELLOW, TFT_BLACK);
             
-            char diagBuf1[128], diagBuf2[128], bleLine[128], evtLine[128], discLine[128];
+            char diagBuf1[128], diagBuf2[128];
             
             snprintf(diagBuf1, sizeof(diagBuf1), "CPU: %d%%  SRM:%dK  PSR:%dK  SR:%dkHz",
                      (int)d.dspCoreLoad, d.freeSRAM, d.freePSRAM, d.sampleRate / 1000);
                      
             snprintf(diagBuf2, sizeof(diagBuf2), "UDF: %d  LAT: %dms  STK: %dB",
                      d.underflows, d.peakLatency, d.stackWatermark);
-                     
-            snprintf(bleLine, sizeof(bleLine), "MAC:%s  PEDAL:%s",
-                     d.bleHostConnected ? "CONN" : "WAIT",
-                     d.blePedalConnected ? "CONN" : "WAIT");
-
-            snprintf(evtLine, sizeof(evtLine), "STATUS: %s", bleEventDebug);
-            snprintf(discLine, sizeof(discLine), "%s", bleLatchedDiscReason);
             
             spr.drawString(diagBuf1, 26, 40, 1);
             spr.drawString(diagBuf2, 26, 55, 1);
-            spr.drawString(bleLine, 26, 70, 1);
-            spr.drawString(evtLine, 26, 85, 1);
-            spr.drawString(discLine, 26, 100, 1);
-            spr.drawString(lastMidiDebug, 26, 115, 1);
         }
 
         if (d.showSavingScreen) {
@@ -387,7 +385,8 @@ public:
 
         spr.pushSprite(0, 0);
     }
-};
 
 #endif
+};
+
 #endif

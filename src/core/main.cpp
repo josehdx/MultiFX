@@ -24,9 +24,8 @@ void setup() {
     // Silence harmless task_wdt reset warnings during high-load stress testing
     esp_log_level_set("task_wdt", ESP_LOG_NONE);
     
-    Serial.begin(115200); 
+    Serial.begin(115200);
     Serial0.begin(115200);
-
     BoardHAL::init();
     
     #if defined(TARGET_LILYGO)
@@ -54,29 +53,40 @@ void setup() {
 void loop() {
     Control_Surface.loop();
 
-
-
     // 2. Fetch raw ADC values from hardware DMA (when stress tester is disabled)
 #if !ENABLE_STRESS_TESTER
     BoardHAL::fetchADC(multifx_adc_handle, isAdcPaused, latestPB1, latestPB2, latestPB3, latestPar1, latestBat);
 #endif
 
-    // 3. Map raw ADC / Stress-test values through PedalManager calibration & process GPIO buttons
+    // 3. Bluetooth Connection Monitoring & Supervision Timeout Control
     bool btConnected = false;
 #if !defined(FW_MODE_KNOBS_ONLY)
     if (btmidi) btConnected = btmidi->isConnected();
+    
+    // Single static state tracker for BLE status
+    static bool lastBtConnected = false;
+    if (btConnected && !lastBtConnected) {
+        snprintf(bleEventDebug, sizeof(bleEventDebug), "BLE: CONNECTED");
+        BluetoothManager::tightenBLETimeout();
+    } else if (!btConnected && lastBtConnected) {
+        snprintf(bleEventDebug, sizeof(bleEventDebug), "BLE: DISCONNECTED (TIMEOUT/DROP)");
+        BluetoothManager::forceAdvertising();
+    }
+    lastBtConnected = btConnected;
 #endif
+
+    // 4. Map raw ADC / Stress-test values through PedalManager calibration & process GPIO buttons
     InputManager::processInputs(btConnected);
     InputManager::processPedals();
 
-    // 4. Commit pending DSP state changes (syncs MonoPoly/Whammy state overrides)
+    // 5. Commit pending DSP state changes (syncs MonoPoly/Whammy state overrides)
     if (dspNeedsCommit) {
         if (commitDSPState()) {
             dspNeedsCommit = false;
         }
     }
 
-    // 5. Update LilyGO TFT display if enabled
+    // 6. Update LilyGO TFT display if enabled
     DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
     if (activeDSP) {
         uint32_t watermarkVal = 0;
@@ -93,24 +103,23 @@ void loop() {
                             audio_underflow_count.load(std::memory_order_relaxed),
                             watermarkVal, btConnected, latestBat,
                             isMonoPolyActive.load(std::memory_order_acquire));
-                            
-        // 6. Output periodic serial telemetry
+
+        // Output periodic serial telemetry
         TelemetryManager::report(activeDSP);
     }
 
     // 7. Auto-save settings to NVS
-    if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) {
-                 
+    if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) { 
         dsp_is_paused.store(true, std::memory_order_release);
         while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
         
         AppSettings currentSettings;
         memset(&currentSettings, 0, sizeof(AppSettings));
         
-        for(int i = 0; i < 10; i++) {
-             currentSettings.fxMem[i] = effectMemory[i];
+        for(int i = 0; i < 10; i++) { 
+             currentSettings.fxMem[i] = effectMemory[i]; 
              for(int p = 0; p < 5; p++) {
-                currentSettings.params[i][p] = fxParams[i][p];
+                currentSettings.params[i][p] = fxParams[i][p]; 
              }
         }
         

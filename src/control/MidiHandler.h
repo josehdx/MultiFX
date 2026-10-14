@@ -2,11 +2,21 @@
 #include "SystemState.h"
 #include "SystemActions.h"
 
+inline char lastMidiDebug[64] = "MIDI: WAITING FOR PACKET...";
+
 inline bool channelMessageCallback(ChannelMessage cm) {
     lastActivityTime = millis();
+    
+    // 1. RAW MIDI LOGGER
+    snprintf(lastMidiDebug, sizeof(lastMidiDebug), "RX -> H:0x%02X D1:%03d D2:%03d", cm.header, cm.data1, cm.data2);
+    Serial0.println(lastMidiDebug);
+
+    // 2. STRICT FILTER: Allow CC (0xB0) on Channel 1
     if (cm.header != 0xB0) return false;
+
     MidiAction action = MidiRouter::parseMessage(cm.data1, cm.data2);
     if (action.event == MidiEvent::NONE) return false;
+
     int currentMode = activeEffectMode.load(std::memory_order_acquire);
     
     switch (action.event) {
@@ -23,18 +33,41 @@ inline bool channelMessageCallback(ChannelMessage cm) {
                 }
             }
             break;
+
         case MidiEvent::KNOB_UPDATE: {
             CriticalSectionGuard lock(MidiRouter::paramMux);
             MidiRouter::updateParameter(action.cc, action.val, currentMode, effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
             settingsNeedSaving = true; lastParameterChangeTime = millis();
             break;
         }
-        case MidiEvent::PREV_MODE: switchEffectMode(currentMode - 1); break;
-        case MidiEvent::NEXT_MODE: switchEffectMode(currentMode + 1); break;
-        case MidiEvent::LATENCY_CYCLE: cycleLatencyMode(); break;
-        case MidiEvent::PANIC_RESET: triggerPanicReset(); break;
-        case MidiEvent::SR_TOGGLE: sampleRateToggleRequested = true; break;
-        case MidiEvent::PB2_WIPER_TOGGLE: isPB2WiperMode = !isPB2WiperMode; dspNeedsCommit = true; pb2ToggleRequested = true; break;
+
+        case MidiEvent::PREV_MODE: 
+            switchEffectMode(currentMode - 1); 
+            break;
+
+        case MidiEvent::NEXT_MODE: 
+            switchEffectMode(currentMode + 1); 
+            break;
+
+        case MidiEvent::LATENCY_CYCLE: 
+            cycleLatencyMode(); 
+            break;
+
+        case MidiEvent::PANIC_RESET: 
+            triggerPanicReset(); 
+            break;
+
+        case MidiEvent::SR_TOGGLE: 
+            // FIX: Execute the sample rate reconfiguration directly
+            toggleSampleRate(); 
+            break;
+
+        case MidiEvent::PB2_WIPER_TOGGLE: 
+            isPB2WiperMode = !isPB2WiperMode; 
+            dspNeedsCommit = true; 
+            pb2ToggleRequested = true; 
+            break;
+
         case MidiEvent::VOL_MODE_TOGGLE:
             isVolumeMode = !isVolumeMode;
             if (!isVolumeMode) {
@@ -49,6 +82,7 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             }
             dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
             break;
+
         case MidiEvent::TOGGLE_EFFECT:
             if (action.targetEffect == 99) {
                 bool newState = !isMonoPolyActive.load(std::memory_order_acquire);
@@ -64,12 +98,14 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             else if (action.targetEffect == 7) isChorusMode = !isChorusMode;
             else if (action.targetEffect == 8) isSwellMode = !isSwellMode;
             else if (action.targetEffect == 9) isVibratoMode = !isVibratoMode;
+            
             if (currentMode == action.targetEffect) {
                 isWhammyActive = !isWhammyActive;
                 if (currentMode == 4 && isCapoMode) lutNeedsUpdate = true;
             }
             dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
             break;
+
         case MidiEvent::STEP_PARAM_UP:
         case MidiEvent::STEP_PARAM_DOWN: {
             float step = (action.event == MidiEvent::STEP_PARAM_DOWN) ? -1.0f : 1.0f;
@@ -87,6 +123,7 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             lutNeedsUpdate = true; dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
             break;
         }
+
         case MidiEvent::NONE: break;
     }
     return false;

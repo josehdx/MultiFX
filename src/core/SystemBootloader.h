@@ -122,7 +122,7 @@ public:
         I2SManager::enableChannels(); 
         
         if (dspTaskStack != nullptr && dspTaskTCB != nullptr) { 
-             audioTaskHandle = xTaskCreateStaticPinnedToCore(AudioDSPTask, "DSP", 8192, NULL, configMAX_PRIORITIES - 1, dspTaskStack, dspTaskTCB, 0); 
+             audioTaskHandle = xTaskCreateStaticPinnedToCore(AudioDSPTask, "DSP", 8192, NULL, 20, dspTaskStack, dspTaskTCB, 0); 
              Serial0.println("           -> Audio DSP Task Spawned");
         } else { 
              Serial0.println("\n[FATAL ERROR] Audio Task allocation failed!");

@@ -6,9 +6,12 @@
 #include <TFT_eSPI.h>
 #include <Arduino.h>
 #include <math.h>
+extern char lastMidiDebug[64];
+extern char bleEventDebug[64];
 
 // Set to 'false' to hide the yellow telemetry overlay box
 #define SHOW_TELEMETRY true
+extern char lastMidiDebug[64];
 
 struct DisplayData {
     float batVoltage;
@@ -320,9 +323,9 @@ public:
 
         // --- 6. CENTER TELEMETRY OVERLAY ---
         if (SHOW_TELEMETRY) {
-            // Draws a floating black box in the exact middle of the screen
-            spr.fillRect(20, 50, 280, 60, TFT_BLACK); 
-            spr.drawRect(20, 50, 280, 60, TFT_YELLOW); 
+            // Expanded to 90px height to fit the BLE event logger
+            spr.fillRect(20, 40, 280, 90, TFT_BLACK); 
+            spr.drawRect(20, 40, 280, 90, TFT_YELLOW); 
             
             spr.setTextDatum(TL_DATUM);
             spr.setTextColor(TFT_YELLOW, TFT_BLACK); 
@@ -335,12 +338,14 @@ public:
             snprintf(diagBuf2, sizeof(diagBuf2), "UDF: %d  LAT: %dms  STK: %dB", 
                     d.underflows, d.peakLatency, d.stackWatermark);
                     
-            snprintf(debugBuf, sizeof(debugBuf), "DEBUG -> PB1:%d PB2:%d PB3:%d CC:%d", 
+            snprintf(debugBuf, sizeof(debugBuf), "HW -> PB1:%d PB2:%d PB3:%d CC:%d", 
                     d.pb1, d.pb2, d.pb3, d.cc11);
             
-            spr.drawString(diagBuf1, 26, 56, 1);
-            spr.drawString(diagBuf2, 26, 74, 1);
-            spr.drawString(debugBuf, 26, 92, 1);
+            spr.drawString(diagBuf1, 26, 46, 1);
+            spr.drawString(diagBuf2, 26, 61, 1);
+            spr.drawString(debugBuf, 26, 76, 1);
+            spr.drawString(lastMidiDebug, 26, 91, 1);
+            spr.drawString(bleEventDebug, 26, 106, 1);
         }
 
         // --- 7. WARNING OVERLAYS ---

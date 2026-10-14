@@ -64,6 +64,7 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
                     lastAckedDSP = activeDSP;
                     dspAckCommit.store(true, std::memory_order_release);
                 }
+                taskYIELD();
             } else {
 #ifdef ENABLE_ADVANCED_TELEMETRY
                 audio_underflow_count.fetch_add(1, std::memory_order_relaxed);

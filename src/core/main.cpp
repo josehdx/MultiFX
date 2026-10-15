@@ -2,7 +2,8 @@
 #include <Preferences.h>
 #include <Update.h>
 #include "esp_log.h"
-#define FW_VERSION "v5.00c"
+
+#define FW_VERSION "v5.00F"
 
 // Core System Includes
 #include "SystemState.h"
@@ -40,8 +41,10 @@ void setup() {
     // Check and apply OTA update with live TFT on-screen feedback
     FirmwareManager::checkAndApplyUpdate();
     
-    SystemBootloader::run();
+    // FIX: Initialize USB MSC before the Bootloader brings up the USB bus
     USBMscManager::init();
+    
+    SystemBootloader::run();
 }
 
 void loop() {
@@ -77,7 +80,6 @@ void loop() {
 #ifdef ENABLE_ADVANCED_TELEMETRY
         watermarkVal = lut_stack_watermark.load(std::memory_order_relaxed);
 #endif
-
 #if defined(TARGET_LILYGO)
         BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
                             ui_audio_level.load(std::memory_order_acquire),
@@ -90,7 +92,6 @@ void loop() {
                             watermarkVal, btConnected, latestBat,
                             isMonoPolyActive.load(std::memory_order_acquire));
 #endif
-
         TelemetryManager::report(activeDSP);
     }
 

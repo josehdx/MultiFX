@@ -1,4 +1,5 @@
 #pragma once
+
 #include <Arduino.h>
 #include "USB.h"
 #include "USBMSC.h"
@@ -26,12 +27,7 @@ private:
             Serial0.println("[USB] File copy in progress: Stopping DSP to protect flash...");
             dsp_is_paused.store(true, std::memory_order_release);
             
-            if (audioTaskHandle != NULL && lutTaskHandle != NULL) {
-                while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
-                    vTaskDelay(pdMS_TO_TICKS(1)); 
-                }
-            }
-            I2SManager::disableAndDestroyChannels();
+            // FIX: Removed blocking loop and I2S teardown to prevent USB deadlock
         }
     }
 
@@ -54,6 +50,7 @@ private:
             uint32_t cache_end = cache_start + 4096;
             uint32_t read_start = abs_offset;
             uint32_t read_end = abs_offset + bufsize;
+
             if (read_start < cache_end && read_end > cache_start) {
                 uint32_t overlap_start = max(read_start, cache_start);
                 uint32_t overlap_end = min(read_end, cache_end);
@@ -69,6 +66,7 @@ private:
     static int32_t write_cb(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
         if (!ffat_partition) return -1;
         uint32_t abs_offset = (lba * 4096) + offset;
+
         for (uint32_t i = 0; i < bufsize; ) {
             uint32_t current_addr = abs_offset + i;
             uint32_t sector = current_addr / 4096;
@@ -80,6 +78,7 @@ private:
                 msc_cache_sector = sector;
                 esp_partition_read(ffat_partition, sector * 4096, msc_cache, 4096);
             }
+
             memcpy(msc_cache + sec_offset, buffer + i, bytes_to_write);
             msc_cache_dirty = true;
             i += bytes_to_write;
@@ -141,18 +140,10 @@ public:
             
             if (dsp_is_paused.load(std::memory_order_acquire)) {
                 Serial0.println("[USB] File copy complete: Resuming DSP...");
-                I2SManager::initChannels(BoardHAL::getI2SConfig(currentSampleRate.load(std::memory_order_acquire)), HOP_SIZE);
-                I2SManager::enableChannels();
                 dsp_is_paused.store(false, std::memory_order_release);
                 
                 if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
                 if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
-                
-                if (audioTaskHandle != NULL && lutTaskHandle != NULL) {
-                    while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { 
-                        vTaskDelay(pdMS_TO_TICKS(1)); 
-                    }
-                }
             }
         }
     }

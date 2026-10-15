@@ -26,19 +26,26 @@ private:
     static void deleteFirmwareFileRaw() {
         const esp_partition_t* part = esp_partition_find_first(
             ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, "ffat");
+
         if (!part) return;
+
         uint8_t sectorBuf[4096];
         bool fileDeleted = false;
+
         uint32_t maxScanBytes = min((uint32_t)part->size, (uint32_t)(1024 * 1024));
+
         for (uint32_t offset = 0; offset < maxScanBytes; offset += 4096) {
             if (esp_partition_read(part, offset, sectorBuf, 4096) != ESP_OK) continue;
+
             bool sectorModified = false;
             for (int i = 0; i < 4096; i += 32) {
                 uint8_t firstByte = sectorBuf[i];
                 if (firstByte == 0x00) break;
                 if (firstByte == 0xE5) continue;
+
                 bool isTargetSFN = (memcmp(&sectorBuf[i], "FIRMWARE", 8) == 0) ||
                                    (memcmp(&sectorBuf[i], "FIRMWA~1", 8) == 0);
+
                 bool isTargetLFN = false;
                 if (sectorBuf[i + 11] == 0x0F) {
                     if ((sectorBuf[i + 1] == 'f' || sectorBuf[i + 1] == 'F') &&
@@ -48,17 +55,20 @@ private:
                         isTargetLFN = true;
                     }
                 }
+
                 if (isTargetSFN || isTargetLFN) {
                     sectorBuf[i] = 0xE5;
                     sectorModified = true;
                     fileDeleted = true;
                 }
             }
+
             if (sectorModified) {
                 esp_partition_erase_range(part, offset, 4096);
                 esp_partition_write(part, offset, sectorBuf, 4096);
             }
         }
+
         if (fileDeleted) {
             logOutput("[OTA] firmware.bin erased from storage.");
         }
@@ -66,13 +76,16 @@ private:
 
     static bool scanAndFlashRawPartition(const esp_partition_t* part) {
         logOutput("[OTA] Scanning partition sectors directly...", 0xFFE0);
+
         uint8_t sec[4096];
         uint32_t foundOffset = 0;
         bool found = false;
+
         uint32_t scanLimit = min((uint32_t)part->size, (uint32_t)(4 * 1024 * 1024));
 
         for (uint32_t off = 0; off < scanLimit; off += 4096) {
             if (esp_partition_read(part, off, sec, 4096) != ESP_OK) continue;
+
             // Check for ESP32-S3 app binary magic byte 0xE9 and descriptor magic 0xABCD5432
             if (sec[0] == 0xE9) {
                 uint32_t descMagic = *(uint32_t*)&sec[0x20];
@@ -119,10 +132,12 @@ private:
 
         size_t written = 0;
         int lastPct = -1;
+
         for (uint32_t off = foundOffset; off < foundOffset + binSize; off += 4096) {
             esp_partition_read(part, off, sec, 4096);
             Update.write(sec, 4096);
             written += 4096;
+
             int pct = (int)((written * 100) / binSize);
             if (pct != lastPct && pct % 10 == 0) {
                 lastPct = pct;
@@ -134,11 +149,16 @@ private:
 
         if (Update.end(true)) {
             logOutput("[OTA] Update complete! Rebooting...", 0x07E0);
+            
+            // Erase the first sector of the found firmware payload to destroy the 0xE9 magic byte
+            esp_partition_erase_range(part, foundOffset, 4096);
+            
             deleteFirmwareFileRaw();
             delay(1200);
             ESP.restart();
             return true;
         }
+
         return false;
     }
 
@@ -161,7 +181,7 @@ public:
 
         esp_vfs_fat_mount_config_t mount_config = {};
         mount_config.max_files = 4;
-        mount_config.format_if_mount_failed = false;
+        mount_config.format_if_mount_failed = true; // Auto-format enabled to prevent raw fallback loop
         mount_config.allocation_unit_size = 4096;
 
         // Try raw flash mount (without wear levelling)
@@ -214,6 +234,7 @@ public:
                 }
 
                 logOutput("[OTA] Flashing firmware to partition...", 0xFFE0);
+
                 fseek(updateFile, 0, SEEK_SET);
 
                 if (Update.begin(fileSize, U_FLASH)) {
@@ -225,8 +246,10 @@ public:
                         size_t bytesToRead = min((size_t)4096, fileSize - written);
                         size_t len = fread(buf, 1, bytesToRead, updateFile);
                         if (len == 0) break;
+
                         Update.write(buf, len);
                         written += len;
+
                         int pct = (int)((written * 100) / fileSize);
                         if (pct != lastPct && pct % 10 == 0) {
                             lastPct = pct;

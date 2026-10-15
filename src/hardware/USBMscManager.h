@@ -19,6 +19,9 @@ private:
     static inline bool msc_cache_dirty = false;
     static inline unsigned long msc_last_write_time = 0;
     
+    // Safety flag to prevent MSC from unpausing DSP if a different system triggered the pause
+    static inline bool msc_paused_dsp = false; 
+
     // Dedicated background worker handle
     static inline TaskHandle_t usbMscTaskHandle = NULL;
 
@@ -26,6 +29,7 @@ private:
         if (!dsp_is_paused.load(std::memory_order_acquire)) {
             Serial0.println("[USB] File copy in progress: Stopping DSP to protect flash...");
             dsp_is_paused.store(true, std::memory_order_release);
+            msc_paused_dsp = true;
         }
     }
 
@@ -89,6 +93,13 @@ private:
         flush_cb();
         if (!start) {
             Serial0.println("[USB] USB Storage safely ejected by host OS.");
+            // Only release DSP lock if USBMSC was the one that placed it
+            if (msc_paused_dsp) {
+                dsp_is_paused.store(false, std::memory_order_release);
+                msc_paused_dsp = false;
+                if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
+                if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
+            }
         }
         return true;
     }
@@ -101,8 +112,6 @@ private:
     }
 
 public:
-    // Programmatically generates a standard MBR + FAT12 structure on first boot.
-    // Handles any partition size (LilyGO 16MB or BananaPi 8MB) dynamically.
     static void ensureMBR() {
         if (!ffat_partition) return;
 
@@ -110,61 +119,55 @@ public:
         static uint8_t sec[4096];
         if (esp_partition_read(ffat_partition, 0, sec, SECTOR_SIZE) != ESP_OK) return;
 
-        // Check if Sector 0 has a valid MBR (signature 0x55AA and partition type 0x01 FAT12)
-        if (sec[510] == 0x55 && sec[511] == 0xAA && sec[446 + 4] == 0x01) {
-            return; // Valid MBR already provisioned
-        }
+        if (sec[510] == 0x55 && sec[511] == 0xAA && sec[446 + 4] == 0x01) return;
 
         Serial0.println("[USB] Provisioning FAT12 filesystem with MBR partition table...");
 
         uint32_t totalSectors = ffat_partition->size / SECTOR_SIZE;
-        uint32_t partSectors = totalSectors - 1; // Sector 0 is MBR; partition starts at Sector 1
+        uint32_t partSectors = totalSectors - 1; 
 
-        // 1. SECTOR 0: Master Boot Record (MBR)
         memset(sec, 0, SECTOR_SIZE);
-        uint8_t* p = &sec[446]; // Partition Entry 1
-        p[0] = 0x00;            // Status: non-bootable
-        p[1] = 0x01; p[2] = 0x01; p[3] = 0x00; // Starting CHS
-        p[4] = 0x01;            // Partition Type: 0x01 (FAT12)
-        p[5] = 0xFE; p[6] = 0xFF; p[7] = 0xFF; // Ending CHS
-        *(uint32_t*)&p[8]  = 1;           // Starting LBA: Sector 1
-        *(uint32_t*)&p[12] = partSectors; // Sector Count
+        uint8_t* p = &sec[446]; 
+        p[0] = 0x00;            
+        p[1] = 0x01; p[2] = 0x01; p[3] = 0x00; 
+        p[4] = 0x01;            
+        p[5] = 0xFE; p[6] = 0xFF; p[7] = 0xFF; 
+        *(uint32_t*)&p[8]  = 1;           
+        *(uint32_t*)&p[12] = partSectors; 
         sec[510] = 0x55;
         sec[511] = 0xAA;
 
         esp_partition_erase_range(ffat_partition, 0, SECTOR_SIZE);
         esp_partition_write(ffat_partition, 0, sec, SECTOR_SIZE);
 
-        // 2. SECTOR 1: FAT12 Volume Boot Record (BPB)
         memset(sec, 0, SECTOR_SIZE);
-        sec[0] = 0xEB; sec[1] = 0x3C; sec[2] = 0x90; // Jump boot
-        memcpy(&sec[3], "MSDOS5.0", 8);              // OEM Name
-        *(uint16_t*)&sec[11] = 4096;                 // Bytes per sector (4KB)
-        sec[13] = 1;                                 // Sectors per cluster (1 sector = 4KB)
-        *(uint16_t*)&sec[14] = 1;                    // Reserved sector count (Sector 1)
-        sec[16] = 2;                                 // Number of FATs
-        *(uint16_t*)&sec[17] = 512;                  // Root directory entries (512 * 32 = 16KB = 4 sectors)
-        *(uint16_t*)&sec[19] = (partSectors <= 65535) ? (uint16_t)partSectors : 0; // Total sectors (16-bit)
-        sec[21] = 0xF8;                              // Media descriptor: Fixed Disk
-        *(uint16_t*)&sec[22] = 1;                    // Sectors per FAT (1 sector covers up to 2730 FAT12 clusters)
-        *(uint16_t*)&sec[24] = 32;                   // Sectors per track
-        *(uint16_t*)&sec[26] = 16;                   // Number of heads
-        *(uint32_t*)&sec[28] = 1;                    // Hidden sectors (LBA Start = 1)
-        *(uint32_t*)&sec[32] = (partSectors > 65535) ? partSectors : 0; // Total sectors (32-bit)
-        sec[36] = 0x80;                              // Drive number
-        sec[38] = 0x29;                              // Extended boot signature
-        *(uint32_t*)&sec[39] = 0x12345678;           // Volume serial number
-        memcpy(&sec[43], "MULTIFX    ", 11);         // Volume label (11 characters)
-        memcpy(&sec[54], "FAT12   ", 8);             // Filesystem type
+        sec[0] = 0xEB; sec[1] = 0x3C; sec[2] = 0x90; 
+        memcpy(&sec[3], "MSDOS5.0", 8);              
+        *(uint16_t*)&sec[11] = 4096;                 
+        sec[13] = 1;                                 
+        *(uint16_t*)&sec[14] = 1;                    
+        sec[16] = 2;                                 
+        *(uint16_t*)&sec[17] = 512;                  
+        *(uint16_t*)&sec[19] = (partSectors <= 65535) ? (uint16_t)partSectors : 0; 
+        sec[21] = 0xF8;                              
+        *(uint16_t*)&sec[22] = 1;                    
+        *(uint16_t*)&sec[24] = 32;                   
+        *(uint16_t*)&sec[26] = 16;                   
+        *(uint32_t*)&sec[28] = 1;                    
+        *(uint32_t*)&sec[32] = (partSectors > 65535) ? partSectors : 0; 
+        sec[36] = 0x80;                              
+        sec[38] = 0x29;                              
+        *(uint32_t*)&sec[39] = 0x12345678;           
+        memcpy(&sec[43], "MULTIFX    ", 11);         
+        memcpy(&sec[54], "FAT12   ", 8);             
         sec[510] = 0x55;
         sec[511] = 0xAA;
 
         esp_partition_erase_range(ffat_partition, 1 * SECTOR_SIZE, SECTOR_SIZE);
         esp_partition_write(ffat_partition, 1 * SECTOR_SIZE, sec, SECTOR_SIZE);
 
-        // 3. SECTOR 2 & 3: FAT 1 and FAT 2 Tables
         memset(sec, 0, SECTOR_SIZE);
-        sec[0] = 0xF8; sec[1] = 0xFF; sec[2] = 0xFF; // FAT12 media descriptor & end-of-chain marks
+        sec[0] = 0xF8; sec[1] = 0xFF; sec[2] = 0xFF; 
 
         esp_partition_erase_range(ffat_partition, 2 * SECTOR_SIZE, SECTOR_SIZE);
         esp_partition_write(ffat_partition, 2 * SECTOR_SIZE, sec, SECTOR_SIZE);
@@ -172,7 +175,6 @@ public:
         esp_partition_erase_range(ffat_partition, 3 * SECTOR_SIZE, SECTOR_SIZE);
         esp_partition_write(ffat_partition, 3 * SECTOR_SIZE, sec, SECTOR_SIZE);
 
-        // 4. SECTORS 4 THROUGH 7: Root Directory Area (512 entries / 128 per sector = 4 sectors)
         memset(sec, 0, SECTOR_SIZE);
         for (int s = 4; s <= 7; s++) {
             esp_partition_erase_range(ffat_partition, s * SECTOR_SIZE, SECTOR_SIZE);
@@ -185,7 +187,6 @@ public:
     static void init() {
         ffat_partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, "ffat");
         if (ffat_partition) {
-            // Guarantee valid MBR and FAT12 tables exist prior to TinyUSB startup
             ensureMBR();
 
             uint32_t block_count = ffat_partition->size / 4096;
@@ -201,7 +202,6 @@ public:
             
             Serial0.println("[USB] Mass Storage Class (MSC) initialized with 4K Sectors.");
 
-            // Dedicated worker on Core 1 prevents USB operations from stalling DSP pipeline
             xTaskCreatePinnedToCore(
                 usbMscWorkerTask, 
                 "USB_MSC_Task", 
@@ -217,14 +217,24 @@ public:
     static void handleCacheFlush() {
         if (msc_cache_dirty && (millis() - msc_last_write_time > 2000)) {
             flush_cb();
+        }
+
+        // FIX: Resume DSP ONLY when:
+        //   1. MSC was the entity that placed the pause (msc_paused_dsp == true).
+        //   2. The cache has been fully flushed to flash (msc_cache_dirty == false).
+        //   3. Enough time has elapsed since the last write (debounce).
+        //
+        // Previously this fired as soon as the timeout elapsed regardless of
+        // msc_cache_dirty state, which caused it to race with setSampleRate():
+        // setSampleRate() parks the DSP, MSC prematurely unparks it mid-I2S-
+        // reconfiguration, and setSampleRate() spins forever in its ack-wait loop.
+        if (msc_paused_dsp && !msc_cache_dirty && (millis() - msc_last_write_time > 2000)) {
+            Serial0.println("[USB] File copy complete: Resuming DSP...");
+            dsp_is_paused.store(false, std::memory_order_release);
+            msc_paused_dsp = false;
             
-            if (dsp_is_paused.load(std::memory_order_acquire)) {
-                Serial0.println("[USB] File copy complete: Resuming DSP...");
-                dsp_is_paused.store(false, std::memory_order_release);
-                
-                if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
-                if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
-            }
+            if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
+            if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
         }
     }
 };

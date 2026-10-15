@@ -11,6 +11,7 @@ public:
         static bool gpio14LastState = HIGH, lastBootState = HIGH;
 
         bool reading = (REG_READ(GPIO_IN_REG) & (1 << BLE_TOGGLE_PIN)) != 0;
+
         if (reading != gpio14LastState && (millis() - lastDebounceTime) > 50) {
             lastDebounceTime = millis();
             
@@ -19,6 +20,7 @@ public:
                 lastActivityTime = millis();
             } else {
                 unsigned long pressDuration = millis() - gpio14PressTime;
+
                 if (pressDuration >= 1000) {
                     #if defined(FW_MODE_HYBRID)
                         DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
@@ -55,7 +57,10 @@ public:
                             vTaskDelay(pdMS_TO_TICKS(150));
                             
                             dsp_is_paused.store(true, std::memory_order_release);
-                            while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+                            // Safety Check: Wait for BOTH core processing tasks to fully park
+                            while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
+                                vTaskDelay(pdMS_TO_TICKS(1)); 
+                            }
                             
                             AppSettings cs; 
                             {
@@ -73,9 +78,9 @@ public:
                             if(activeDSP->pd) fxStates|=(1<<6); if(activeDSP->ch) fxStates|=(1<<7); 
                             if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9); 
                             
-                            settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode,
-                                             constrain(activeDSP->fbIdx,0,4), isPB2WiperMode,
-                                             isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire),
+                            settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, 
+                                             constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, 
+                                             isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), 
                                              &cs, sizeof(AppSettings));
                         }
                         

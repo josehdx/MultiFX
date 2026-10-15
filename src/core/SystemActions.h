@@ -50,14 +50,16 @@ inline void triggerPanicReset() {
 }
 
 inline bool commitDSPState() {
-    if (!dspAckCommit.load(std::memory_order_acquire)) return false; 
-    CriticalSectionGuard lock(MidiRouter::paramMux);
+    if (!dspAckCommit.load(std::memory_order_acquire)) return false;
 
+    CriticalSectionGuard lock(MidiRouter::paramMux);
     DSPCoreState* backBuffer = &dspStates[dspWriteIndex];
+
     for(int i=0; i<10; i++) {
         backBuffer->fxMem[i] = effectMemory[i];
         for(int j=0; j<5; j++) backBuffer->params[i][j] = fxParams[i][j];
     }
+
     backBuffer->activeMode = activeEffectMode.load(std::memory_order_relaxed);
     backBuffer->latMode = latencyMode.load(std::memory_order_relaxed);
     backBuffer->fbIdx = feedbackIntervalIdx.load(std::memory_order_relaxed);
@@ -76,8 +78,8 @@ inline bool commitDSPState() {
     
     dspAckCommit.store(false, std::memory_order_release); 
     dspActiveState.store(backBuffer, std::memory_order_release);
-    dspWriteIndex = (dspWriteIndex + 1) & 1; 
-    
+    dspWriteIndex = (dspWriteIndex + 1) & 1;      
+
     return true;
 }
 
@@ -126,49 +128,46 @@ inline void cycleLatencyMode() {
     lastParameterChangeTime = millis();
 }
 
-inline void toggleSampleRate() {
+inline void setSampleRate(uint32_t targetSr) {
+    if (currentSampleRate.load(std::memory_order_acquire) == targetSr) return;
+
     dsp_is_paused.store(true, std::memory_order_release);
     while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
         vTaskDelay(pdMS_TO_TICKS(1)); 
     }
     
-    uint32_t newSr = (currentSampleRate.load(std::memory_order_acquire) == 96000) ? 48000 : 96000;
-    currentSampleRate.store(newSr, std::memory_order_release);
-     
+    currentSampleRate.store(targetSr, std::memory_order_release);      
     settingsNeedSaving = false; 
-    lutNeedsUpdate = true;
-     
-    Serial0.printf("[SYSTEM] Reconfiguring I2S Clock to %lu Hz...\n", newSr);
-    padVectorFilter.setLPF(1200.0f, (float)newSr);
+    lutNeedsUpdate = true;      
     
-    i2s_channel_disable((i2s_chan_handle_t)I2SManager::tx_chan);
-    i2s_channel_disable((i2s_chan_handle_t)I2SManager::rx_chan);
+    Serial0.printf("[SYSTEM] Reconfiguring I2S Clock to %lu Hz...\n", targetSr);
+    padVectorFilter.setLPF(1200.0f, (float)targetSr);
     
-    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(newSr);
+    I2SManager::disableAndDestroyChannels();
+    
+    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(targetSr);
     clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
     
-    i2s_channel_reconfig_std_clock((i2s_chan_handle_t)I2SManager::tx_chan, &clk_cfg);
-    i2s_channel_reconfig_std_clock((i2s_chan_handle_t)I2SManager::rx_chan, &clk_cfg);
+    I2SManager::initChannels(BoardHAL::getI2SConfig(targetSr), HOP_SIZE);
     
-    freezeLength = newSr;
+    freezeLength = targetSr;
     
     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
     memset(sramPitchLow, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t)); 
     memset(sramPitchHigh, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t)); 
     memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); 
     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t)); 
-    if(diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));
-     
+    if(diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));      
+    
     vTaskDelay(pdMS_TO_TICKS(30));
     
-    i2s_channel_enable((i2s_chan_handle_t)I2SManager::tx_chan);
-    i2s_channel_enable((i2s_chan_handle_t)I2SManager::rx_chan);
+    I2SManager::enableChannels();
     
     globalAudioResetRequested.store(true, std::memory_order_release); 
-    hardwareSyncMuteFrames.store((newSr/HOP_SIZE)*0.40f, std::memory_order_release);
+    hardwareSyncMuteFrames.store((targetSr/HOP_SIZE)*0.40f, std::memory_order_release);
     
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-     
+    std::atomic_thread_fence(std::memory_order_seq_cst);      
+    
     dsp_is_paused.store(false, std::memory_order_release);
     
     if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
@@ -183,37 +182,39 @@ inline void toggleSampleRate() {
     lastParameterChangeTime = millis();
 }
 
-inline void turnScreenOff() { 
-    if(!isScreenOff.load(std::memory_order_acquire)) { 
+inline void turnScreenOff() {
+    if(!isScreenOff.load(std::memory_order_acquire)) {
         digitalWrite(15, LOW);
-        isScreenOff.store(true, std::memory_order_release); 
-    } 
+        isScreenOff.store(true, std::memory_order_release);
+    }
 }
 
-// Fixed: Removed the wakeupPending check so the screen reliably powers back on
-inline void turnScreenOn() { 
-    if(isScreenOff.load(std::memory_order_acquire)) { 
+inline void turnScreenOn() {
+    if(isScreenOff.load(std::memory_order_acquire)) {
         digitalWrite(15, HIGH);
         isScreenOff.store(false, std::memory_order_release);
-    } 
+    }
 }
 
 inline void goToLightSleep() {
-    turnScreenOff(); 
+    turnScreenOff();      
     
     dsp_is_paused.store(true, std::memory_order_release);
     while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
         vTaskDelay(pdMS_TO_TICKS(1)); 
     }
     
-    i2s_channel_disable((i2s_chan_handle_t)I2SManager::tx_chan); 
-    i2s_channel_disable((i2s_chan_handle_t)I2SManager::rx_chan);
+    // Hard destruction of I2S Channels to prevent DMA unpark freeze
+    I2SManager::disableAndDestroyChannels();
+    
+    // Safely block ADC loop before stopping it to prevent Invalid State panics
+    isAdcPaused = true;
     adc_continuous_stop(multifx_adc_handle);
-
+    
     if (dsp_cpu_lock != NULL) esp_pm_lock_release(dsp_cpu_lock);
     
     // Wait until activity wakes it up
-    while ((REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN)) && 
+    while ((REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN)) &&
            (REG_READ(GPIO_IN_REG) & (1 << BLE_TOGGLE_PIN))) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -221,6 +222,7 @@ inline void goToLightSleep() {
     if (dsp_cpu_lock != NULL) esp_pm_lock_acquire(dsp_cpu_lock);
     
     adc_continuous_start(multifx_adc_handle);
+    isAdcPaused = false;
     
     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
     memset(sramPitchLow, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t));
@@ -229,8 +231,10 @@ inline void goToLightSleep() {
     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
     if (diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));
     
-    i2s_channel_enable((i2s_chan_handle_t)I2SManager::tx_chan); 
-    i2s_channel_enable((i2s_chan_handle_t)I2SManager::rx_chan); 
+    // Rebuild the I2S channels completely on wake
+    I2SManager::initChannels(BoardHAL::getI2SConfig(currentSampleRate.load(std::memory_order_acquire)), HOP_SIZE);
+    I2SManager::enableChannels();
+    
     globalAudioResetRequested.store(true, std::memory_order_release);
     
     std::atomic_thread_fence(std::memory_order_seq_cst);

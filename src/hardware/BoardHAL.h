@@ -98,11 +98,17 @@ public:
 #if defined(TARGET_LILYGO)
         static unsigned long lastDisplayUpdate = 0;
         
+        // Apply low-pass filter to raw ADC battery value every cycle for stability
+        static float smoothBatRaw = -1.0f;
+        if (smoothBatRaw < 0) smoothBatRaw = batVal;
+        else smoothBatRaw = (smoothBatRaw * 0.98f) + (batVal * 0.02f);
+        
         if (millis() - lastDisplayUpdate >= 250 || showSavingScreen || showKnobModeScreen) {
             lastDisplayUpdate = millis();
             DisplayData dData;
 
-            dData.batVoltage = PowerManager::getBatteryVoltage(batVal);
+            // Feed the smoothed value into the UI data struct
+            dData.batVoltage = PowerManager::getBatteryVoltage(smoothBatRaw);
             dData.batPercent = PowerManager::getBatteryPercentage(dData.batVoltage);
 
             dData.bleConnected = bleConnected;

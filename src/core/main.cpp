@@ -3,7 +3,7 @@
 #include <Update.h>
 #include "esp_log.h"
 
-#define FW_VERSION "v5.00F"
+#define FW_VERSION "v5.00H"
 
 // Core System Includes
 #include "SystemState.h"
@@ -41,7 +41,6 @@ void setup() {
     // Check and apply OTA update with live TFT on-screen feedback
     FirmwareManager::checkAndApplyUpdate();
     
-    // FIX: Initialize USB MSC before the Bootloader brings up the USB bus
     USBMscManager::init();
     
     SystemBootloader::run();
@@ -80,6 +79,7 @@ void loop() {
 #ifdef ENABLE_ADVANCED_TELEMETRY
         watermarkVal = lut_stack_watermark.load(std::memory_order_relaxed);
 #endif
+
 #if defined(TARGET_LILYGO)
         BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
                             ui_audio_level.load(std::memory_order_acquire),
@@ -97,7 +97,10 @@ void loop() {
 
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) {
         dsp_is_paused.store(true, std::memory_order_release);
-        while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
+        // Explicitly wait for BOTH AudioTask and LUTUpdateTask to acknowledge park state
+        while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
+            vTaskDelay(pdMS_TO_TICKS(1)); 
+        }
         
         AppSettings currentSettings;
         memset(&currentSettings, 0, sizeof(AppSettings));
@@ -115,6 +118,11 @@ void loop() {
         dsp_is_paused.store(false, std::memory_order_release);
         if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
         if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
+
+        // Ensure tasks have safely unparked before re-entering main system loop
+        while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { 
+            vTaskDelay(pdMS_TO_TICKS(1)); 
+        }
     }
 
     if (panicResetRequested.load(std::memory_order_acquire)) {

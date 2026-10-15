@@ -13,10 +13,10 @@ static void IRAM_ATTR LUTUpdateTask(void * pvParameters) {
 #endif
 
         if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
-            lut_ack_parked.store(true, std::memory_order_release);
-            // --- ARCHITECTURAL FIX 2: Clear lingering unpark signals to prevent immediate wakeups ---
-            ulTaskNotifyValueClear(NULL, UINT32_MAX);
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            while (dsp_is_paused.load(std::memory_order_acquire)) {
+                lut_ack_parked.store(true, std::memory_order_release);
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+            }
             lut_ack_parked.store(false, std::memory_order_release);
         }
 

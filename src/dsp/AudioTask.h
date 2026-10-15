@@ -17,10 +17,10 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
 #endif
 
         if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
-            dsp_ack_parked.store(true, std::memory_order_release);
-            // --- ARCHITECTURAL FIX 2: Clear lingering unpark signals to prevent immediate wakeups ---
-            ulTaskNotifyValueClear(NULL, UINT32_MAX);
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            while (dsp_is_paused.load(std::memory_order_acquire)) {
+                dsp_ack_parked.store(true, std::memory_order_release);
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+            }
             dsp_ack_parked.store(false, std::memory_order_release);
         }
 

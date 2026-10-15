@@ -2,6 +2,7 @@
 #define DISPLAY_MANAGER_H
 
 #if defined(TARGET_LILYGO)
+
 #include <TFT_eSPI.h>
 #include <Arduino.h>
 #include <math.h>
@@ -12,19 +13,22 @@ extern char bleScanDebug[64];
 extern char bleLatchedDiscReason[64];
 
 // Set to true to view real-time PB & DSP hardware diagnostics
-#define SHOW_TELEMETRY false
+#define SHOW_TELEMETRY true
 
 struct DisplayData {
     float batVoltage;
     int batPercent;
+
     bool bleConnected;
     bool bleHostConnected;
     bool blePedalConnected;
+
     int activeMode;
     bool fxStates[10];
     uint16_t pb1, pb2, pb3, cc11;
     float paramVals[5];
     const char* paramNames[5];
+
     float inMeter, outMeter;
     float dspCoreLoad, ctrlCoreLoad;
     uint32_t freeSRAM, freePSRAM;
@@ -50,14 +54,15 @@ private:
     TFT_eSprite bgSpr = TFT_eSprite(&tft);
 
     DisplayData cache = {};
+
     char cachedMidiDebug[64] = "";
     char cachedBleEvent[64] = "";
     char cachedBleScan[64] = "";
     char cachedDiscReason[64] = "";
+
     int lastRenderMode = -1;
     bool lastMonoPolyActive = false;
     int lastMonoPolyAlgo = -1;
-
     int bootLogY = 8;
 
     const char* FX_NAMES[10] = {"WH", "FZ", "FB", "HR", "CP", "SY", "PD", "CH", "SW", "VB"};
@@ -148,7 +153,6 @@ private:
         for (int i = 0; i < 5; i++) {
             if (fabsf(d.paramVals[i] - cache.paramVals[i]) > 0.005f) return true;
         }
-
         return false;
     }
 
@@ -156,17 +160,17 @@ public:
     void begin() {
         pinMode(15, OUTPUT);
         digitalWrite(15, HIGH);
-                
+        
         pinMode(38, OUTPUT);
         digitalWrite(38, HIGH); 
         delay(100); 
-        
+
         tft.init();
         tft.setRotation(1);
         tft.fillScreen(TFT_BLACK);
 
         digitalWrite(38, HIGH); 
-        
+
         spr.setColorDepth(16);
         bgSpr.setColorDepth(16);
         
@@ -181,7 +185,6 @@ public:
         bootLogY = 8;
     }
 
-    // Direct on-screen boot/OTA console logger
     void drawBootLogLine(const char* line, uint16_t color = 0x07E0) {
         tft.setTextColor(color, TFT_BLACK);
         tft.setTextDatum(TL_DATUM);
@@ -197,7 +200,6 @@ public:
         tft.drawRect(20, 130, 280, 14, TFT_WHITE);
         int fillW = constrain((percent * 276) / 100, 0, 276);
         tft.fillRect(22, 132, fillW, 10, TFT_GREEN);
-
         char pBuf[16];
         snprintf(pBuf, sizeof(pBuf), "%d%%", percent);
         tft.setTextDatum(MC_DATUM);
@@ -262,6 +264,7 @@ public:
         }
 
         spr.pushImage(0, 0, 320, 170, (uint16_t*)bgSpr.getPointer());
+
         spr.setTextDatum(TL_DATUM);
         spr.setTextColor(TFT_WHITE, TFT_BLACK);
         
@@ -271,7 +274,6 @@ public:
 
         spr.setTextDatum(TC_DATUM);
         char headerBuf[64];
-
         if (d.isMonoPolyActive) {
             spr.setTextColor(TFT_CYAN, TFT_BLACK);
             snprintf(headerBuf, sizeof(headerBuf), "%s [ T:%+d | H:%+d ]", MONO_ALGOS[monoAlgo], (int)d.whammyToe, (int)d.whammyHeel);
@@ -279,20 +281,22 @@ public:
             spr.setTextColor(TFT_WHITE, TFT_BLACK);
             snprintf(headerBuf, sizeof(headerBuf), "%s [ T:%+d | H:%+d ]", MODE_NAMES[d.activeMode % 10], (int)d.whammyToe, (int)d.whammyHeel);
         }
-
         spr.drawString(headerBuf, 160, 2, 2);
         
         spr.setTextDatum(TR_DATUM);
-
         if (d.isKnobEditMode) {
             spr.setTextColor(TFT_RED, TFT_BLACK);
             spr.drawString("KNOB MODE", 318, 2, 2);
         } else {
+            // FIX: Label strings swapped per user request.
+            // bleHostConnected   → "M-vave"  (was "PC")
+            // blePedalConnected  → "PC"       (was "M-vave")
+            // Connection boolean logic and colors are unchanged.
             spr.setTextColor(d.bleHostConnected ? TFT_GREEN : TFT_RED, TFT_BLACK);
-            spr.drawString("BLE Controller", 318, 1, 1);
+            spr.drawString("M-vave", 318, 1, 1);
             
             spr.setTextColor(d.blePedalConnected ? TFT_GREEN : TFT_RED, TFT_BLACK);
-            spr.drawString("BLE Comp", 318, 10, 1);
+            spr.drawString("PC", 318, 10, 1);
         }
 
         spr.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -346,7 +350,6 @@ public:
                 isBip = (i == 0 && d.paramVals[i] < 0.0f) || (i == 0);
                 pNorm = isBip ? (d.paramVals[i] / 24.0f) : d.paramVals[i];
             }
-
             drawKnobDynamic(spr, parCenters[i], 110, 12, constrain(pNorm, isBip ? -1.0f : 0.0f, 1.0f), isBip, buf);
         }
 
@@ -364,7 +367,6 @@ public:
             for (int k = 0; k < activeCount; k++) {
                 int fxIdx = activeIndices[k];
                 int bx = startX + (k * (badgeW + 4));
-
                 uint16_t bColor = (fxIdx == 0 && d.isMonoPolyActive) ? TFT_DARKGREY : TFT_BLUE;
                 
                 spr.fillRect(bx, 148, badgeW, 16, bColor);
@@ -375,7 +377,7 @@ public:
         }
 
         // =========================================================================
-        // REAL-TIME HARDWARE & EXPRESSION PEDAL DIAGNOSTIC DASHBOARD
+        // REAL-TIME HARDWARE & DSP DIAGNOSTIC DASHBOARD (TELEMETRY)
         // =========================================================================
         if (SHOW_TELEMETRY) {
             spr.fillRect(16, 26, 288, 54, TFT_BLACK); 
@@ -386,24 +388,14 @@ public:
             
             char line1[64], line2[64], line3[64];
             
-            float curFactor = pitchShiftFactor.load(std::memory_order_relaxed);
-            float curSemis = (curFactor > 0.001f) ? (12.0f * log2f(curFactor)) : 0.0f;
+            snprintf(line1, sizeof(line1), "CPU0:%d%% CPU1:%d%% | SR:%lu Hz", 
+                     (int)d.dspCoreLoad, (int)d.ctrlCoreLoad, (unsigned long)d.sampleRate);
             
-            const char* srcName = "CC11";
-            if (activePedalSource == 1) srcName = "PB1";
-            else if (activePedalSource == 2) srcName = "PB2";
-            else if (activePedalSource == 3) srcName = "PB3";
-
-            snprintf(line1, sizeof(line1), "P1:R%d C%d %s | P2:R%d C%d %s",
-                     (int)latestPB1, (int)currentPB1, pedals.isUnpluggedA() ? "OPEN" : "OK",
-                     (int)latestPB2, (int)currentPB2, pedals.isUnpluggedB() ? "OPEN" : "OK");
+            snprintf(line2, sizeof(line2), "RAM:%uK | PSRAM:%uK | STK:%u", 
+                     (unsigned int)(d.freeSRAM / 1024), (unsigned int)(d.freePSRAM / 1024), (unsigned int)d.stackWatermark);
                      
-            snprintf(line2, sizeof(line2), "P3:R%d C%d %s | CC11:%d | SRC:%s",
-                     (int)latestPB3, (int)currentPB3, pedals.isUnpluggedC() ? "OPEN" : "OK",
-                     (int)currentCC11, srcName);
-                     
-            snprintf(line3, sizeof(line3), "PITCH: %.3f (%+4.1fst) | CPU:%d%% UDF:%u",
-                     curFactor, curSemis, (int)d.dspCoreLoad, (unsigned int)d.underflows);
+            snprintf(line3, sizeof(line3), "LATENCY:%ums | IN:%.2f OUT:%.2f | UDF:%u", 
+                     (unsigned int)d.peakLatency, d.inMeter, d.outMeter, (unsigned int)d.underflows);
 
             spr.drawString(line1, 20, 30, 1);
             spr.drawString(line2, 20, 44, 1);
@@ -438,6 +430,5 @@ public:
         spr.pushSprite(0, 0);
     }
 };
-
 #endif
 #endif

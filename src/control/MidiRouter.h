@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <atomic>
+#include "SystemState.h"
 #include "freertos/FreeRTOS.h"
 #include "SpinlockGuard.h"
 
@@ -89,7 +90,6 @@ public:
         {
             CriticalSectionGuard lock(paramMux);
             
-            // Route Whammy's 3rd and 4th knobs to the global pitch memory
             if (currentMode == 0 && paramIdx == 2) {
                 effectMemory[0] = roundf((normalizedVal * 48.0f) - 24.0f);
             } 
@@ -106,7 +106,9 @@ public:
             }
         }
         
+        // Preserve legacy boolean for UI, but wake the actual Core 1 task atomically
         lutNeedsUpdate = true;
+        asyncLutUpdateRequested.store(true, std::memory_order_release);
         dspNeedsCommit = true;
     }
 };

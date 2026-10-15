@@ -135,19 +135,16 @@ public:
         }
 
         float shiftedSample = 0.0f;
-        float finalAppliedMix = confidenceMix * p5;
         
-        if (finalAppliedMix > 0.001f) {
-            switch(algo) {
-                case 0: shiftedSample = executeTDPSOLA(inSample, targetPitch, detectedT0, p3, p4); break;
-                case 1: shiftedSample = executeYinSynth(targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); break;
-                case 2: shiftedSample = executeECKF(targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); break;
-                case 3: if (varDelayBuffer) shiftedSample = executeVarDelay(inSample, targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); break;
-                case 4: if (pvInput) shiftedSample = executePhaseVocoder(inSample, targetPitch, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); break;
-            }
+        switch(algo) {
+            case 0: shiftedSample = executeTDPSOLA(inSample, targetPitch, detectedT0, p3, p4); break;
+            case 1: shiftedSample = executeYinSynth(targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); break;
+            case 2: shiftedSample = executeECKF(targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); break;
+            case 3: if (varDelayBuffer) shiftedSample = executeVarDelay(inSample, targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); break;
+            case 4: if (pvInput) shiftedSample = executePhaseVocoder(inSample, targetPitch, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); break;
         }
         
-        outSample = __builtin_fmaf(shiftedSample, finalAppliedMix, drySample * (1.0f - finalAppliedMix));
+        outSample = shiftedSample;
     }
 
 private:
@@ -203,7 +200,8 @@ private:
         float c2 = y0 - y1 + c1 - c3;
         float sample = __builtin_fmaf(__builtin_fmaf(__builtin_fmaf(c3, frac, c2), frac, c1), frac, y1);
 
-        int lutIdx = ((uint32_t)(T * hannIntMult) >> 16) & 1023;
+        // Fixed Hanning window resolution bitmask to match the new 4096-length table
+        int lutIdx = ((uint32_t)(T * hannIntMult) >> 16) & 4095;
         float val = sample * LUTManager::hannLUT[lutIdx];
         
         // FPU-native AntiDenormal
@@ -289,15 +287,14 @@ private:
 
     // --- ALGO 3: VARIABLE DELAY LINE ---
     inline float executeVarDelay(float sample, float targetPitch, float T0, float p_win, float p_zc, float p_trn, float sr) __attribute__((always_inline)) {
-        (void)T0; (void)p_win; (void)p_zc; (void)p_trn; (void)sr; // Mute compiler warnings for unused args
+        (void)T0; (void)p_win; (void)p_zc; (void)p_trn; (void)sr; 
         
         varDelayBuffer[varWriteIdx] = sample;
 
-        // Restoring High-Quality Polyphonic Time-Domain Shifter
-        // LATENCY_WINDOWS hardcoded strictly to 4096
         uint32_t windowSize = 4096;
         uint32_t windowMask = 4095;
-        uint32_t hannIntMult = (1024U << 16) / windowSize; // Calculates to 16384
+        // Fixed multiplier calculation for the updated 4096-element window curve
+        uint32_t hannIntMult = (4096U << 16) / windowSize; 
 
         float outSample = processTap(tap_w1_1, varDelayBuffer, varWriteIdx, windowMask, hannIntMult) +
                           processTap(tap_w1_2, varDelayBuffer, varWriteIdx, windowMask, hannIntMult);

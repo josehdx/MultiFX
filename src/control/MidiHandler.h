@@ -9,11 +9,9 @@ inline char lastMidiDebug[64] = "MIDI: WAITING FOR PACKET...";
 inline bool channelMessageCallback(ChannelMessage cm) {
     lastActivityTime = millis();
     
-    // 1. RAW MIDI LOGGER: Mirror ONLY to Hardware UART0 to prevent CDC fallback duplicates
     snprintf(lastMidiDebug, sizeof(lastMidiDebug), "RX -> H:0x%02X D1:%03d D2:%03d", cm.header, cm.data1, cm.data2);
     Serial0.println(lastMidiDebug); 
 
-    // 2. STRICT FILTER: Allow CC (0xB0) on Channel 1
     if (cm.header != 0xB0) return false;
 
     MidiAction action = MidiRouter::parseMessage(cm.data1, cm.data2);
@@ -26,9 +24,8 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             currentCC11 = action.rawValue; 
             currentPB3 = action.rawValue; 
             lastActivePedal = action.rawValue;
-
+            activePedalSource = 0; // CC11 Active
             pedals.updateLastMidiC();
-
             if (isVolumeMode) {
                 volumePedalGain = (float)action.rawValue / 16383.0f; 
                 dspNeedsCommit = true;
@@ -82,13 +79,14 @@ inline bool channelMessageCallback(ChannelMessage cm) {
                 pedals.lockPB3Whammy(); 
                 currentPB3 = 8192; 
                 lastActivePedal = 8192;
+                activePedalSource = 0;
                 Control_Surface.sendPitchBend(Channel_3, 8192);
             } else {
                 pedals.lockPB3Volume(); 
                 lastActivePedal = 8192; 
+                activePedalSource = 0;
                 volumePedalGain = (float)currentPB3 / 16383.0f;
             }
-
             if (!asyncLutUpdateRequested.load(std::memory_order_acquire)) {
                 float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release);
@@ -104,7 +102,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
                 isMonoPolyActive.store(newState, std::memory_order_release);
                 if (newState) isWhammyActive = false;
             }
-
             if (action.targetEffect == 1) isFrozen = !isFrozen;
             else if (action.targetEffect == 2) isFeedbackActive = !isFeedbackActive;
             else if (action.targetEffect == 3) isHarmonizerMode = !isHarmonizerMode;
@@ -117,22 +114,47 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             
             if (currentMode == action.targetEffect) {
                 isWhammyActive = !isWhammyActive;
-                if (currentMode == 4 && isCapoMode) lutNeedsUpdate = true;
+                if (currentMode == 4 && isCapoMode) {
+                    lutNeedsUpdate = true;
+                    asyncLutUpdateRequested.store(true, std::memory_order_release);
+                }
             }
-
             dspNeedsCommit = true; 
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();
             break;
 
-        case MidiEvent::STEP_PARAM_UP:
-        case MidiEvent::STEP_PARAM_DOWN: {
-            float step = (action.event == MidiEvent::STEP_PARAM_DOWN) ? -1.0f : 1.0f;
+        // CC 17: Controls TOE Range (127 = Decrease, 0 = Increase)
+        case MidiEvent::STEP_TOE: {
+            float step = (action.val >= 64) ? -1.0f : 1.0f;
             {
                 CriticalSectionGuard lock(MidiRouter::paramMux);
-                if (currentMode == 0 || currentMode == 1 || currentMode == 8) effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f);
-                else if (currentMode == 4) effectMemory[4] = constrain(effectMemory[4] + step, -24.0f, 24.0f);
-                else if (currentMode == 2) {
+                if (currentMode == 0 || currentMode == 1 || currentMode == 8) {
+                    effectMemory[0] = constrain(effectMemory[0] + step, -24.0f, 24.0f);
+                } else if (currentMode == 4) {
+                    fxParams[4][1] = constrain(fxParams[4][1] + (step * 0.01f), -1.0f, 1.0f);
+                } else {
+                    effectMemory[currentMode] = constrain(effectMemory[currentMode] + step, -24.0f, 24.0f);
+                }
+            }
+            lutNeedsUpdate = true; 
+            asyncLutUpdateRequested.store(true, std::memory_order_release);
+            dspNeedsCommit = true; 
+            settingsNeedSaving = true; 
+            lastParameterChangeTime = millis();
+            break;
+        }
+
+        // CC 18: Controls HEEL Range (127 = Decrease, 0 = Increase)
+        case MidiEvent::STEP_HEEL: {
+            float step = (action.val >= 64) ? -1.0f : 1.0f;
+            {
+                CriticalSectionGuard lock(MidiRouter::paramMux);
+                if (currentMode == 0 || currentMode == 1 || currentMode == 8) {
+                    effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f);
+                } else if (currentMode == 4) {
+                    effectMemory[4] = constrain(effectMemory[4] + step, -24.0f, 24.0f);
+                } else if (currentMode == 2) {
                     int fbIdx = feedbackIntervalIdx.load(std::memory_order_acquire);
                     feedbackIntervalIdx.store(step > 0 ? (fbIdx + 1) % 5 : (fbIdx + 4) % 5, std::memory_order_release);
                 } else {
@@ -140,6 +162,7 @@ inline bool channelMessageCallback(ChannelMessage cm) {
                 }
             }
             lutNeedsUpdate = true; 
+            asyncLutUpdateRequested.store(true, std::memory_order_release);
             dspNeedsCommit = true; 
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();
@@ -149,6 +172,5 @@ inline bool channelMessageCallback(ChannelMessage cm) {
         case MidiEvent::NONE: 
             break;
     }
-
     return false;
 }

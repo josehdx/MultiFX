@@ -7,7 +7,21 @@ SettingsManager settingsMgr;
 
 volatile bool settingsNeedSaving = false;
 volatile unsigned long lastParameterChangeTime = 0;
-float fxParams[10][5] = {{0.0f,1.0f,0.0f,0.0f,0.0f},{0.6f,0.0002f,0.00005f,0.0f,0.0f},{5120.0f,30.0f,0.02f,0.0f,0.0f},{0.5f,0.0f,0.0f,0.0f,0.0f},{0.0f,0.0f,0.0f,0.0f,0.0f},{0.1f,0.005f,0.3f,0.1f,0.0f},{0.95f,1.5f,0.0f,0.0f,0.0f},{1536.0f,0.4f,0.0f,0.0f,0.0f},{0.015f,0.00002f,0.00005f,0.0f,0.0f},{1.0f,0.0f,0.0f,0.0f,0.0f}};
+
+// Whammy initialized with 0.25f for Parameter 5 (Glide)
+float fxParams[10][5] = {
+    {0.0f, 1.0f, 0.0f, 0.0f, 0.25f}, // Mode 0 (Whammy): Dry, Wet, Toe, Heel, Glide
+    {0.6f, 0.0002f, 0.00005f, 0.0f, 0.0f},
+    {5120.0f, 30.0f, 0.02f, 0.0f, 0.0f},
+    {0.5f, 0.0f, 0.0f, 0.0f, 0.0f},
+    {0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+    {0.1f, 0.005f, 0.3f, 0.1f, 0.0f},
+    {0.95f, 1.5f, 0.0f, 0.0f, 0.0f},
+    {1536.0f, 0.4f, 0.0f, 0.0f, 0.0f},
+    {0.015f, 0.00002f, 0.00005f, 0.0f, 0.0f},
+    {1.0f, 0.0f, 0.0f, 0.0f, 0.0f}
+};
+
 const bool INVERT_PB3 = false;
 
 std::atomic<bool> dsp_is_paused{false}, dsp_ack_parked{false}, lut_ack_parked{false}, ui_clear_meters_requested{false}, globalAudioResetRequested{false}, panicResetRequested{false}, bleEnabled{true};
@@ -42,6 +56,7 @@ volatile bool dspNeedsCommit = false;
 std::atomic<bool> dspAckCommit{true};
 
 volatile uint16_t lastActivePedal = 8192;
+volatile uint8_t activePedalSource = 0; // 0=CC11, 1=PB1, 2=PB2, 3=PB3
 volatile float effectMemory[10]={12.0f,-12.0f,0.0f,5.0f,-2.0f,-12.0f,-12.0f,12.0f,0.0f,0.0f}; 
 
 volatile bool isWhammyActive=true, isFrozen=false, isFeedbackActive=false, isHarmonizerMode=false, isSynthMode=false, isPadMode=false, isCapoMode=false, isChorusMode=false, isSwellMode=false, isVibratoMode=false, isVolumeMode=false, isPB2WiperMode=false;

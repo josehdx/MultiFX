@@ -1,6 +1,5 @@
 #pragma once
 
-// Make sure all modules agree that telemetry is enabled
 #define ENABLE_ADVANCED_TELEMETRY 
 
 #include <Arduino.h>
@@ -89,6 +88,7 @@ extern volatile bool dspNeedsCommit;
 extern std::atomic<bool> dspAckCommit;
 
 extern volatile uint16_t lastActivePedal;
+extern volatile uint8_t activePedalSource; // 0=CC11, 1=PB1, 2=PB2, 3=PB3
 extern volatile float effectMemory[10];
 extern volatile bool isWhammyActive, isFrozen, isFeedbackActive, isHarmonizerMode, isSynthMode, isPadMode, isCapoMode, isChorusMode, isSwellMode, isVibratoMode, isVolumeMode, isPB2WiperMode;
 

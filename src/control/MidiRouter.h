@@ -18,8 +18,8 @@ enum class MidiEvent : uint8_t {
     PB2_WIPER_TOGGLE,
     VOL_MODE_TOGGLE,
     TOGGLE_EFFECT,
-    STEP_PARAM_UP,
-    STEP_PARAM_DOWN
+    STEP_TOE,   // CC 17
+    STEP_HEEL   // CC 18
 };
 
 struct MidiAction {
@@ -51,8 +51,8 @@ public:
                 action.event = MidiEvent::EXPRESSION_UPDATE;
                 action.rawValue = (uint16_t)data2 * 128;
                 break;
-            case 17: action.event = MidiEvent::STEP_PARAM_DOWN; break;
-            case 18: action.event = MidiEvent::STEP_PARAM_UP; break;
+            case 17: action.event = MidiEvent::STEP_TOE; break;
+            case 18: action.event = MidiEvent::STEP_HEEL; break;
             case 7:  action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 9; break;
             case 8:  action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 1; break;
             case 9:  action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 2; break;
@@ -106,7 +106,6 @@ public:
             }
         }
         
-        // Preserve legacy boolean for UI, but wake the actual Core 1 task atomically
         lutNeedsUpdate = true;
         asyncLutUpdateRequested.store(true, std::memory_order_release);
         dspNeedsCommit = true;

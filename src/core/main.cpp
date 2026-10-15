@@ -2,12 +2,11 @@
 #include <Preferences.h>
 #include <Update.h>
 #include "esp_log.h"
-#define FW_VERSION "v5.00"
+#define FW_VERSION "v5.00c"
 
 // Core System Includes
 #include "SystemState.h"
 #include "BoardHAL.h"
-#include "FirmwareManager.h"
 #include "USBMscManager.h"
 #include "SystemBootloader.h"
 #include "TelemetryManager.h"
@@ -18,6 +17,8 @@
 DisplayManager displayManager;
 #endif
 
+#include "FirmwareManager.h"
+
 void dispatchBleMidi(uint8_t header, uint8_t data1, uint8_t data2) {
     ChannelMessage cm(MIDIMessage(header, data1, data2, Cable_1));
     channelMessageCallback(cm);
@@ -27,23 +28,19 @@ void setup() {
     esp_log_level_set("task_wdt", ESP_LOG_NONE);
 
 #if defined(TARGET_LILYGO)
-    // Power on LilyGO peripheral & LCD rail immediately for battery boot
     pinMode(15, OUTPUT);
     digitalWrite(15, HIGH);
-#endif
-
-    Serial.begin(115200);
-    // Serial0 initialization removed here to prevent seizing I2S clock GPIOs 43 & 44
-
-    BoardHAL::init();
-    
-    FirmwareManager::checkAndApplyUpdate();
-    SystemBootloader::run();
-
-#if defined(TARGET_LILYGO)
+    // Initialize display early so update logs appear on screen
     displayManager.begin();
 #endif
 
+    Serial.begin(115200);
+    BoardHAL::init();
+    
+    // Check and apply OTA update with live TFT on-screen feedback
+    FirmwareManager::checkAndApplyUpdate();
+    
+    SystemBootloader::run();
     USBMscManager::init();
 }
 

@@ -147,24 +147,19 @@ public:
         float p_sw_rel, float srScale, bool swellActive, float localVolGain, 
         float vol_alpha, float& input_dc_offset, float& inputEnvelope, 
         float& localSwellGain, float& smoothedVolGain, float& currentPitch, 
-        float targetPitch, float* envBuf, float* masterGainBuf, float* inBuf, float* fzOutBuf) 
+        float targetPitch, float portamentoCoeff, float* envBuf, float* masterGainBuf, 
+        float* inBuf, float* fzOutBuf) 
     {
         if (__builtin_expect(isnan(input_dc_offset) || isinf(input_dc_offset), 0)) input_dc_offset = 0.0f;
         if (__builtin_expect(isnan(inputEnvelope) || isinf(inputEnvelope), 0)) inputEnvelope = 0.0f;
-
-        float pitchInc = 0.0f;
-        if (__builtin_expect(fabsf(targetPitch - currentPitch) < 1e-6f, 1)) {
-             currentPitch = targetPitch;
-         } else {
-             pitchInc = (targetPitch - currentPitch) * (1.0f / (float)framesRead);
-         }
 
         float localPitch = currentPitch, localDC = input_dc_offset, localEnv = inputEnvelope;
         float localSwell = localSwellGain, localSmVol = smoothedVolGain;
         
         #pragma GCC unroll 4
         for(int i = 0; i < framesRead; i++) {
-            localPitch += pitchInc;
+            // Smoothly glide currentPitch toward targetPitch according to portamentoCoeff
+            localPitch = __builtin_fmaf(targetPitch - localPitch, portamentoCoeff, localPitch);
             
             // Explicit (int32_t) cast prevents unsigned promotion from stripping sign bit on negative values
             float raw_in = ((float)(int32_t)(i2s_in_block[i * 2] & 0xFFFFFF00) * normFactor);

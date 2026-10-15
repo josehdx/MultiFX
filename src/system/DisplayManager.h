@@ -11,7 +11,8 @@ extern char bleEventDebug[64];
 extern char bleScanDebug[64];
 extern char bleLatchedDiscReason[64];
 
-#define SHOW_TELEMETRY false
+// Set to true to view real-time PB & DSP hardware diagnostics
+#define SHOW_TELEMETRY true
 
 struct DisplayData {
     float batVoltage;
@@ -62,9 +63,10 @@ private:
     bool lastMonoPolyActive = false;
     int lastMonoPolyAlgo = -1;
 
+    int bootLogY = 8;
+
     const char* FX_NAMES[10] = {"WH", "FZ", "FB", "HR", "CP", "SY", "PD", "CH", "SW", "VB"};
     const char* MODE_NAMES[10] = {"WHAMMY", "FREEZE", "FEEDBACK", "HARMONY", "CAPO", "SYNTH", "PAD", "CHORUS", "SWELL", "VIBRATO"};
-    
     const char* MONO_ALGOS[5] = {"PSOLA", "YIN SYNTH", "ECKF", "VAR DELAY", "VOCODER"};
 
     const char* MONO_LABELS[5][5] = {
@@ -76,7 +78,7 @@ private:
     };
 
     const char* POLY_LABELS[10][5] = {
-        {"DRY",  "WET",  "TOE",  "HEEL", "MODE"},
+        {"DRY",  "WET",  "TOE",  "HEEL", "GLIDE"},
         {"APF",  "ATTK", "REL",  "FADE", "MIX"},
         {"SPD",  "DRV",  "OFFS", "INTV", "MIX"},
         {"MIX",  "VOIC", "DETN", "DRY",  "WET"},
@@ -163,7 +165,7 @@ public:
         
         pinMode(38, OUTPUT);
         digitalWrite(38, HIGH); 
-        delay(150);          
+        delay(100);          
 
         tft.init();
         tft.setRotation(1);
@@ -182,6 +184,30 @@ public:
         lastRenderMode = -1;
         lastMonoPolyActive = false;
         lastMonoPolyAlgo = -1;
+        bootLogY = 8;
+    }
+
+    // Direct on-screen boot/OTA console logger
+    void drawBootLogLine(const char* line, uint16_t color = 0x07E0) {
+        tft.setTextColor(color, TFT_BLACK);
+        tft.setTextDatum(TL_DATUM);
+        tft.drawString(line, 6, bootLogY, 2);
+        bootLogY += 19;
+        if (bootLogY > 150) {
+            bootLogY = 8;
+            tft.fillScreen(TFT_BLACK);
+        }
+    }
+
+    void drawBootProgress(int percent) {
+        tft.drawRect(20, 130, 280, 14, TFT_WHITE);
+        int fillW = constrain((percent * 276) / 100, 0, 276);
+        tft.fillRect(22, 132, fillW, 10, TFT_GREEN);
+        char pBuf[16];
+        snprintf(pBuf, sizeof(pBuf), "%d%%", percent);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.drawString(pBuf, 160, 118, 2);
     }
 
     void render(const DisplayData& d) {
@@ -265,16 +291,14 @@ public:
             spr.setTextColor(TFT_RED, TFT_BLACK);
             spr.drawString("KNOB MODE", 318, 2, 2);
         } else {
-            // BLE PC (Mac -> ESP32 Server connection)
             spr.setTextColor(d.bleHostConnected ? TFT_GREEN : TFT_RED, TFT_BLACK);
             spr.drawString("BLE PC", 318, 1, 1);
             
-            // BLE client (ESP32 Client -> M-Vave Server connection)
             spr.setTextColor(d.blePedalConnected ? TFT_GREEN : TFT_RED, TFT_BLACK);
             spr.drawString("BLE client", 318, 10, 1);
         }
 
-        spr.setTextColor(TFT_WHITE, TFT_BLACK); // Reset to default
+        spr.setTextColor(TFT_WHITE, TFT_BLACK);
 
         int inH = constrain((int)(d.inMeter * 104.0f), 0, 104);
         int outH = constrain((int)(d.outMeter * 104.0f), 0, 104);
@@ -311,11 +335,10 @@ public:
             } else if (d.activeMode == 0 && !d.isMonoPolyActive) {
                 if (i == 2 || i == 3) {
                     snprintf(buf, sizeof(buf), "%+d", (int)d.paramVals[i]);
-                    pNorm = d.paramVals[i] / 24.0f; // Bipolar range -24 to +24 natively normalized
+                    pNorm = d.paramVals[i] / 24.0f;
                     isBip = true;
                 } else if (i == 4) {
-                    int algo = constrain((int)(d.paramVals[i] * 4.99f), 0, 4);
-                    snprintf(buf, sizeof(buf), "%s", MONO_ALGOS[algo]);
+                    snprintf(buf, sizeof(buf), "%d%%", (int)(d.paramVals[i] * 100.0f));
                     pNorm = d.paramVals[i];
                     isBip = false;
                 } else {
@@ -353,24 +376,40 @@ public:
             }
         }
 
+        // =========================================================================
+        // REAL-TIME HARDWARE & EXPRESSION PEDAL DIAGNOSTIC DASHBOARD
+        // =========================================================================
         if (SHOW_TELEMETRY) {
-            // Shrunk background to only fit the two primary hardware metrics lines
-            spr.fillRect(20, 36, 280, 34, TFT_BLACK); 
-            spr.drawRect(20, 36, 280, 34, TFT_YELLOW);
+            spr.fillRect(16, 26, 288, 54, TFT_BLACK); 
+            spr.drawRect(16, 26, 288, 54, TFT_YELLOW);
             
             spr.setTextDatum(TL_DATUM);
             spr.setTextColor(TFT_YELLOW, TFT_BLACK);
             
-            char diagBuf1[128], diagBuf2[128];
+            char line1[64], line2[64], line3[64];
             
-            snprintf(diagBuf1, sizeof(diagBuf1), "CPU: %d%%  SRM:%dK  PSR:%dK  SR:%dkHz",
-                     (int)d.dspCoreLoad, d.freeSRAM, d.freePSRAM, d.sampleRate / 1000);
+            float curFactor = pitchShiftFactor.load(std::memory_order_relaxed);
+            float curSemis = (curFactor > 0.001f) ? (12.0f * log2f(curFactor)) : 0.0f;
+            
+            const char* srcName = "CC11";
+            if (activePedalSource == 1) srcName = "PB1";
+            else if (activePedalSource == 2) srcName = "PB2";
+            else if (activePedalSource == 3) srcName = "PB3";
+
+            snprintf(line1, sizeof(line1), "P1:R%d C%d %s | P2:R%d C%d %s",
+                     (int)latestPB1, (int)currentPB1, pedals.isUnpluggedA() ? "OPEN" : "OK",
+                     (int)latestPB2, (int)currentPB2, pedals.isUnpluggedB() ? "OPEN" : "OK");
                      
-            snprintf(diagBuf2, sizeof(diagBuf2), "UDF: %d  LAT: %dms  STK: %dB",
-                     d.underflows, d.peakLatency, d.stackWatermark);
+            snprintf(line2, sizeof(line2), "P3:R%d C%d %s | CC11:%d | SRC:%s",
+                     (int)latestPB3, (int)currentPB3, pedals.isUnpluggedC() ? "OPEN" : "OK",
+                     (int)currentCC11, srcName);
+                     
+            snprintf(line3, sizeof(line3), "PITCH: %.3f (%+4.1fst) | CPU:%d%% UDF:%u",
+                     curFactor, curSemis, (int)d.dspCoreLoad, (unsigned int)d.underflows);
             
-            spr.drawString(diagBuf1, 26, 40, 1);
-            spr.drawString(diagBuf2, 26, 55, 1);
+            spr.drawString(line1, 20, 30, 1);
+            spr.drawString(line2, 20, 44, 1);
+            spr.drawString(line3, 20, 58, 1);
         }
 
         if (d.showSavingScreen) {

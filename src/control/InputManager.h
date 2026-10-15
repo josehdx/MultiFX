@@ -10,20 +10,16 @@ public:
         static unsigned long gpio14PressTime = 0, lastDebounceTime = 0;
         static bool gpio14LastState = HIGH, lastBootState = HIGH;
 
-        // Read the IO14 BLE/Knob Mode button (Active Low)
         bool reading = (REG_READ(GPIO_IN_REG) & (1 << BLE_TOGGLE_PIN)) != 0;
         if (reading != gpio14LastState && (millis() - lastDebounceTime) > 50) {
             lastDebounceTime = millis();
             
             if (!reading) { 
-                // Button Pressed
                 gpio14PressTime = millis(); 
                 lastActivityTime = millis();
             } else {
-                // Button Released - Check how long it was held
                 unsigned long pressDuration = millis() - gpio14PressTime;
                 if (pressDuration >= 1000) {
-                    // LONG PRESS: Toggle Boot Mode and Restart
                     #if defined(FW_MODE_HYBRID)
                         DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
                         uint32_t watermarkVal = 0;
@@ -31,10 +27,8 @@ public:
                             watermarkVal = lut_stack_watermark.load(std::memory_order_relaxed);
                         #endif
 
-                        // If currently in BLE Mode (Knob Mode is false), we want to switch TO Knob Mode
                         if (!isKnobEditMode) {
-                            showKnobModeScreen = true; // Show the green "KNOB MODE / Rebooting..." screen
-                            
+                            showKnobModeScreen = true;
                             BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
                                                ui_audio_level.load(std::memory_order_acquire),
                                                ui_output_level.load(std::memory_order_acquire),
@@ -45,13 +39,9 @@ public:
                                                audio_underflow_count.load(std::memory_order_relaxed),
                                                watermarkVal, currentBtState, latestBat,
                                                isMonoPolyActive.load(std::memory_order_acquire));
-                            
                             vTaskDelay(pdMS_TO_TICKS(150));
-                        
-                        // If currently in Knob Mode (true), we want to switch TO BLE Mode
                         } else {
-                            showSavingScreen = true; // Show the blue "ENABLING BLE / Rebooting..." screen
-                            
+                            showSavingScreen = true;
                             BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
                                                ui_audio_level.load(std::memory_order_acquire),
                                                ui_output_level.load(std::memory_order_acquire),
@@ -62,10 +52,8 @@ public:
                                                audio_underflow_count.load(std::memory_order_relaxed),
                                                watermarkVal, currentBtState, latestBat,
                                                isMonoPolyActive.load(std::memory_order_acquire));
-                            
                             vTaskDelay(pdMS_TO_TICKS(150));
                             
-                            // Safe park DSP before saving settings to prevent corruption
                             dsp_is_paused.store(true, std::memory_order_release);
                             while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
                             
@@ -91,19 +79,14 @@ public:
                                              &cs, sizeof(AppSettings));
                         }
                         
-                        // FLIP THE SAVED NVS STATE
-                        // This guarantees the device reboots into the opposite mode of whatever it is currently in
                         preferences.putBool("knobEditMode", !isKnobEditMode);
-                        
                         I2SManager::disableAndDestroyChannels();
                         ESP.restart();
-                        
                     #endif
                 } else if (pressDuration >= 50) {
-                    // SHORT PRESS: Check if we are allowed to use BLE, or Cycle Latency
                     #if defined(FW_MODE_HYBRID)
                         if (isKnobEditMode) {
-                            showBleWarning = true; // Flashes the red "HOLD TO ENABLE BLE" warning
+                            showBleWarning = true;
                             warningTimer = millis();
                         } else {
                             cycleLatencyMode();
@@ -116,10 +99,8 @@ public:
             gpio14LastState = reading;
         }
 
-        // Clear BLE warning overlay after 3 seconds
         if (showBleWarning && (millis() - warningTimer > 3000)) showBleWarning = false;
 
-        // Process the hardware BOOT button (GPIO 0) for Mode Switching
         bool currentBootState = (REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN)) != 0;
         if(!currentBootState && lastBootState) { 
             switchEffectMode(activeEffectMode.load(std::memory_order_acquire) + 1);
@@ -132,16 +113,49 @@ public:
     static void processPedals() {
         pedals.process(latestPB1, latestPB2, latestPB3, isVolumeMode, INVERT_PB3);
         
-        if (pedals.hasMovedA() || pedals.hasMovedB() || pedals.hasMovedC()) {
-            lastActivityTime = millis();
-        }
-
         currentPB1 = pedals.getCalA(); 
         currentPB2 = pedals.getCalB(); 
         currentPB3 = pedals.getCalC();
         
-        if (pedals.hasMovedC()) {
+        static int lastProcessedA = 8192;
+        static int lastProcessedB = 8192;
+        static int lastProcessedC = 8192;
+
+        int deltaA = abs((int)currentPB1 - lastProcessedA);
+        int deltaB = abs((int)currentPB2 - lastProcessedB);
+        int deltaC = abs((int)currentPB3 - lastProcessedC);
+
+        // Active Pedal Arbiter: requires intentional movement (delta > 48) and verified plugged status
+        if (!pedals.isUnpluggedA() && deltaA > 48) {
+            lastProcessedA = currentPB1;
+            activePedalSource = 1;
+            lastActivePedal = currentPB1;
+            lastActivityTime = millis();
+            
+            if (!asyncLutUpdateRequested.load(std::memory_order_acquire)) {
+                float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
+                if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB1], std::memory_order_release);
+            }
+            pedals.updateLastMidiA();
+        }
+        else if (!pedals.isUnpluggedB() && deltaB > 48) {
+            lastProcessedB = currentPB2;
+            activePedalSource = 2;
+            lastActivePedal = currentPB2;
+            lastActivityTime = millis();
+            
+            if (!asyncLutUpdateRequested.load(std::memory_order_acquire)) {
+                float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
+                if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB2], std::memory_order_release);
+            }
+            pedals.updateLastMidiB();
+        }
+        else if (!pedals.isUnpluggedC() && deltaC > 48) {
+            lastProcessedC = currentPB3;
+            activePedalSource = 3;
             lastActivePedal = currentPB3;
+            lastActivityTime = millis();
+            
             if (isVolumeMode) {
                 volumePedalGain = (float)currentPB3 / 16383.0f;
                 dspNeedsCommit = true;

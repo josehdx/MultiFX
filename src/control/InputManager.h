@@ -7,24 +7,22 @@
 class InputManager {
 public:
     static void processInputs(bool currentBtState) {
-        static unsigned long gpio14PressTime = 0, lastDebounceTime = 0; 
+        static unsigned long gpio14PressTime = 0, lastDebounceTime = 0;
         static bool gpio14LastState = HIGH, lastBootState = HIGH;
 
         // Read the IO14 BLE/Knob Mode button (Active Low)
         bool reading = (REG_READ(GPIO_IN_REG) & (1 << BLE_TOGGLE_PIN)) != 0;
-
         if (reading != gpio14LastState && (millis() - lastDebounceTime) > 50) {
             lastDebounceTime = millis();
             
             if (!reading) { 
                 // Button Pressed
                 gpio14PressTime = millis(); 
-                lastActivityTime = millis(); 
+                lastActivityTime = millis();
             } else {
                 // Button Released - Check how long it was held
                 unsigned long pressDuration = millis() - gpio14PressTime;
-
-                if (pressDuration >= 1000) { 
+                if (pressDuration >= 1000) {
                     // LONG PRESS: Toggle Boot Mode and Restart
                     #if defined(FW_MODE_HYBRID)
                         DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
@@ -38,15 +36,15 @@ public:
                             showKnobModeScreen = true; // Show the green "KNOB MODE / Rebooting..." screen
                             
                             BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
-                                                ui_audio_level.load(std::memory_order_acquire),
-                                                ui_output_level.load(std::memory_order_acquire),
-                                                core0_dsp_load.load(std::memory_order_relaxed),
-                                                core1_ctrl_load.load(std::memory_order_relaxed),
-                                                currentSampleRate.load(std::memory_order_acquire),
-                                                max_loop_latency_ms.exchange(0, std::memory_order_relaxed),
-                                                audio_underflow_count.load(std::memory_order_relaxed),
-                                                watermarkVal, currentBtState, latestBat,
-                                                isMonoPolyActive.load(std::memory_order_acquire));
+                                               ui_audio_level.load(std::memory_order_acquire),
+                                               ui_output_level.load(std::memory_order_acquire),
+                                               core0_dsp_load.load(std::memory_order_relaxed),
+                                               core1_ctrl_load.load(std::memory_order_relaxed),
+                                               currentSampleRate.load(std::memory_order_acquire),
+                                               max_loop_latency_ms.exchange(0, std::memory_order_relaxed),
+                                               audio_underflow_count.load(std::memory_order_relaxed),
+                                               watermarkVal, currentBtState, latestBat,
+                                               isMonoPolyActive.load(std::memory_order_acquire));
                             
                             vTaskDelay(pdMS_TO_TICKS(150));
                         
@@ -55,15 +53,15 @@ public:
                             showSavingScreen = true; // Show the blue "ENABLING BLE / Rebooting..." screen
                             
                             BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
-                                                ui_audio_level.load(std::memory_order_acquire),
-                                                ui_output_level.load(std::memory_order_acquire),
-                                                core0_dsp_load.load(std::memory_order_relaxed),
-                                                core1_ctrl_load.load(std::memory_order_relaxed),
-                                                currentSampleRate.load(std::memory_order_acquire),
-                                                max_loop_latency_ms.exchange(0, std::memory_order_relaxed),
-                                                audio_underflow_count.load(std::memory_order_relaxed),
-                                                watermarkVal, currentBtState, latestBat,
-                                                isMonoPolyActive.load(std::memory_order_acquire));
+                                               ui_audio_level.load(std::memory_order_acquire),
+                                               ui_output_level.load(std::memory_order_acquire),
+                                               core0_dsp_load.load(std::memory_order_relaxed),
+                                               core1_ctrl_load.load(std::memory_order_relaxed),
+                                               currentSampleRate.load(std::memory_order_acquire),
+                                               max_loop_latency_ms.exchange(0, std::memory_order_relaxed),
+                                               audio_underflow_count.load(std::memory_order_relaxed),
+                                               watermarkVal, currentBtState, latestBat,
+                                               isMonoPolyActive.load(std::memory_order_acquire));
                             
                             vTaskDelay(pdMS_TO_TICKS(150));
                             
@@ -88,9 +86,9 @@ public:
                             if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9); 
                             
                             settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode,
-                                              constrain(activeDSP->fbIdx,0,4), isPB2WiperMode,
-                                              isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire),
-                                              &cs, sizeof(AppSettings));
+                                             constrain(activeDSP->fbIdx,0,4), isPB2WiperMode,
+                                             isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire),
+                                             &cs, sizeof(AppSettings));
                         }
                         
                         // FLIP THE SAVED NVS STATE
@@ -101,17 +99,17 @@ public:
                         ESP.restart();
                         
                     #endif
-                } else if (pressDuration >= 50) { 
+                } else if (pressDuration >= 50) {
                     // SHORT PRESS: Check if we are allowed to use BLE, or Cycle Latency
                     #if defined(FW_MODE_HYBRID)
-                        if (isKnobEditMode) { 
+                        if (isKnobEditMode) {
                             showBleWarning = true; // Flashes the red "HOLD TO ENABLE BLE" warning
-                            warningTimer = millis(); 
-                        } else { 
-                            cycleLatencyMode(); 
+                            warningTimer = millis();
+                        } else {
+                            cycleLatencyMode();
                         }
                     #else
-                        cycleLatencyMode(); 
+                        cycleLatencyMode();
                     #endif
                 }
             }
@@ -124,15 +122,20 @@ public:
         // Process the hardware BOOT button (GPIO 0) for Mode Switching
         bool currentBootState = (REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN)) != 0;
         if(!currentBootState && lastBootState) { 
-            switchEffectMode(activeEffectMode.load(std::memory_order_acquire) + 1); 
-            lastActivityTime = millis(); 
-            vTaskDelay(pdMS_TO_TICKS(50)); 
+            switchEffectMode(activeEffectMode.load(std::memory_order_acquire) + 1);
+            lastActivityTime = millis();
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
         lastBootState = currentBootState;
     }
 
     static void processPedals() {
         pedals.process(latestPB1, latestPB2, latestPB3, isVolumeMode, INVERT_PB3);
+        
+        if (pedals.hasMovedA() || pedals.hasMovedB() || pedals.hasMovedC()) {
+            lastActivityTime = millis();
+        }
+
         currentPB1 = pedals.getCalA(); 
         currentPB2 = pedals.getCalB(); 
         currentPB3 = pedals.getCalC();

@@ -16,7 +16,6 @@ extern char bleLatchedDiscReason[64];
 struct DisplayData {
     float batVoltage;
     int batPercent;
-
     bool bleConnected;
     bool bleHostConnected;
     bool blePedalConnected;
@@ -29,8 +28,8 @@ struct DisplayData {
     const char* paramNames[5];
 
     float inMeter, outMeter;
-
     float dspCoreLoad, ctrlCoreLoad;
+
     uint32_t freeSRAM, freePSRAM;
     uint32_t sampleRate;
     uint32_t peakLatency;
@@ -58,6 +57,7 @@ private:
     char cachedBleEvent[64] = "";
     char cachedBleScan[64] = "";
     char cachedDiscReason[64] = "";
+
     int lastRenderMode = -1;
     bool lastMonoPolyActive = false;
     int lastMonoPolyAlgo = -1;
@@ -66,6 +66,7 @@ private:
     const char* MODE_NAMES[10] = {"WHAMMY", "FREEZE", "FEEDBACK", "HARMONY", "CAPO", "SYNTH", "PAD", "CHORUS", "SWELL", "VIBRATO"};
     
     const char* MONO_ALGOS[5] = {"PSOLA", "YIN SYNTH", "ECKF", "VAR DELAY", "VOCODER"};
+
     const char* MONO_LABELS[5][5] = {
         {"ALGO", "RNG",  "FRM",  "TOL",  "MIX"},
         {"ALGO", "WAV",  "GLD",  "OCT",  "MIX"},
@@ -73,6 +74,7 @@ private:
         {"ALGO", "WIN",  "Z-C",  "TRN",  "MIX"},
         {"ALGO", "FFT",  "PHS",  "TRN",  "MIX"}
     };
+
     const char* POLY_LABELS[10][5] = {
         {"DRY",  "WET",  "TOE",  "HEEL", "MODE"},
         {"APF",  "ATTK", "REL",  "FADE", "MIX"},
@@ -157,18 +159,18 @@ private:
 public:
     void begin() {
         pinMode(15, OUTPUT);
-        digitalWrite(15, HIGH); 
-          
+        digitalWrite(15, HIGH);       
+        
         pinMode(38, OUTPUT);
         digitalWrite(38, HIGH); 
-        delay(150); 
-        
+        delay(150);          
+
         tft.init();
         tft.setRotation(1);
         tft.fillScreen(TFT_BLACK);
 
-        digitalWrite(38, HIGH); 
-        
+        digitalWrite(38, HIGH);          
+
         spr.setColorDepth(16);
         bgSpr.setColorDepth(16);
         
@@ -203,7 +205,6 @@ public:
 
         if (d.activeMode != lastRenderMode) {
             bgSpr.fillSprite(TFT_BLACK);
-
             bgSpr.setTextColor(TFT_WHITE, TFT_BLACK);
             
             bgSpr.drawFastHLine(0, 18, 320, TFT_WHITE);
@@ -272,6 +273,7 @@ public:
             spr.setTextColor(d.blePedalConnected ? TFT_GREEN : TFT_RED, TFT_BLACK);
             spr.drawString("BLE client", 318, 10, 1);
         }
+
         spr.setTextColor(TFT_WHITE, TFT_BLACK); // Reset to default
 
         int inH = constrain((int)(d.inMeter * 104.0f), 0, 104);
@@ -286,7 +288,6 @@ public:
         float cc11_norm = (float)d.cc11 / 16383.0f;
 
         char buf[16];
-
         snprintf(buf, sizeof(buf), "%d%%", (int)(pb1_norm * 100.0f));
         drawKnobDynamic(spr, pbCenters[0], 48, 14, pb1_norm, true, buf);
 
@@ -300,17 +301,31 @@ public:
         drawKnobDynamic(spr, pbCenters[3], 48, 14, cc11_norm, false, buf);
 
         for (int i = 0; i < 5; i++) {
-            snprintf(buf, sizeof(buf), "%.2f", d.paramVals[i]);
+            bool isBip = false;
+            float pNorm = d.paramVals[i];
 
-            bool isBip = (i == 0 && d.paramVals[i] < 0.0f) || (i == 0);
-            float pNorm = isBip ? (d.paramVals[i] / 24.0f) : d.paramVals[i];
-            
             if (d.isMonoPolyActive && i == 0) {
                 snprintf(buf, sizeof(buf), "%s", MONO_ALGOS[monoAlgo]);
                 pNorm = monoAlgo / 4.0f; 
                 isBip = false;
+            } else if (d.activeMode == 0 && !d.isMonoPolyActive) {
+                if (i == 2 || i == 3) {
+                    snprintf(buf, sizeof(buf), "%+d", (int)d.paramVals[i]);
+                    pNorm = d.paramVals[i] / 24.0f; // Bipolar range -24 to +24 natively normalized
+                    isBip = true;
+                } else if (i == 4) {
+                    int algo = constrain((int)(d.paramVals[i] * 4.99f), 0, 4);
+                    snprintf(buf, sizeof(buf), "%s", MONO_ALGOS[algo]);
+                    pNorm = d.paramVals[i];
+                    isBip = false;
+                } else {
+                    snprintf(buf, sizeof(buf), "%.2f", d.paramVals[i]);
+                }
+            } else {
+                snprintf(buf, sizeof(buf), "%.2f", d.paramVals[i]);
+                isBip = (i == 0 && d.paramVals[i] < 0.0f) || (i == 0);
+                pNorm = isBip ? (d.paramVals[i] / 24.0f) : d.paramVals[i];
             }
-
             drawKnobDynamic(spr, parCenters[i], 110, 12, constrain(pNorm, isBip ? -1.0f : 0.0f, 1.0f), isBip, buf);
         }
 
@@ -365,7 +380,7 @@ public:
             spr.setTextDatum(MC_DATUM);
             spr.drawString("ENABLING BLE", 160, 65, 2);
             spr.drawString("Rebooting...", 160, 85, 2);
-            
+        
         } else if (d.showKnobModeScreen) {
             spr.fillRect(60, 45, 200, 60, TFT_DARKGREEN);
             spr.drawRect(60, 45, 200, 60, TFT_WHITE);
@@ -373,7 +388,7 @@ public:
             spr.setTextDatum(MC_DATUM);
             spr.drawString("KNOB MODE", 160, 65, 2);
             spr.drawString("Rebooting...", 160, 85, 2);
-            
+        
         } else if (d.showBleWarning) {
             spr.fillRect(60, 45, 200, 60, TFT_RED);
             spr.drawRect(60, 45, 200, 60, TFT_WHITE);
@@ -385,8 +400,7 @@ public:
 
         spr.pushSprite(0, 0);
     }
-
-#endif
 };
 
+#endif
 #endif

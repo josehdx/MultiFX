@@ -85,17 +85,27 @@ public:
         if (paramIdx < 0 || paramIdx >= 5) return;
         
         float normalizedVal = (float)val / 127.0f;
-
+        
         {
             CriticalSectionGuard lock(paramMux);
-            fxParams[currentMode][paramIdx] = normalizedVal;
+            
+            // Route Whammy's 3rd and 4th knobs to the global pitch memory
+            if (currentMode == 0 && paramIdx == 2) {
+                effectMemory[0] = roundf((normalizedVal * 48.0f) - 24.0f);
+            } 
+            else if (currentMode == 0 && paramIdx == 3) {
+                effectMemory[1] = roundf((normalizedVal * 48.0f) - 24.0f);
+            } 
+            else {
+                fxParams[currentMode][paramIdx] = normalizedVal;
+            }
             
             if (currentMode == 2 && paramIdx == 0) {
                 int fbIdx = (int)(normalizedVal * 4.99f);
                 feedbackIntervalIdx.store(fbIdx, std::memory_order_release);
             }
         }
-
+        
         lutNeedsUpdate = true;
         dspNeedsCommit = true;
     }

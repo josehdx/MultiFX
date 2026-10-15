@@ -100,8 +100,8 @@ public:
         
         if (millis() - lastDisplayUpdate >= 250 || showSavingScreen || showKnobModeScreen) {
             lastDisplayUpdate = millis();
-
             DisplayData dData;
+
             dData.batVoltage = PowerManager::getBatteryVoltage(batVal);
             dData.batPercent = PowerManager::getBatteryPercentage(dData.batVoltage);
 
@@ -117,7 +117,17 @@ public:
             dData.pb3 = pb3; 
             dData.cc11 = cc11;
 
-            for(int i = 0; i < 5; i++) { dData.paramVals[i] = activeDSP->params[activeDSP->activeMode][i]; }
+            // Load visual parameters
+            for(int i = 0; i < 5; i++) { 
+                dData.paramVals[i] = activeDSP->params[activeDSP->activeMode % 10][i]; 
+            }
+            
+            // Override TOE and HEEL parameter data if in Whammy mode
+            if (dData.activeMode == 0) {
+                dData.paramVals[2] = activeDSP->fxMem[0];
+                dData.paramVals[3] = activeDSP->fxMem[1];
+            }
+
             dData.paramNames[0] = "P1"; dData.paramNames[1] = "P2"; dData.paramNames[2] = "P3"; 
             dData.paramNames[3] = "P4"; dData.paramNames[4] = "P5";
 
@@ -136,7 +146,7 @@ public:
             dData.showSavingScreen = showSavingScreen;
             dData.showKnobModeScreen = showKnobModeScreen;
             dData.isMonoPolyActive = isMonoPolyActiveFlag;
-
+            
             dData.whammyToe = activeDSP->fxMem[0];
             dData.whammyHeel = activeDSP->fxMem[1];
             

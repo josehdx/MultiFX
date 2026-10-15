@@ -29,10 +29,7 @@ public:
         
         isKnobEditMode = preferences.getBool("knobEditMode", false);
         
-        // =========================================================
-        // FORCE BLE ON: Prevent NVS from silently disabling radio
-        // =========================================================
-        isKnobEditMode = false; 
+        // --- REMOVED THE HARDCODED "FORCE BLE ON" OVERRIDE HERE ---
 
         Serial0.println("[INIT 2/8] Setting up Control Surface MIDI & Bluetooth...");
         if (!isKnobEditMode) {
@@ -60,6 +57,7 @@ public:
         AudioBufferManager::allocate();
         monoPolyEngine.allocateBuffers();
         padVectorFilter.setLPF(1200.0f, (float)currentSampleRate.load(std::memory_order_acquire));
+
         I2SManager::initChannels(BoardHAL::getI2SConfig(currentSampleRate.load(std::memory_order_acquire)), HOP_SIZE);
 
         Serial0.println("[INIT 4/8] Setting up Analog Inputs...");
@@ -87,6 +85,7 @@ public:
         }
 
         commitDSPState();
+
         pedals.resetToCenter();
         pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
         pinMode(BLE_TOGGLE_PIN, INPUT_PULLUP);

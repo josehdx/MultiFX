@@ -15,7 +15,7 @@
             }
         },
         {
-            "label": "2. Upload Firmware",
+            "label": "PlatformIO: 1st Time Factory Flash",
             "type": "process",
             "command": "${userHome}/.platformio/penv/bin/pio",
             "args": [
@@ -23,19 +23,6 @@
                 "--target", "upload"
             ],
             "dependsOn": "1. Erase Flash",
-            "presentation": {
-                "reveal": "silent",
-                "panel": "shared"
-            }
-        },
-        {
-            "label": "PlatformIO: 1st Time Factory Flash",
-            "type": "process",
-            "command": "${userHome}/.platformio/penv/bin/pio",
-            "args": [
-                "pkg", "exec", "-p", "tool-esptoolpy", "-c", "esptool.py write_flash 0x810000 ffat_golden.bin"
-            ],
-            "dependsOn": "2. Upload Firmware",
             "problemMatcher": [
                 "$platformio"
             ],

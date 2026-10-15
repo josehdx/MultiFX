@@ -95,7 +95,11 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             static unsigned long lastSrToggle = 0;
             if (millis() - lastSrToggle > 500) {
                 lastSrToggle = millis();
-                uint32_t targetSr = (action.val >= 64) ? 96000 : 48000;
+                
+                // Read the current state and invert it, ignoring action.val
+                uint32_t currentSr = currentSampleRate.load(std::memory_order_acquire);
+                uint32_t targetSr = (currentSr == 96000) ? 48000 : 96000;
+                
                 setSampleRate(targetSr);
             }
             break;

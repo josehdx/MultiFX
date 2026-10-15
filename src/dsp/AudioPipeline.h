@@ -59,10 +59,8 @@ public:
     static inline __attribute__((always_inline)) void processBlock(int framesRead, DSPCoreState* activeDSP) {
         float sr = (float)currentSampleRate.load(std::memory_order_relaxed);
         float srScale = 48000.0f / sr;
-
         for(int j=0; j<10; j++) for(int k=0; k<5; k++) c_fx[j][k] = activeDSP->params[j][k];
         c_lat = activeDSP->latMode; c_act = activeDSP->activeMode; c_w = activeDSP->w; c_fz = activeDSP->fz; c_fb = activeDSP->fb; c_hr = activeDSP->hr; c_cp = activeDSP->cp; c_sy = activeDSP->sy; c_pd = activeDSP->pd; c_ch = activeDSP->ch; c_sw = activeDSP->sw; c_vb = activeDSP->vb; c_vg = activeDSP->vg;
-
         float c_pt = pitchShiftFactor.load(std::memory_order_acquire);
         
         float targetWindow = LATENCY_WINDOWS[c_lat];
@@ -70,36 +68,34 @@ public:
             currentWindowSize=targetWindow; uint32_t halfWindowFixed=((uint32_t)targetWindow/2)<<16;
             tap_w3_1=0; tap_w3_2=halfWindowFixed; tap_w4_1=0; tap_w4_2=halfWindowFixed; tap_w5_1=0; tap_w5_2=halfWindowFixed;
         }
+
         uint32_t windowSizeLow = 4096; uint32_t windowSizeHigh = 512;
         uint32_t maskLow = windowSizeLow - 1; uint32_t maskHigh = windowSizeHigh - 1;
         uint32_t hannMultLow = (4096U<<16)/windowSizeLow; uint32_t hannMultHigh = (4096U<<16)/windowSizeHigh;
         uint32_t hannIntMult=(4096U<<16)/(uint32_t)currentWindowSize, windowMask=(uint32_t)currentWindowSize-1;
         
-        float p_w_dry=c_fx[0][0], p_w_wet=c_fx[0][1], p_w_port=c_fx[0][4], p_fz_apf=c_fx[1][0], p_fz_att=c_fx[1][1], p_fz_rel=c_fx[1][2], p_fb_spd=c_fx[2][0], p_fb_drv=c_fx[2][1], p_fb_off=c_fx[2][2], p_hr_mix=c_fx[3][0], p_sy_att=c_fx[5][0], p_sy_rel=c_fx[5][1], p_sy_flt=c_fx[5][2], p_sy_mix=c_fx[5][3], p_pd_sm=c_fx[6][0], p_pd_mix=c_fx[6][1], p_ch_spd=c_fx[7][0], p_ch_mix=c_fx[7][1], p_sw_thr=c_fx[8][0], p_sw_att=c_fx[8][1], p_sw_rel=c_fx[8][2], p_vb_dep=c_fx[9][0];
+        float p_w_dry=c_fx[0][0], p_w_wet=c_fx[0][1], p_fz_apf=c_fx[1][0], p_fz_att=c_fx[1][1], p_fz_rel=c_fx[1][2], p_fb_spd=c_fx[2][0], p_fb_drv=c_fx[2][1], p_fb_off=c_fx[2][2], p_hr_mix=c_fx[3][0], p_sy_att=c_fx[5][0], p_sy_rel=c_fx[5][1], p_sy_flt=c_fx[5][2], p_sy_mix=c_fx[5][3], p_pd_sm=c_fx[6][0], p_pd_mix=c_fx[6][1], p_ch_spd=c_fx[7][0], p_ch_mix=c_fx[7][1], p_sw_thr=c_fx[8][0], p_sw_att=c_fx[8][1], p_sw_rel=c_fx[8][2], p_vb_dep=c_fx[9][0];
         
-        // Single-pole exponential portamento response
-        float glideSec = 0.005f + (p_w_port * p_w_port * 1.50f);
+        // Fixed 15ms anti-zipper glide (replaces the variable glide knob)
+        float glideSec = 0.015f; 
         float portamentoCoeff = 1.0f - expf(-1.0f / (glideSec * sr));
 
         float chorusPhaseIncr = p_ch_spd / sr;
         float feedbackPhaseIncr = p_fb_spd / sr;
-
         float targetPitch = FX_Whammy::getSpd(c_pt);
 
         bool frzActive=((c_act==1&&c_w)||c_fz);
         if(__builtin_expect(frzActive && !wasFrozen, 0)) { freezePlayCounterVar=0; int bestStart=freezeWriteIdxVar, tempIdx=freezeWriteIdxVar; for(int s=0; s<4000; s++) { int prev=tempIdx-1; if(prev<0) prev+=freezeLength; if(freezeBuffer[tempIdx]>=0 && freezeBuffer[prev]<0) { bestStart=tempIdx; break; } tempIdx=prev; } freezeStartIdxVar=bestStart; activeFreezeLength=freezeLength; int searchEnd=bestStart-1; if(searchEnd<0) searchEnd+=freezeLength; tempIdx=searchEnd; for(int s=0; s<4000; s++) { int prev=tempIdx-1; if(prev<0) prev+=freezeLength; if(freezeBuffer[tempIdx]>=0 && freezeBuffer[prev]<0) { activeFreezeLength=s; break; } tempIdx=prev; } if(activeFreezeLength<64) activeFreezeLength=freezeLength; }
         if(__builtin_expect(!frzActive && wasFrozen, 0)) apfNeedsClear=true; 
-        wasFrozen=frzActive;
-        
+        wasFrozen=frzActive; 
+
         uint32_t safeFreezeLen = (activeFreezeLength >= 64) ? activeFreezeLength : (sr > 0 ? (uint32_t)sr : 96000);
         float activeInvFreqLength = 1.0f / (float)safeFreezeLen;
 
         bool synthActive=((c_act==5&&c_w)||c_sy), padActive=((c_act==6&&c_w)||c_pd), harmActive=((c_act==3&&c_w)||c_hr), swellActive=((c_act==8&&c_w)||c_sw), chorusActive=((c_act==7&&c_w)||c_ch), feedbackActive=((c_act==2&&c_w)||c_fb);
-
         if(__builtin_expect(feedbackActive && !wasFeedbackActive, 0)) { fbOutNode=0.0f; fbHpfState=0.0f; feedbackFilterVar=0.0f; } wasFeedbackActive=feedbackActive; bool vibratoActive=((c_act==9&&c_w)||c_vb), capoActive=((c_act==4&&c_w)||c_cp);
 
         bool localMonoPolyActive = isMonoPolyActive.load(std::memory_order_acquire);
-
         float localSwellGain=swellGain, localVolGain=c_vg, localFrzRamp=freezeRamp, localFbRamp=feedbackRamp, target_delay=constrain((float)(sr*p_fb_off), 0.0f, (float)(FB_BUFFER_SIZE-1)); smoothed_delay_samples+= (target_delay-smoothed_delay_samples)*0.01f*srScale+DC_OFFSET; int delaySamples=(int)smoothed_delay_samples;
         
         float fbHpfCoeff = (sr == 96000) ? 0.025f : 0.05f;
@@ -120,6 +116,7 @@ public:
 
         if(__builtin_expect(isnan(synthFilter)||isinf(synthFilter), 0)) synthFilter=0.0f; if(__builtin_expect(isnan(synthBandpass)||isinf(synthBandpass), 0)) synthBandpass=0.0f; if(__builtin_expect(isnan(feedbackFilterVar)||isinf(feedbackFilterVar), 0)) feedbackFilterVar=0.0f; if(__builtin_expect(isnan(fbHpfState)||isinf(fbHpfState), 0)) fbHpfState=0.0f;
         float localVibPhase=vibratoLfoPhase, localChoPhase=chorusLfoPhase, localFbPhase=feedbackLfoPhase, localFbHpf=fbHpfState;
+
         float cross_alpha = (sr == 96000) ? 0.0163f : 0.0326f;
 
         int prefetchIdx = (writeIndex - halfWindow + MAX_BUFFER_SIZE) & BUFFER_MASK;
@@ -147,7 +144,6 @@ public:
             FX_Freeze::process(frzActive, procSample, p_fz_att, p_fz_rel, srScale, p_fz_apf, activeInvFreqLength, activeFreezeLength, freezeLength, LUTManager::hannLUT, freezeBuffer, LUTManager::apf1Buffer, LUTManager::apf2Buffer, freezeWriteIdxVar, freezePlayCounterVar, freezeStartIdxVar, localFrzRamp, fzOutBuf[i], apf1Idx, apf2Idx);
             
             float delayIn=(localFrzRamp>0.0f)?__builtin_fmaf(procSample, (1.0f-localFrzRamp), fzOutBuf[i]):procSample;
-
             cross_lp1 = DSPEngine::AntiDenormal(cross_lp1 + cross_alpha * (delayIn - cross_lp1));
             cross_lp2 = DSPEngine::AntiDenormal(cross_lp2 + cross_alpha * (cross_lp1 - cross_lp2));
             
@@ -160,16 +156,15 @@ public:
             float spd1 = FX_Vibrato::getSpd(vibratoActive, currentPitch, localVibPhase, LUTManager::globalVibratoPhaseInc.load(std::memory_order_relaxed), p_vb_dep, LUTManager::lfoLUT);
             float spd2 = FX_Harmony::getSpd(currentPitch, LUTManager::globalHarmRatio.load(std::memory_order_relaxed));
             float spd3 = FX_Chorus::getSpd(chorusActive, currentPitch, LUTManager::globalChorusRatio.load(std::memory_order_relaxed), localChoPhase, chorusPhaseIncr, LUTManager::lfoLUT);
-
             float spd4 = 1.0f, spd5 = 1.0f;
             float w4 = 0.0f, w5 = 0.0f;
 
             if (__builtin_expect(localMonoPolyActive, 0)) {
                 monoPolyEngine.process(
-                    procSample,      // Fix 3: Direct routing of live guitar signal
+                    procSample,
                     currentPitch,
                     w1Buf[i],
-                    dryBuf[i],       
+                    dryBuf[i],
                     c_fx[c_act][0],
                     c_fx[c_act][1],
                     c_fx[c_act][2],
@@ -184,11 +179,9 @@ public:
                     w4 = DSPEngine::processDualPitchTap_SIMD(tap_w4_1, tap_w4_2, sramPitchHigh, sramWriteIdx, windowMask, hannIntMult, LUTManager::hannLUT, LUTManager::pitchSincLUT);
                     w5 = DSPEngine::processDualPitchTap_SIMD(tap_w5_1, tap_w5_2, sramPitchHigh, sramWriteIdx, windowMask, hannIntMult, LUTManager::hannLUT, LUTManager::pitchSincLUT);
                 }
-
                 float w1_lo = DSPEngine::processDualPitchTap_SIMD(tap_w1_lo_1, tap_w1_lo_2, sramPitchLow, sramWriteIdx, maskLow, hannMultLow, LUTManager::hannLUT, LUTManager::pitchSincLUT);
                 float w1_hi = DSPEngine::processDualPitchTap_SIMD(tap_w1_hi_1, tap_w1_hi_2, sramPitchHigh, sramWriteIdx, maskHigh, hannMultHigh, LUTManager::hannLUT, LUTManager::pitchSincLUT);
                 float rawW1 = w1_lo + w1_hi;
-
                 float dampCutoff = (currentPitch > 1.498f) ? __builtin_fmaxf(0.1f, 1.0f - (currentPitch - 1.498f) * 0.5f) : 1.0f;
                 dampState = DSPEngine::AntiDenormal(__builtin_fmaf(dampCutoff, (rawW1 - dampState), dampState)); 
                 w1Buf[i] = dampState;
@@ -216,7 +209,6 @@ public:
         }
 
         vibratoLfoPhase=localVibPhase; chorusLfoPhase=localChoPhase; feedbackLfoPhase=localFbPhase; fbHpfState=localFbHpf;
-
         int16_t* tempDmaPtr = activeDmaReadBuf; activeDmaReadBuf = activeDmaWriteBuf; activeDmaWriteBuf = tempDmaPtr;
 
         int targetPsramIdx = (writeIndex - framesRead + MAX_BUFFER_SIZE) & BUFFER_MASK;
@@ -249,7 +241,7 @@ public:
             if(peakOutputVal > current_out) { ui_output_level.store(peakOutputVal, std::memory_order_release); }
             else { current_out *= meter_decay; ui_output_level.store((current_out < 1e-5f) ? 0.0f : current_out, std::memory_order_release); }
         }
-
+        
         // Prevent LIGHT_SLEEP_TIMEOUT from muting the guitar while playing
         if (peakInputVal > 0.005f) {
             extern unsigned long lastActivityTime;

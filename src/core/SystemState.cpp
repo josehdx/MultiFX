@@ -8,9 +8,9 @@ SettingsManager settingsMgr;
 volatile bool settingsNeedSaving = false;
 volatile unsigned long lastParameterChangeTime = 0;
 
-// Whammy initialized with 0.25f for Parameter 5 (Glide)
+// Whammy initialized with 0.0f for Parameter 5 (Mode selection)
 float fxParams[10][5] = {
-    {0.0f, 1.0f, 0.0f, 0.0f, 0.25f}, // Mode 0 (Whammy): Dry, Wet, Toe, Heel, Glide
+    {0.0f, 1.0f, 0.0f, 0.0f, 0.0f}, // Mode 0 (Whammy): Dry, Wet, Toe, Heel, Mode
     {0.6f, 0.0002f, 0.00005f, 0.0f, 0.0f},
     {5120.0f, 30.0f, 0.02f, 0.0f, 0.0f},
     {0.5f, 0.0f, 0.0f, 0.0f, 0.0f},
@@ -27,7 +27,9 @@ const bool INVERT_PB3 = false;
 std::atomic<bool> dsp_is_paused{false}, dsp_ack_parked{false}, lut_ack_parked{false}, ui_clear_meters_requested{false}, globalAudioResetRequested{false}, panicResetRequested{false}, bleEnabled{true};
 std::atomic<float> pitchShiftFactor{1.0f};
 std::atomic<uint32_t> currentSampleRate{96000};
-std::atomic<bool> isMonoPolyActive{false};
+
+// Default to Polyphonic mode on boot
+std::atomic<bool> isMonoPolyActive{false}; 
 std::atomic<int> monoPolyAlgo{0};
 
 bool isKnobEditMode = false, showBleWarning = false, showSavingScreen = false, showKnobModeScreen = false;

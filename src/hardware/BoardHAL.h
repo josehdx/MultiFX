@@ -21,7 +21,7 @@ extern bool showBleWarning;
 // 0 = Full I2S Audio Mode (GPIO 43=MCLK, 44=BCLK, 18=WS, 17=DIN)
 //     NOTE: Serial0 MUST be detached in Mode 0 to prevent seizing GPIO 43/44!
 // =========================================================================
-#define ENABLE_SERIAL_DEBUG 0
+#define ENABLE_SERIAL_DEBUG 1
 
 class BoardHAL {
 public:

@@ -26,12 +26,10 @@ private:
     static void deleteFirmwareFileRaw() {
         const esp_partition_t* part = esp_partition_find_first(
             ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, "ffat");
-
         if (!part) return;
 
         uint8_t sectorBuf[4096];
         bool fileDeleted = false;
-
         uint32_t maxScanBytes = min((uint32_t)part->size, (uint32_t)(1024 * 1024));
 
         for (uint32_t offset = 0; offset < maxScanBytes; offset += 4096) {
@@ -45,8 +43,8 @@ private:
 
                 bool isTargetSFN = (memcmp(&sectorBuf[i], "FIRMWARE", 8) == 0) ||
                                    (memcmp(&sectorBuf[i], "FIRMWA~1", 8) == 0);
-
                 bool isTargetLFN = false;
+
                 if (sectorBuf[i + 11] == 0x0F) {
                     if ((sectorBuf[i + 1] == 'f' || sectorBuf[i + 1] == 'F') &&
                         (sectorBuf[i + 3] == 'i' || sectorBuf[i + 3] == 'I') &&
@@ -62,13 +60,11 @@ private:
                     fileDeleted = true;
                 }
             }
-
             if (sectorModified) {
                 esp_partition_erase_range(part, offset, 4096);
                 esp_partition_write(part, offset, sectorBuf, 4096);
             }
         }
-
         if (fileDeleted) {
             logOutput("[OTA] firmware.bin erased from storage.");
         }
@@ -76,16 +72,13 @@ private:
 
     static bool scanAndFlashRawPartition(const esp_partition_t* part) {
         logOutput("[OTA] Scanning partition sectors directly...", 0xFFE0);
-
         uint8_t sec[4096];
         uint32_t foundOffset = 0;
         bool found = false;
 
         uint32_t scanLimit = min((uint32_t)part->size, (uint32_t)(4 * 1024 * 1024));
-
         for (uint32_t off = 0; off < scanLimit; off += 4096) {
             if (esp_partition_read(part, off, sec, 4096) != ESP_OK) continue;
-
             // Check for ESP32-S3 app binary magic byte 0xE9 and descriptor magic 0xABCD5432
             if (sec[0] == 0xE9) {
                 uint32_t descMagic = *(uint32_t*)&sec[0x20];
@@ -105,7 +98,6 @@ private:
 
         esp_app_desc_t new_app;
         esp_partition_read(part, foundOffset + 0x20, &new_app, sizeof(esp_app_desc_t));
-
         const esp_partition_t* running = esp_ota_get_running_partition();
         esp_app_desc_t running_app;
         esp_ota_get_partition_description(running, &running_app);
@@ -132,12 +124,10 @@ private:
 
         size_t written = 0;
         int lastPct = -1;
-
         for (uint32_t off = foundOffset; off < foundOffset + binSize; off += 4096) {
             esp_partition_read(part, off, sec, 4096);
             Update.write(sec, 4096);
             written += 4096;
-
             int pct = (int)((written * 100) / binSize);
             if (pct != lastPct && pct % 10 == 0) {
                 lastPct = pct;
@@ -165,7 +155,6 @@ private:
 public:
     static void checkAndApplyUpdate() {
         logOutput("[SYSTEM] Checking storage partition...");
-
         const esp_partition_t* part = esp_partition_find_first(
             ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, "ffat");
             
@@ -185,7 +174,7 @@ public:
         mount_config.allocation_unit_size = 4096;
 
         // Try raw flash mount (without wear levelling)
-        esp_err_t err = esp_vfs_fat_rawflash_mount("/ffat", "ffat", &mount_config);
+        esp_err_t err = esp_vfs_fat_spiflash_mount_ro("/ffat", "ffat", &mount_config);
         
         if (err != ESP_OK) {
             // Direct partition sector scan fallback (handles sector sizes != 512 and custom FAT formats)
@@ -227,14 +216,13 @@ public:
                 if (memcmp(new_app_info.app_elf_sha256, running_app_info.app_elf_sha256, sizeof(new_app_info.app_elf_sha256)) == 0) {
                     logOutput("[OTA] Image matches running firmware.");
                     fclose(updateFile);
-                    esp_vfs_fat_rawflash_unmount("/ffat", "ffat");
+                    esp_vfs_fat_spiflash_unmount_ro("/ffat", "ffat");
                     deleteFirmwareFileRaw();
                     delay(800);
                     return;
                 }
 
                 logOutput("[OTA] Flashing firmware to partition...", 0xFFE0);
-
                 fseek(updateFile, 0, SEEK_SET);
 
                 if (Update.begin(fileSize, U_FLASH)) {
@@ -246,7 +234,7 @@ public:
                         size_t bytesToRead = min((size_t)4096, fileSize - written);
                         size_t len = fread(buf, 1, bytesToRead, updateFile);
                         if (len == 0) break;
-
+                        
                         Update.write(buf, len);
                         written += len;
 
@@ -263,7 +251,7 @@ public:
                     if (written == fileSize && Update.end(true)) {
                         logOutput("[OTA] Update complete! Rebooting...", 0x07E0);
                         fclose(updateFile);
-                        esp_vfs_fat_rawflash_unmount("/ffat", "ffat");
+                        esp_vfs_fat_spiflash_unmount_ro("/ffat", "ffat");
                         deleteFirmwareFileRaw();
                         delay(1200);
                         ESP.restart();
@@ -276,6 +264,6 @@ public:
             delay(300);
         }
 
-        esp_vfs_fat_rawflash_unmount("/ffat", "ffat");
+        esp_vfs_fat_spiflash_unmount_ro("/ffat", "ffat");
     }
 };

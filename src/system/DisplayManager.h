@@ -2,7 +2,6 @@
 #define DISPLAY_MANAGER_H
 
 #if defined(TARGET_LILYGO)
-
 #include <TFT_eSPI.h>
 #include <Arduino.h>
 #include <math.h>
@@ -12,23 +11,24 @@ extern char bleEventDebug[64];
 extern char bleScanDebug[64];
 extern char bleLatchedDiscReason[64];
 
-// Set to true to view real-time PB & DSP hardware diagnostics
 #define SHOW_TELEMETRY true
+
+// Hardware-safe color definitions for ST7789 BGR panels:
+// 0x001F lights Red subpixels on BGR screens; 0x07E0 is Green on both.
+#define DISP_COLOR_OFF  0x001F  // Clear red off-state on BGR
+#define DISP_COLOR_ON   TFT_GREEN // 0x07E0
 
 struct DisplayData {
     float batVoltage;
     int batPercent;
-
     bool bleConnected;
     bool bleHostConnected;
     bool blePedalConnected;
-
     int activeMode;
     bool fxStates[10];
     uint16_t pb1, pb2, pb3, cc11;
     float paramVals[5];
     const char* paramNames[5];
-
     float inMeter, outMeter;
     float dspCoreLoad, ctrlCoreLoad;
     uint32_t freeSRAM, freePSRAM;
@@ -36,7 +36,6 @@ struct DisplayData {
     uint32_t peakLatency;
     uint32_t underflows, dmaCount, stackWatermark;
     
-    // UI Warning State Flags
     bool isKnobEditMode;
     bool showBleWarning;
     bool showSavingScreen;
@@ -52,14 +51,12 @@ private:
     TFT_eSPI tft = TFT_eSPI();
     TFT_eSprite spr = TFT_eSprite(&tft);
     TFT_eSprite bgSpr = TFT_eSprite(&tft);
-
     DisplayData cache = {};
 
     char cachedMidiDebug[64] = "";
     char cachedBleEvent[64] = "";
     char cachedBleScan[64] = "";
     char cachedDiscReason[64] = "";
-
     int lastRenderMode = -1;
     bool lastMonoPolyActive = false;
     int lastMonoPolyAlgo = -1;
@@ -78,7 +75,7 @@ private:
     };
 
     const char* POLY_LABELS[10][5] = {
-        {"DRY",  "WET",  "TOE",  "HEEL", "GLIDE"},
+        {"DRY",  "WET",  "TOE",  "HEEL", "MODE"}, 
         {"APF",  "ATTK", "REL",  "FADE", "MIX"},
         {"SPD",  "DRV",  "OFFS", "INTV", "MIX"},
         {"MIX",  "VOIC", "DETN", "DRY",  "WET"},
@@ -159,18 +156,17 @@ private:
 public:
     void begin() {
         pinMode(15, OUTPUT);
-        digitalWrite(15, HIGH);
+        digitalWrite(15, HIGH);       
         
         pinMode(38, OUTPUT);
         digitalWrite(38, HIGH); 
-        delay(100); 
+        delay(100);             
 
         tft.init();
         tft.setRotation(1);
         tft.fillScreen(TFT_BLACK);
-
         digitalWrite(38, HIGH); 
-
+        
         spr.setColorDepth(16);
         bgSpr.setColorDepth(16);
         
@@ -178,7 +174,6 @@ public:
         bgSpr.createSprite(320, 170);
         
         spr.setTextColor(TFT_WHITE, TFT_BLACK);
-
         lastRenderMode = -1;
         lastMonoPolyActive = false;
         lastMonoPolyAlgo = -1;
@@ -285,17 +280,15 @@ public:
         
         spr.setTextDatum(TR_DATUM);
         if (d.isKnobEditMode) {
-            spr.setTextColor(TFT_RED, TFT_BLACK);
+            spr.setTextColor(DISP_COLOR_OFF, TFT_BLACK);
             spr.drawString("KNOB MODE", 318, 2, 2);
         } else {
-            // FIX: Label strings swapped per user request.
-            // bleHostConnected   → "M-vave"  (was "PC")
-            // blePedalConnected  → "PC"       (was "M-vave")
-            // Connection boolean logic and colors are unchanged.
-            spr.setTextColor(d.bleHostConnected ? TFT_GREEN : TFT_RED, TFT_BLACK);
+            // M-Vave connection status
+            spr.setTextColor(d.blePedalConnected ? DISP_COLOR_ON : DISP_COLOR_OFF, TFT_BLACK);
             spr.drawString("M-vave", 318, 1, 1);
             
-            spr.setTextColor(d.blePedalConnected ? TFT_GREEN : TFT_RED, TFT_BLACK);
+            // PC connection status
+            spr.setTextColor(d.bleHostConnected ? DISP_COLOR_ON : DISP_COLOR_OFF, TFT_BLACK);
             spr.drawString("PC", 318, 10, 1);
         }
 
@@ -328,7 +321,6 @@ public:
         for (int i = 0; i < 5; i++) {
             bool isBip = false;
             float pNorm = d.paramVals[i];
-
             if (d.isMonoPolyActive && i == 0) {
                 snprintf(buf, sizeof(buf), "%s", MONO_ALGOS[monoAlgo]);
                 pNorm = monoAlgo / 4.0f; 
@@ -339,7 +331,8 @@ public:
                     pNorm = d.paramVals[i] / 24.0f;
                     isBip = true;
                 } else if (i == 4) {
-                    snprintf(buf, sizeof(buf), "%d%%", (int)(d.paramVals[i] * 100.0f));
+                    int algo = constrain((int)(d.paramVals[i] * 4.99f), 0, 4);
+                    snprintf(buf, sizeof(buf), "%s", MONO_ALGOS[algo]);
                     pNorm = d.paramVals[i];
                     isBip = false;
                 } else {
@@ -363,7 +356,6 @@ public:
             int badgeW = 28;
             int totalW = (activeCount * badgeW) + ((activeCount - 1) * 4);
             int startX = (320 - totalW) / 2;
-
             for (int k = 0; k < activeCount; k++) {
                 int fxIdx = activeIndices[k];
                 int bx = startX + (k * (badgeW + 4));
@@ -376,9 +368,6 @@ public:
             }
         }
 
-        // =========================================================================
-        // REAL-TIME HARDWARE & DSP DIAGNOSTIC DASHBOARD (TELEMETRY)
-        // =========================================================================
         if (SHOW_TELEMETRY) {
             spr.fillRect(16, 26, 288, 54, TFT_BLACK); 
             spr.drawRect(16, 26, 288, 54, TFT_YELLOW);
@@ -390,13 +379,13 @@ public:
             
             snprintf(line1, sizeof(line1), "CPU0:%d%% CPU1:%d%% | SR:%lu Hz", 
                      (int)d.dspCoreLoad, (int)d.ctrlCoreLoad, (unsigned long)d.sampleRate);
-            
+                     
             snprintf(line2, sizeof(line2), "RAM:%uK | PSRAM:%uK | STK:%u", 
                      (unsigned int)(d.freeSRAM / 1024), (unsigned int)(d.freePSRAM / 1024), (unsigned int)d.stackWatermark);
                      
             snprintf(line3, sizeof(line3), "LATENCY:%ums | IN:%.2f OUT:%.2f | UDF:%u", 
                      (unsigned int)d.peakLatency, d.inMeter, d.outMeter, (unsigned int)d.underflows);
-
+            
             spr.drawString(line1, 20, 30, 1);
             spr.drawString(line2, 20, 44, 1);
             spr.drawString(line3, 20, 58, 1);
@@ -419,9 +408,9 @@ public:
             spr.drawString("Rebooting...", 160, 85, 2);
             
         } else if (d.showBleWarning) {
-            spr.fillRect(60, 45, 200, 60, TFT_RED);
+            spr.fillRect(60, 45, 200, 60, DISP_COLOR_OFF);
             spr.drawRect(60, 45, 200, 60, TFT_WHITE);
-            spr.setTextColor(TFT_WHITE, TFT_RED);
+            spr.setTextColor(TFT_WHITE, DISP_COLOR_OFF);
             spr.setTextDatum(MC_DATUM);
             spr.drawString("HOLD TO ENABLE BLE", 160, 65, 2);
             spr.drawString("Reboot Required", 160, 85, 2);
@@ -430,5 +419,6 @@ public:
         spr.pushSprite(0, 0);
     }
 };
+
 #endif
 #endif

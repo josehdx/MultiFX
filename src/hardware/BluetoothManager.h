@@ -21,6 +21,7 @@ public:
     static inline bool isMvaveConnected = false;
     static inline bool isHostConnected = false;
     static inline uint32_t packetCount = 0;
+    
     static inline char bleHostStatusStr[16] = "WAIT";
     static inline char blePedalStatusStr[16] = "WAIT";
     static inline char bleTargetStr[32] = "NONE";
@@ -32,11 +33,13 @@ private:
     static inline bool hasTarget = false;
     static inline bool doConnect = false;
     static inline unsigned long reconnectLockoutUntil = 0;
-
+    
+    static inline uint16_t hostConnHandle = 0xFFFF;
+    static inline uint16_t pedalServerConnHandle = 0xFFFF;
+    
     static inline NimBLEClient* pClient = nullptr;
     static inline NimBLEServer* pServer = nullptr;
     static inline NimBLECharacteristic* pServerChar = nullptr;
-
     static inline const NimBLEUUID midiServiceUUID{"03B80E5A-EDE8-4B33-A751-6CE34EC4C700"};
     static inline const NimBLEUUID midiCharUUID{"7772E5DB-3868-4112-A1A9-F2669D106BF3"};
 
@@ -85,6 +88,7 @@ private:
 
         bool isMatch = false;
 
+        // 1. Match Advertised Device Name
         if (nameStr.length() > 0) {
             String upper = nameStr.c_str();
             upper.toUpperCase();
@@ -96,6 +100,7 @@ private:
             }
         }
 
+        // 2. Match Standard 128-bit MIDI Service UUID
         if (!isMatch && advertisedDevice->haveServiceUUID()) {
             if (advertisedDevice->isAdvertisingService(midiServiceUUID)) {
                 isMatch = true;
@@ -109,7 +114,7 @@ private:
             strlcpy(bleTargetStr, nameStr.length() > 0 ? nameStr.c_str() : addrStr.c_str(), sizeof(bleTargetStr));
             
             snprintf(bleEventDebug, sizeof(bleEventDebug), "BLE: PEDAL FOUND!");
-            dualLog("[BLE ACTION] Target %s found.\n", bleTargetStr);
+            dualLog("[BLE ACTION] Target pedal [%s] found at %s.\n", bleTargetStr, addrStr.c_str());
         }
     }
 
@@ -148,7 +153,7 @@ public:
     }
 
     class ScanCallbacks : public NimBLEScanCallbacks {
-        void onDiscovered(const NimBLEAdvertisedDevice* advertisedDevice) override {
+        void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
             handleDiscoveredDevice(advertisedDevice);
         }
     };
@@ -156,42 +161,62 @@ public:
 
     class ServerCallbacks : public NimBLEServerCallbacks {
         void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
-            int count = server->getConnectedCount();
+            uint16_t connHandle = connInfo.getConnHandle();
             
-            if (count == 1) {
-                isHostConnected = true;
-                strlcpy(bleHostStatusStr, "CONN", sizeof(bleHostStatusStr));
-                snprintf(bleEventDebug, sizeof(bleEventDebug), "MAC: CONNECTED!");
-                dualLog("\n[BLE SERVER] Host 1 (Mac/iOS) connected!\n");
-            } else if (count >= 2) {
-                isMvaveConnected = true;
-                strlcpy(blePedalStatusStr, "CONN", sizeof(blePedalStatusStr));
-                snprintf(bleEventDebug, sizeof(bleEventDebug), "PEDAL (REV): CONN!");
-                dualLog("\n[BLE SERVER] Host 2 (M-Vave Central) connected!\n");
+            // Check 1: Ignore outgoing Client connections that trigger this callback
+            if (pClient && pClient->isConnected() && pClient->getConnHandle() == connHandle) {
+                dualLog("\n[BLE FILTER] Ignored outgoing Client connection handle in Server callback.\n");
+                return;
             }
-            
-            server->updateConnParams(connInfo.getConnHandle(), 12, 24, 0, 400);
+            if (hasTarget && connInfo.getAddress().toString() == targetAddress.toString()) {
+                dualLog("\n[BLE FILTER] Ignored outgoing Client address in Server callback.\n");
+                return;
+            }
+
+            // Check 2: Differentiate multiple connections to Server
+            if (isMvaveConnected) {
+                isHostConnected = true;
+                hostConnHandle = connHandle;
+                strlcpy(bleHostStatusStr, "CONN", sizeof(bleHostStatusStr));
+                snprintf(bleEventDebug, sizeof(bleEventDebug), "PC CONNECTED!");
+                dualLog("\n[BLE SERVER] Host (PC/Mac) connected (Handle: %u)!\n", connHandle);
+            } else if (!isHostConnected) {
+                isHostConnected = true;
+                hostConnHandle = connHandle;
+                strlcpy(bleHostStatusStr, "CONN", sizeof(bleHostStatusStr));
+                snprintf(bleEventDebug, sizeof(bleEventDebug), "HOST CONNECTED!");
+                dualLog("\n[BLE SERVER] Incoming connection assigned as Host (Handle: %u).\n", connHandle);
+            } else {
+                isMvaveConnected = true;
+                pedalServerConnHandle = connHandle;
+                strlcpy(blePedalStatusStr, "CONN", sizeof(blePedalStatusStr));
+                snprintf(bleEventDebug, sizeof(bleEventDebug), "PEDAL (SERVER)!");
+                dualLog("\n[BLE SERVER] Secondary connection assigned as M-Vave Pedal (Handle: %u)!\n", connHandle);
+            }
+
+            // FIX: Removed server->updateConnParams() to prevent Apple LL Controller crashes
         }
 
         void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
-            int count = server->getConnectedCount();
-            
-            if (count == 0) {
-                isHostConnected = false;
-                isMvaveConnected = false;
-                strlcpy(bleHostStatusStr, "WAIT", sizeof(bleHostStatusStr));
-                strlcpy(blePedalStatusStr, "WAIT", sizeof(blePedalStatusStr));
-            } else if (count == 1) {
-                isMvaveConnected = false;
-                strlcpy(blePedalStatusStr, "WAIT", sizeof(blePedalStatusStr));
-            }
-            
+            uint16_t connHandle = connInfo.getConnHandle();
             int hciCode = reason & 0xFF;
-            snprintf(bleLatchedDiscReason, sizeof(bleLatchedDiscReason), "M-DISC 0x%02X: %s", hciCode, getHciReasonString(hciCode));
-            snprintf(bleEventDebug, sizeof(bleEventDebug), "MAC DISC (0x%02X)", hciCode);
-            dualLog("[BLE SERVER] Device disconnected (0x%02X - %s).\n", hciCode, getHciReasonString(hciCode));
-            
-            NimBLEDevice::getAdvertising()->start();
+
+            if (connHandle == pedalServerConnHandle) {
+                isMvaveConnected = false;
+                pedalServerConnHandle = 0xFFFF;
+                strlcpy(blePedalStatusStr, "WAIT", sizeof(blePedalStatusStr));
+                snprintf(bleEventDebug, sizeof(bleEventDebug), "PEDAL DISC (0x%02X)", hciCode);
+                dualLog("[BLE SERVER] M-Vave Pedal (Server role) disconnected.\n");
+            } else {
+                isHostConnected = false;
+                hostConnHandle = 0xFFFF;
+                strlcpy(bleHostStatusStr, "WAIT", sizeof(bleHostStatusStr));
+                snprintf(bleLatchedDiscReason, sizeof(bleLatchedDiscReason), "M-DISC 0x%02X: %s", hciCode, getHciReasonString(hciCode));
+                snprintf(bleEventDebug, sizeof(bleEventDebug), "MAC DISC (0x%02X)", hciCode);
+                dualLog("[BLE SERVER] Host disconnected (0x%02X - %s).\n", hciCode, getHciReasonString(hciCode));
+                
+                NimBLEDevice::getAdvertising()->start();
+            }
         }
     };
     static inline ServerCallbacks serverCB;
@@ -201,8 +226,25 @@ public:
             NimBLEAttValue val = pChar->getValue();
             if (val.length() >= 5) {
                 const uint8_t* pData = val.data();
-                dualLog("[MAC/PEDAL -> MIDI] 0x%02X %03d %03d\n", pData[2], pData[3], pData[4]);
-                BleMidiPacket pkt = {pData[2], pData[3], pData[4]};
+                uint8_t header = pData[2];
+                uint8_t data1  = pData[3];
+                uint8_t data2  = pData[4];
+
+                if (!isMvaveConnected && connInfo.getConnHandle() == hostConnHandle) {
+                    if (header == 0xB0 || (header & 0xF0) == 0xC0) {
+                        isMvaveConnected = true;
+                        isHostConnected = false;
+                        pedalServerConnHandle = hostConnHandle;
+                        hostConnHandle = 0xFFFF;
+                        strlcpy(blePedalStatusStr, "CONN", sizeof(blePedalStatusStr));
+                        strlcpy(bleHostStatusStr, "WAIT", sizeof(bleHostStatusStr));
+                        dualLog("\n[BLE ARBITER] Reassigned Handle %u from Host to M-Vave Pedal based on MIDI traffic.\n", connInfo.getConnHandle());
+                        NimBLEDevice::getAdvertising()->start();
+                    }
+                }
+
+                dualLog("[MIDI RX] 0x%02X %03d %03d\n", header, data1, data2);
+                BleMidiPacket pkt = {header, data1, data2};
                 if (bleMidiQueue) xQueueSend(bleMidiQueue, &pkt, 0);
             }
         }
@@ -213,7 +255,6 @@ public:
         if (bleMidiQueue == nullptr) {
             bleMidiQueue = xQueueCreate(64, sizeof(BleMidiPacket));
         }
-
         strlcpy(bleInitStep, "1: NimBLE init()", sizeof(bleInitStep));
         dualLog("\n[BLE INIT] Initializing Dual-Role NimBLE Stack on Core 1...\n");
         NimBLEDevice::init("Whammy_S3");
@@ -223,7 +264,6 @@ public:
         strlcpy(bleInitStep, "2: createServer()", sizeof(bleInitStep));
         pServer = NimBLEDevice::createServer();
         pServer->setCallbacks(&serverCB);
-
         NimBLEService* pService = pServer->createService(midiServiceUUID);
         pServerChar = pService->createCharacteristic(
             midiCharUUID,
@@ -240,31 +280,28 @@ public:
         advData.setFlags(0x06);
         advData.addServiceUUID(midiServiceUUID);
         pAdvertising->setAdvertisementData(advData);
-
         NimBLEAdvertisementData scanRespData;
         scanRespData.setName("Whammy_S3");
         pAdvertising->setScanResponseData(scanRespData);
         pAdvertising->enableScanResponse(true);
-
         pAdvertising->setMinInterval(400); 
         pAdvertising->setMaxInterval(800); 
         pAdvertising->start();
-        dualLog("[BLE SERVER] Advertising as 'Whammy_S3' for macOS.\n");
+        dualLog("[BLE SERVER] Advertising as 'Whammy_S3' for PC/Mac.\n");
 
         strlcpy(bleInitStep, "4: getScan()", sizeof(bleInitStep));
         NimBLEScan* pScan = NimBLEDevice::getScan();
         pScan->setScanCallbacks(&scanCB, false);
-        pScan->setActiveScan(false);
-        pScan->setMaxResults(0); // Disables internal device storage to prevent memory corruption
-        
-        pScan->setInterval(100); 
-        pScan->setWindow(40);            
+        pScan->setActiveScan(true);
+        pScan->setMaxResults(0);          
+        pScan->setInterval(60); 
+        pScan->setWindow(55);             
 
         snprintf(bleEventDebug, sizeof(bleEventDebug), "DUAL: ADV & SCAN");
         snprintf(bleScanDebug, sizeof(bleScanDebug), "SCAN: LISTENING...");
         
         strlcpy(bleInitStep, "5: pScan->start()", sizeof(bleInitStep));
-        if (pScan->start(0, false, true)) { // Continuous scan with 0 timeout
+        if (pScan->start(0, false, true)) {
             strlcpy(bleInitStep, "6: SUCCESS (Scanning)", sizeof(bleInitStep));
         } else {
             strlcpy(bleInitStep, "ERR: SCAN FAILED", sizeof(bleInitStep));
@@ -281,7 +318,6 @@ public:
     }
 
     static void process() {
-        // Drain safely in the primary thread loop to avoid corrupting the Control_Surface queue
         if (bleMidiQueue != nullptr) {
             BleMidiPacket pkt;
             while (xQueueReceive(bleMidiQueue, &pkt, 0)) {
@@ -290,7 +326,7 @@ public:
             }
         }
 
-        if (!isHostConnected && !NimBLEDevice::getAdvertising()->isAdvertising()) {
+        if (pServer && pServer->getConnectedCount() < 2 && !NimBLEDevice::getAdvertising()->isAdvertising()) {
             NimBLEDevice::getAdvertising()->start();
         }
 
@@ -304,15 +340,14 @@ public:
             if (NimBLEDevice::getScan()->isScanning()) {
                 NimBLEDevice::getScan()->stop();
             }
-
             vTaskDelay(pdMS_TO_TICKS(150));
-
+            
             snprintf(bleEventDebug, sizeof(bleEventDebug), "CONNECTING...");
             dualLog("[BLE PROCESS] Connecting to pedal [%s]...\n", targetAddress.toString().c_str());
 
             if (!pClient) {
                 pClient = NimBLEDevice::createClient();
-                pClient->setClientCallbacks(&clientCB);
+                pClient->setClientCallbacks(&clientCB, false);
                 pClient->setConnectionParams(12, 40, 0, 500); 
                 pClient->setConnectTimeout(5000);
             }
@@ -335,7 +370,6 @@ public:
                     snprintf(bleLatchedDiscReason, sizeof(bleLatchedDiscReason), "GATT: NO SVC 03B8");
                     pClient->disconnect();
                 }
-
             } else {
                 int err = pClient->getLastError();
                 int hciCode = err & 0xFF;
@@ -352,4 +386,5 @@ public:
         }
     }
 };
+
 #endif

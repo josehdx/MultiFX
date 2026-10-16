@@ -1,5 +1,4 @@
 #pragma once
-
 #include "SystemState.h"
 #include "BoardHAL.h"
 #include "MidiRouter.h"
@@ -9,7 +8,7 @@
 inline void switchEffectMode(int newMode) {
     int cmode = (newMode % 10 + 10) % 10;
     activeEffectMode.store(cmode, std::memory_order_release);
-
+    
     // Clear ALL secondary effect states first for a clean mode swap
     isWhammyActive   = false;
     isFrozen         = false;
@@ -21,7 +20,10 @@ inline void switchEffectMode(int newMode) {
     isChorusMode     = false;
     isSwellMode      = false;
     isVibratoMode    = false;
-
+    
+    // Disable the MonoPoly override on mode switch to prevent algorithm jumping
+    isMonoPolyActive.store(false, std::memory_order_release);
+    
     // Activate only the selected mode's effect
     switch (cmode) {
         case 0: isWhammyActive   = true; break;
@@ -35,9 +37,8 @@ inline void switchEffectMode(int newMode) {
         case 8: isSwellMode      = true; break;
         case 9: isVibratoMode    = true; break;
     }
-
     Serial0.printf("[SYSTEM] Switched Effect Mode cleanly to: %d\n", cmode);
-
+    
     dspNeedsCommit = true;
     lutNeedsUpdate = true;
     settingsNeedSaving = true;
@@ -51,15 +52,15 @@ inline void triggerPanicReset() {
 
 inline bool commitDSPState() {
     if (!dspAckCommit.load(std::memory_order_acquire)) return false;
-
+    
     CriticalSectionGuard lock(MidiRouter::paramMux);
     DSPCoreState* backBuffer = &dspStates[dspWriteIndex];
-
+    
     for(int i=0; i<10; i++) {
         backBuffer->fxMem[i] = effectMemory[i];
         for(int j=0; j<5; j++) backBuffer->params[i][j] = fxParams[i][j];
     }
-
+    
     backBuffer->activeMode = activeEffectMode.load(std::memory_order_relaxed);
     backBuffer->latMode = latencyMode.load(std::memory_order_relaxed);
     backBuffer->fbIdx = feedbackIntervalIdx.load(std::memory_order_relaxed);
@@ -78,8 +79,8 @@ inline bool commitDSPState() {
     
     dspAckCommit.store(false, std::memory_order_release); 
     dspActiveState.store(backBuffer, std::memory_order_release);
-    dspWriteIndex = (dspWriteIndex + 1) & 1;      
-
+    dspWriteIndex = (dspWriteIndex + 1) & 1; 
+    
     return true;
 }
 
@@ -130,20 +131,24 @@ inline void cycleLatencyMode() {
 
 inline void setSampleRate(uint32_t targetSr) {
     if (currentSampleRate.load(std::memory_order_acquire) == targetSr) return;
-
+    
     dsp_is_paused.store(true, std::memory_order_release);
     while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
         vTaskDelay(pdMS_TO_TICKS(1)); 
     }
     
-    currentSampleRate.store(targetSr, std::memory_order_release);      
+    currentSampleRate.store(targetSr, std::memory_order_release); 
     settingsNeedSaving = false; 
-    lutNeedsUpdate = true;      
+    lutNeedsUpdate = true;
     
     Serial0.printf("[SYSTEM] Reconfiguring I2S Clock to %lu Hz...\n", targetSr);
     padVectorFilter.setLPF(1200.0f, (float)targetSr);
     
     I2SManager::disableAndDestroyChannels();
+    
+    // CRITICAL FIX: ESP-IDF requires a brief delay to cleanly flush hardware DMA descriptors 
+    // after a channel is destroyed. Skipping this causes initChannels to fail silently.
+    vTaskDelay(pdMS_TO_TICKS(25));
     
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(targetSr);
     clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
@@ -157,7 +162,7 @@ inline void setSampleRate(uint32_t targetSr) {
     memset(sramPitchHigh, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t)); 
     memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t)); 
     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t)); 
-    if(diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));      
+    if(diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));
     
     vTaskDelay(pdMS_TO_TICKS(30));
     
@@ -166,7 +171,7 @@ inline void setSampleRate(uint32_t targetSr) {
     globalAudioResetRequested.store(true, std::memory_order_release); 
     hardwareSyncMuteFrames.store((targetSr/HOP_SIZE)*0.40f, std::memory_order_release);
     
-    std::atomic_thread_fence(std::memory_order_seq_cst);      
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     
     dsp_is_paused.store(false, std::memory_order_release);
     
@@ -197,7 +202,7 @@ inline void turnScreenOn() {
 }
 
 inline void goToLightSleep() {
-    turnScreenOff();      
+    turnScreenOff();
     
     dsp_is_paused.store(true, std::memory_order_release);
     while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 

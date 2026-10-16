@@ -175,6 +175,10 @@ public:
             uint16_t connHandle = connInfo.getConnHandle();
             std::string addrStr = connInfo.getAddress().toString();
             
+            if (NimBLEDevice::getScan()->isScanning()) {
+                NimBLEDevice::getScan()->stop();
+            }
+            
             bool isPedal = false;
             if (hasTarget && addrStr == targetAddress.toString()) isPedal = true;
             if (addrStr.find("12:9d:6d") != std::string::npos) isPedal = true;
@@ -197,7 +201,6 @@ public:
                 dualLog("\n[BLE SERVER] Host (Mac/iOS/PC) connected (Handle: %u)!\n", connHandle);
             }
 
-            // CRITICAL FIX: Restart advertising from inside the callback thread safely.
             if (server->getConnectedCount() < 2) {
                 NimBLEDevice::getAdvertising()->start();
             }
@@ -222,7 +225,6 @@ public:
                 dualLog("[BLE SERVER] Host disconnected (0x%02X - %s).\n", hciCode, getHciReasonString(hciCode));
             }
             
-            // Safe to call from here because we are in the NimBLE Task thread.
             NimBLEDevice::getAdvertising()->start();
         }
     };
@@ -319,8 +321,9 @@ public:
     static void sendMidiToHost(uint8_t header, uint8_t data1, uint8_t data2) {
         if (isHostConnected && pServerChar) {
             uint8_t packet[5] = {0x80, 0x80, header, data1, data2};
-            pServerChar->setValue(packet, 5);
-            pServerChar->notify();
+            // CRITICAL FIX: Send notification array directly.
+            // Avoids mutating the characteristic's underlying std::string buffer to prevent memory race condition.
+            pServerChar->notify(packet, 5, false);
         }
     }
 
@@ -331,6 +334,10 @@ public:
                 dispatchBleMidi(pkt.header, pkt.data1, pkt.data2);
                 sendMidiToHost(pkt.header, pkt.data1, pkt.data2);
             }
+        }
+
+        if (pServer && pServer->getConnectedCount() < 2 && !NimBLEDevice::getAdvertising()->isAdvertising()) {
+            NimBLEDevice::getAdvertising()->start();
         }
 
         if (!hasTarget && !isMvaveConnected && 

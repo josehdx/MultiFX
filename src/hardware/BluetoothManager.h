@@ -333,20 +333,28 @@ public:
             while (xQueueReceive(bleMidiQueue, &pkt, 0)) {
                 dispatchBleMidi(pkt.header, pkt.data1, pkt.data2);
                 
-                // Do not blindly echo CC 11 here: dispatchBleMidi routes it to CC 11 or CC 19
                 if (!(pkt.header == 0xB0 && pkt.data1 == 11)) {
                     sendMidiToHost(pkt.header, pkt.data1, pkt.data2);
                 }
             }
         }
 
-        if (pServer && pServer->getConnectedCount() < 2 && !NimBLEDevice::getAdvertising()->isAdvertising()) {
-            NimBLEDevice::getAdvertising()->start();
+        // CRITICAL FIX: Debounce advertising start to prevent tight-loop NimBLE queue flooding
+        static unsigned long lastAdvCall = 0;
+        if (pServer && pServer->getConnectedCount() < 2) {
+            if (!NimBLEDevice::getAdvertising()->isAdvertising() && (millis() - lastAdvCall > 500)) {
+                NimBLEDevice::getAdvertising()->start();
+                lastAdvCall = millis();
+            }
         }
 
-        if (!hasTarget && !isMvaveConnected && 
-            millis() >= reconnectLockoutUntil && !NimBLEDevice::getScan()->isScanning()) {
-            NimBLEDevice::getScan()->start(0, false, true);
+        // CRITICAL FIX: Debounce async scanning start to prevent ble_gap_update_next_exp crashes
+        static unsigned long lastScanCall = 0;
+        if (!hasTarget && !isMvaveConnected && millis() >= reconnectLockoutUntil) {
+            if (!NimBLEDevice::getScan()->isScanning() && (millis() - lastScanCall > 500)) {
+                NimBLEDevice::getScan()->start(0, false, true);
+                lastScanCall = millis();
+            }
         }
 
         if (hasTarget && !isMvaveConnected && millis() >= clientConnectTimestamp) {

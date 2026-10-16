@@ -222,7 +222,6 @@ public:
             monoAlgo = constrain(monoAlgo, 0, 4);
         }
 
-        // CRITICAL FIX: Trigger background redraw when Volume Mode changes
         if (d.isMonoPolyActive != lastMonoPolyActive || 
            (d.isMonoPolyActive && monoAlgo != lastMonoPolyAlgo) || 
            d.isVolumeMode != lastVolumeMode) {
@@ -244,10 +243,13 @@ public:
             
             drawKnobStatic(bgSpr, pbCenters[0], 48, 14, "PB1");
             drawKnobStatic(bgSpr, pbCenters[1], 48, 14, "PB2");
-            drawKnobStatic(bgSpr, pbCenters[2], 48, 14, "PB3");
             
-            // CRITICAL FIX: Dynamic 4th Knob Label based on Volume Mode
-            const char* pb4Label = d.isVolumeMode ? "CC 19" : "PB4-7B";
+            // PB3 Label adapts to Volume Mode
+            const char* pb3Label = d.isVolumeMode ? "Vol" : "PB3";
+            drawKnobStatic(bgSpr, pbCenters[2], 48, 14, pb3Label);
+            
+            // PB4/MIDI Label adapts to Volume Mode
+            const char* pb4Label = d.isVolumeMode ? "Vol" : "PB4-14B";
             drawKnobStatic(bgSpr, pbCenters[3], 48, 14, pb4Label);
             
             const char* currentNames[5];

@@ -162,27 +162,32 @@ public:
 
             pedals.updateLastMidiB();
         }
-        // PB3: 14-bit Pitch Bend on Channel 3
+        // PB3: Physical Expression Treadle (Channel 3 output)
         else if (!pedals.isUnpluggedC() && deltaC > 48) {
             lastProcessedC = currentPB3;
             activePedalSource = 3;
             lastActivePedal = currentPB3;
             lastActivityTime = millis();
             
+            uint8_t msb = (uint8_t)((currentPB3 >> 7) & 0x7F);
+            
             if (isVolumeMode) {
                 volumePedalGain = (float)currentPB3 / 16383.0f;
                 dspNeedsCommit = true;
+
+                // 7-bit Volume: CC 19 on Channel 3
+                Control_Surface.sendControlChange({19, Channel_3}, msb);
+                BluetoothManager::sendMidiToHost(0xB2, 19, msb); // 0xB2 = Control Change on Channel 3
             } else {
                 if (!asyncLutUpdateRequested.load(std::memory_order_acquire)) {
                     float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                     if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB3], std::memory_order_release);
                 }
+
+                // 14-bit Pitch Bend on Channel 3
+                Control_Surface.sendPitchBend(Channel_3, currentPB3);
+                BluetoothManager::sendMidiToHost(0xE2, currentPB3 & 0x7F, (currentPB3 >> 7) & 0x7F);
             }
-
-            // Always transmit 14-bit Pitch Bend on Channel 3
-            Control_Surface.sendPitchBend(Channel_3, currentPB3);
-            BluetoothManager::sendMidiToHost(0xE2, currentPB3 & 0x7F, (currentPB3 >> 7) & 0x7F);
-
             pedals.updateLastMidiC();
         }
     }

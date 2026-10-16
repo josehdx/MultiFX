@@ -21,7 +21,7 @@ extern bool showBleWarning;
 // 0 = Full I2S Audio Mode (GPIO 43=MCLK, 44=BCLK, 18=WS, 17=DIN)
 //     NOTE: Serial0 MUST be detached in Mode 0 to prevent seizing GPIO 43/44!
 // =========================================================================
-#define ENABLE_SERIAL_DEBUG 0
+#define ENABLE_SERIAL_DEBUG 1
 
 class BoardHAL {
 public:
@@ -80,7 +80,6 @@ public:
         
         pb1 = analogRead(1); 
         pb2 = analogRead(2); 
-
 #if defined(TARGET_LILYGO)
         par1 = analogRead(3);
         pb3  = analogRead(10);
@@ -112,14 +111,13 @@ public:
             dData.batPercent = PowerManager::getBatteryPercentage(dData.batVoltage);
             
             dData.bleConnected = bleConnected;
-            dData.bleHostConnected = BluetoothManager::isHostConnected;
+            // CRITICAL FIX: Light up the PC icon if either a real PC/Mac or the NUX Amp is connected
+            dData.bleHostConnected = BluetoothManager::isHostConnected || BluetoothManager::isNuxConnected;
             dData.blePedalConnected = BluetoothManager::isMvaveConnected;
             dData.activeMode = activeDSP->activeMode;
+
             for(int i = 0; i < 10; i++) { dData.fxStates[i] = (&activeDSP->w)[i]; }
-            dData.pb1 = pb1; 
-            dData.pb2 = pb2; 
-            dData.pb3 = pb3; 
-            dData.cc11 = cc11;
+            dData.pb1 = pb1;  dData.pb2 = pb2;  dData.pb3 = pb3;  dData.cc11 = cc11;
 
             for(int i = 0; i < 5; i++) { 
                 dData.paramVals[i] = activeDSP->params[activeDSP->activeMode % 10][i]; 
@@ -141,9 +139,7 @@ public:
             dData.underflows = underflows; dData.dmaCount = 0; 
             dData.stackWatermark = stackWatermark;
             
-            // CRITICAL FIX: Pass latency window mode to UI
             dData.latencyMode = latencyMode.load(std::memory_order_relaxed);
-
             dData.isKnobEditMode = isKnobEditMode;
             dData.showBleWarning = showBleWarning;
             dData.showSavingScreen = showSavingScreen;

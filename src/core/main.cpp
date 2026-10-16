@@ -2,7 +2,6 @@
 #include <Preferences.h>
 #include <Update.h>
 #include "esp_log.h"
-
 #define FW_VERSION "v5.00H"
 
 // Core System Includes
@@ -23,6 +22,8 @@ DisplayManager displayManager;
 
 void dispatchBleMidi(uint8_t header, uint8_t data1, uint8_t data2) {
     ChannelMessage cm(MIDIMessage(header, data1, data2, Cable_1));
+    // Wrap the dispatch in the parameter mux to prevent RTOS collisions
+    CriticalSectionGuard lock(MidiRouter::paramMux);
     channelMessageCallback(cm);
 }
 
@@ -102,8 +103,8 @@ void loop() {
         
         // Explicitly wait for BOTH AudioTask and LUTUpdateTask to acknowledge park state
         while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
-            vTaskDelay(pdMS_TO_TICKS(1)); 
-        }
+             vTaskDelay(pdMS_TO_TICKS(1)); 
+         }
         
         AppSettings currentSettings;
         memset(&currentSettings, 0, sizeof(AppSettings));
@@ -137,8 +138,8 @@ void loop() {
         
         // Ensure tasks have safely unparked before re-entering main system loop
         while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { 
-            vTaskDelay(pdMS_TO_TICKS(1)); 
-        }
+             vTaskDelay(pdMS_TO_TICKS(1)); 
+         }
     }
 
     if (panicResetRequested.load(std::memory_order_acquire)) {

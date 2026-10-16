@@ -10,8 +10,7 @@ inline void switchEffectMode(int newMode) {
     int cmode = (newMode % 10 + 10) % 10;
     activeEffectMode.store(cmode, std::memory_order_release);
     
-    // Clear ALL secondary effect states first for a clean mode swap
-    isWhammyActive   = false;
+    // Clear secondary effect states first for a clean mode swap
     isFrozen         = false;
     isFeedbackActive = false;
     isHarmonizerMode = false;
@@ -22,12 +21,13 @@ inline void switchEffectMode(int newMode) {
     isSwellMode      = false;
     isVibratoMode    = false;
     
-    // Disable the MonoPoly override on mode switch to prevent algorithm jumping
-    isMonoPolyActive.store(false, std::memory_order_release);
+    // Polyphonic Whammy is global whenever Mono Whammy is not active
+    bool monoActive = isMonoPolyActive.load(std::memory_order_acquire);
+    isWhammyActive = !monoActive;
     
     // Activate only the selected mode's effect
     switch (cmode) {
-        case 0: isWhammyActive   = true; break;
+        case 0: /* Mode 0 is Whammy itself; isWhammyActive already set */ break;
         case 1: isFrozen         = true; break;
         case 2: isFeedbackActive = true; break;
         case 3: isHarmonizerMode = true; break;
@@ -49,7 +49,10 @@ inline void switchEffectMode(int newMode) {
 inline void triggerPanicReset() {
     panicResetRequested.store(true, std::memory_order_release);
     
-    // CRITICAL FIX: Ensure Volume Mode is explicitly killed and pedals are unlocked
+    // Disable Mono Whammy and re-engage Poly Whammy
+    isMonoPolyActive.store(false, std::memory_order_release);
+    isWhammyActive = true;
+    
     if (isVolumeMode) {
         isVolumeMode = false;
         volumePedalGain = 1.0f; 
@@ -226,7 +229,6 @@ inline void goToLightSleep() {
     I2SManager::disableAndDestroyChannels();
     
     isAdcPaused = true;
-    
     if (multifx_adc_handle != NULL) {
         adc_continuous_stop(multifx_adc_handle);
     }

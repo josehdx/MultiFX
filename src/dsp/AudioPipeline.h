@@ -73,16 +73,27 @@ public:
         uint32_t hannMultLow = (4096U<<16)/windowSizeLow; uint32_t hannMultHigh = (4096U<<16)/windowSizeHigh;
         uint32_t hannIntMult=(4096U<<16)/(uint32_t)currentWindowSize, windowMask=(uint32_t)currentWindowSize-1;
         
-        float p_w_dry=c_fx[0][0], p_w_wet=c_fx[0][1], p_fz_apf=c_fx[1][0], p_fz_att=c_fx[1][1], p_fz_rel=c_fx[1][2], p_fb_spd=c_fx[2][0], p_fb_drv=c_fx[2][1], p_fb_off=c_fx[2][2], p_hr_mix=c_fx[3][0], p_sy_att=c_fx[5][0], p_sy_rel=c_fx[5][1], p_sy_flt=c_fx[5][2], p_sy_mix=c_fx[5][3], p_pd_sm=c_fx[6][0], p_pd_mix=c_fx[6][1], p_ch_spd=c_fx[7][0], p_ch_mix=c_fx[7][1], p_sw_thr=c_fx[8][0], p_sw_att=c_fx[8][1], p_sw_rel=c_fx[8][2], p_vb_dep=c_fx[9][0];
+        // Whammy dry/wet parameters always sourced from slot 0
+        float p_w_dry=c_fx[0][0], p_w_wet=c_fx[0][1];
         
-        // CRITICAL FIX: The 5th Whammy Knob (c_fx[0][4]) now controls the portamento glide speed dynamically
+        float p_fz_apf=c_fx[1][0], p_fz_att=c_fx[1][1], p_fz_rel=c_fx[1][2];
+        float p_fb_spd=c_fx[2][0], p_fb_drv=c_fx[2][1], p_fb_off=c_fx[2][2];
+        float p_hr_mix=c_fx[3][0];
+        float p_sy_att=c_fx[5][0], p_sy_rel=c_fx[5][1], p_sy_flt=c_fx[5][2], p_sy_mix=c_fx[5][3];
+        float p_pd_sm=c_fx[6][0], p_pd_mix=c_fx[6][1];
+        float p_ch_spd=c_fx[7][0], p_ch_mix=c_fx[7][1];
+        float p_sw_thr=c_fx[8][0], p_sw_att=c_fx[8][1], p_sw_rel=c_fx[8][2];
+        float p_vb_dep=c_fx[9][0];
+        
         float glideSec = 0.015f + (c_fx[0][4] * 0.185f); 
         float portamentoCoeff = 1.0f - expf(-1.0f / (glideSec * sr));
         
         float chorusPhaseIncr = p_ch_spd / sr;
         float feedbackPhaseIncr = p_fb_spd / sr;
         float targetPitch = FX_Whammy::getSpd(c_pt);
-        bool frzActive=((c_act==1&&c_w)||c_fz);
+        
+        // Individual effects are cleanly driven by their dedicated flags
+        bool frzActive = c_fz;
         
         if(__builtin_expect(frzActive && !wasFrozen, 0)) { freezePlayCounterVar=0; int bestStart=freezeWriteIdxVar, tempIdx=freezeWriteIdxVar; for(int s=0; s<4000; s++) { int prev=tempIdx-1; if(prev<0) prev+=freezeLength; if(freezeBuffer[tempIdx]>=0 && freezeBuffer[prev]<0) { bestStart=tempIdx; break; } tempIdx=prev; } freezeStartIdxVar=bestStart; activeFreezeLength=freezeLength; int searchEnd=bestStart-1; if(searchEnd<0) searchEnd+=freezeLength; tempIdx=searchEnd; for(int s=0; s<4000; s++) { int prev=tempIdx-1; if(prev<0) prev+=freezeLength; if(freezeBuffer[tempIdx]>=0 && freezeBuffer[prev]<0) { activeFreezeLength=s; break; } tempIdx=prev; } if(activeFreezeLength<64) activeFreezeLength=freezeLength; }
         if(__builtin_expect(!frzActive && wasFrozen, 0)) apfNeedsClear=true; 
@@ -91,8 +102,16 @@ public:
         uint32_t safeFreezeLen = (activeFreezeLength >= 64) ? activeFreezeLength : (sr > 0 ? (uint32_t)sr : 96000);
         float activeInvFreqLength = 1.0f / (float)safeFreezeLen;
         
-        bool synthActive=((c_act==5&&c_w)||c_sy), padActive=((c_act==6&&c_w)||c_pd), harmActive=((c_act==3&&c_w)||c_hr), swellActive=((c_act==8&&c_w)||c_sw), chorusActive=((c_act==7&&c_w)||c_ch), feedbackActive=((c_act==2&&c_w)||c_fb);
-        if(__builtin_expect(feedbackActive && !wasFeedbackActive, 0)) { fbOutNode=0.0f; fbHpfState=0.0f; feedbackFilterVar=0.0f; } wasFeedbackActive=feedbackActive; bool vibratoActive=((c_act==9&&c_w)||c_vb), capoActive=((c_act==4&&c_w)||c_cp);
+        bool synthActive = c_sy;
+        bool padActive = c_pd;
+        bool harmActive = c_hr;
+        bool swellActive = c_sw;
+        bool chorusActive = c_ch;
+        bool feedbackActive = c_fb;
+        if(__builtin_expect(feedbackActive && !wasFeedbackActive, 0)) { fbOutNode=0.0f; fbHpfState=0.0f; feedbackFilterVar=0.0f; } wasFeedbackActive=feedbackActive; 
+        bool vibratoActive = c_vb;
+        bool capoActive = c_cp;
+        
         bool localMonoPolyActive = isMonoPolyActive.load(std::memory_order_acquire);
         
         float localSwellGain=swellGain, localVolGain=c_vg, localFrzRamp=freezeRamp, localFbRamp=feedbackRamp, target_delay=constrain((float)(sr*p_fb_off), 0.0f, (float)(FB_BUFFER_SIZE-1)); smoothed_delay_samples+= (target_delay-smoothed_delay_samples)*0.01f*srScale+DC_OFFSET; int delaySamples=(int)smoothed_delay_samples;
@@ -101,13 +120,24 @@ public:
         float fbLpfCoeff = (sr == 96000) ? 0.05f : 0.1f;
         float fbLpfRetain = 1.0f - fbLpfCoeff; float dc_alpha = (sr == 96000) ? 0.0005f : 0.001f;
         float meter_decay = (sr == 96000) ? 0.999f : 0.998f;
-        int halfWindow=(int)currentWindowSize/2; bool activeGroup=c_w||localMonoPolyActive||harmActive||chorusActive||feedbackActive||synthActive||padActive||frzActive||vibratoActive||capoActive, dryGroup=chorusActive||padActive||frzActive||feedbackActive||(localFrzRamp>0.0f)||(localFbRamp>0.0f), repeatGroup=capoActive||synthActive||vibratoActive||padActive||harmActive;
-        float g_base=0.0f; if(dryGroup) { if(!repeatGroup) g_base=0.4f; } else if(harmActive) g_base=0.5f; else g_base=1.0f; float g_w2=harmActive?p_hr_mix:0.0f, g_w3=chorusActive?p_ch_mix:0.0f;
-        bool padIsAudible = padActive || (fabsf(padVectorFilter.delay_state[0]) > 0.001f);
-        float g_pad=padIsAudible?p_pd_mix:0.0f, g_frz=(!frzActive&&localFrzRamp>0.0f)?0.5f:0.0f, g_fb=(feedbackActive||localFbRamp>0.0f)?0.6f:0.0f;
+        int halfWindow=(int)currentWindowSize/2; 
         
+        bool activeGroup = c_w || localMonoPolyActive || harmActive || chorusActive || feedbackActive || synthActive || padActive || frzActive || vibratoActive || capoActive;
+        bool dryGroup = chorusActive || padActive || frzActive || feedbackActive || (localFrzRamp > 0.0f) || (localFbRamp > 0.0f);
+        bool repeatGroup = capoActive || synthActive || vibratoActive || padActive || harmActive;
+        
+        float g_base=0.0f; if(dryGroup) { if(!repeatGroup) g_base=0.4f; } else if(harmActive) g_base=0.5f; else g_base=1.0f; 
+        float g_w2 = harmActive ? p_hr_mix : 0.0f;
+        float g_w3 = chorusActive ? p_ch_mix : 0.0f;
+        
+        bool padIsAudible = padActive || (fabsf(padVectorFilter.delay_state[0]) > 0.001f);
+        float g_pad = padIsAudible ? p_pd_mix : 0.0f;
+        float g_frz = (!frzActive && localFrzRamp > 0.0f) ? 0.5f : 0.0f;
+        float g_fb  = (feedbackActive || localFbRamp > 0.0f) ? 0.6f : 0.0f;
+        
+        // Whammy wet/dry mix enabled globally via c_w or Mono Whammy
         float g_whammy = (c_w || localMonoPolyActive) ? p_w_wet : 0.0f;
-        float g_dry = (c_w || localMonoPolyActive) ? p_w_dry : 1.0f;
+        float g_dry    = (c_w || localMonoPolyActive) ? p_w_dry : 1.0f;
         
         float vol_alpha=0.01f*srScale, envRetain=powf(0.99f,srScale), envAttack=1.0f-envRetain;
         if(__builtin_expect(isnan(synthFilter)||isinf(synthFilter), 0)) synthFilter=0.0f; if(__builtin_expect(isnan(synthBandpass)||isinf(synthBandpass), 0)) synthBandpass=0.0f; if(__builtin_expect(isnan(feedbackFilterVar)||isinf(feedbackFilterVar), 0)) feedbackFilterVar=0.0f; if(__builtin_expect(isnan(fbHpfState)||isinf(fbHpfState), 0)) fbHpfState=0.0f;
@@ -153,18 +183,16 @@ public:
             float w4 = 0.0f, w5 = 0.0f;
             
             if (__builtin_expect(localMonoPolyActive, 0)) {
-                // CRITICAL FIX: The MonoPoly tracker now correctly intercepts `delayIn` (which includes 
-                // the crossfaded frozen audio) rather than `procSample` so it bends the Freeze effect accurately.
                 monoPolyEngine.process(
                     delayIn, 
                     currentPitch,
                     w1Buf[i],
                     dryBuf[i],
-                    c_fx[c_act][0],
-                    c_fx[c_act][1],
-                    c_fx[c_act][2],
-                    c_fx[c_act][3],
-                    c_fx[c_act][4]
+                    c_fx[0][0],
+                    c_fx[0][1],
+                    c_fx[0][2],
+                    c_fx[0][3],
+                    c_fx[0][4]
                 );
                 w4 = w1Buf[i];
                 w5 = 0.0f;

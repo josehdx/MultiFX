@@ -105,7 +105,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
         }
 
         case MidiEvent::VOL_MODE_TOGGLE: {
-            // CRITICAL FIX: Debounced relative toggling, ignores 127 absolute values
             static unsigned long lastVolToggle = 0;
             if (millis() - lastVolToggle > 500) {
                 lastVolToggle = millis();
@@ -140,28 +139,29 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             static unsigned long lastTgl = 0;
             if (action.val > 0 && millis() - lastTgl > 250) {
                 lastTgl = millis();
+                
+                // Mono Whammy Toggle (Target 99)
                 if (action.targetEffect == 99) {
                     bool newState = !isMonoPolyActive.load(std::memory_order_acquire);
                     isMonoPolyActive.store(newState, std::memory_order_release);
-                    if (newState) isWhammyActive = false;
+                    // Mutual exclusion: When Mono Whammy is ON, Poly Whammy is OFF.
+                    // When Mono Whammy is OFF, Poly Whammy is restored globally!
+                    isWhammyActive = !newState;
                 }
-                if (action.targetEffect == 1) isFrozen = !isFrozen;
+                else if (action.targetEffect == 1) isFrozen = !isFrozen;
                 else if (action.targetEffect == 2) isFeedbackActive = !isFeedbackActive;
                 else if (action.targetEffect == 3) isHarmonizerMode = !isHarmonizerMode;
-                else if (action.targetEffect == 4) isCapoMode = !isCapoMode;
+                else if (action.targetEffect == 4) {
+                    isCapoMode = !isCapoMode;
+                    lutNeedsUpdate = true;
+                    asyncLutUpdateRequested.store(true, std::memory_order_release);
+                }
                 else if (action.targetEffect == 5) isSynthMode = !isSynthMode;
                 else if (action.targetEffect == 6) isPadMode = !isPadMode;
                 else if (action.targetEffect == 7) isChorusMode = !isChorusMode;
                 else if (action.targetEffect == 8) isSwellMode = !isSwellMode;
                 else if (action.targetEffect == 9) isVibratoMode = !isVibratoMode;
                 
-                if (currentMode == action.targetEffect) {
-                    isWhammyActive = !isWhammyActive;
-                    if (currentMode == 4 && isCapoMode) {
-                        lutNeedsUpdate = true;
-                        asyncLutUpdateRequested.store(true, std::memory_order_release);
-                    }
-                }
                 dspNeedsCommit = true; 
                 settingsNeedSaving = true; 
                 lastParameterChangeTime = millis();

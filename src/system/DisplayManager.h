@@ -75,7 +75,6 @@ private:
         {"ALGO", "FFT",  "PHS",  "TRN",  "MIX"}
     };
 
-    // CRITICAL FIX: Replaced "MODE" with "GLD" (Glide) for the Polyphonic Whammy's 5th parameter
     const char* POLY_LABELS[10][5] = {
         {"DRY",  "WET",  "TOE",  "HEEL", "GLD"}, 
         {"APF",  "ATTK", "REL",  "FADE", "MIX"},
@@ -230,8 +229,6 @@ public:
             bgSpr.setTextColor(TFT_WHITE, TFT_BLACK);
             
             bgSpr.drawFastHLine(0, 18, 320, TFT_WHITE);
-            bgSpr.drawFastHLine(15, 78, 290, TFT_DARKGREY);
-            bgSpr.drawFastHLine(0, 142, 320, TFT_DARKGREY);
             
             bgSpr.drawRect(2, 24, 10, 106, TFT_WHITE);
             bgSpr.setTextDatum(TC_DATUM);
@@ -246,7 +243,8 @@ public:
             drawKnobStatic(bgSpr, pbCenters[3], 48, 14, "CC11");
             
             const char* currentNames[5];
-            if (d.isMonoPolyActive) {
+            
+            if (d.isMonoPolyActive && d.activeMode == 0) {
                 for (int i = 0; i < 5; i++) currentNames[i] = MONO_LABELS[monoAlgo][i];
             } else {
                 int actMode = d.activeMode % 10;
@@ -277,8 +275,7 @@ public:
         if (d.isVolumeMode) {
             spr.setTextColor(TFT_ORANGE, TFT_BLACK);
             snprintf(headerBuf, sizeof(headerBuf), "*** VOLUME MODE ***");
-        } else if (d.isMonoPolyActive) {
-            // CRITICAL FIX: Renamed header to "Mono Whammy"
+        } else if (d.isMonoPolyActive && d.activeMode == 0) {
             spr.setTextColor(TFT_CYAN, TFT_BLACK);
             snprintf(headerBuf, sizeof(headerBuf), "Mono Whammy [ T:%+d | H:%+d ]", (int)d.whammyToe, (int)d.whammyHeel);
         } else {
@@ -328,24 +325,23 @@ public:
         for (int i = 0; i < 5; i++) {
             bool isBip = false;
             float pNorm = d.paramVals[i];
-            if (d.isMonoPolyActive && i == 0) {
+            
+            if (d.isMonoPolyActive && d.activeMode == 0 && i == 0) {
                 snprintf(buf, sizeof(buf), "%s", MONO_ALGOS[monoAlgo]);
                 pNorm = monoAlgo / 4.0f; 
                 isBip = false;
-            } else if (d.activeMode == 0 && !d.isMonoPolyActive) {
+            } 
+            else if (d.activeMode == 0) {
                 if (i == 2 || i == 3) {
                     snprintf(buf, sizeof(buf), "%+d", (int)d.paramVals[i]);
                     pNorm = d.paramVals[i] / 24.0f;
                     isBip = true;
-                } else if (i == 4) {
-                    // CRITICAL FIX: Parameter 4 is now GLD (Glide Speed). Replaced MONO_ALGOS logic.
-                    snprintf(buf, sizeof(buf), "%.2f", d.paramVals[i]);
-                    pNorm = d.paramVals[i];
-                    isBip = false;
                 } else {
                     snprintf(buf, sizeof(buf), "%.2f", d.paramVals[i]);
+                    isBip = false;
                 }
-            } else {
+            } 
+            else {
                 snprintf(buf, sizeof(buf), "%.2f", d.paramVals[i]);
                 isBip = (i == 0 && d.paramVals[i] < 0.0f) || (i == 0);
                 pNorm = isBip ? (d.paramVals[i] / 24.0f) : d.paramVals[i];
@@ -353,49 +349,55 @@ public:
             drawKnobDynamic(spr, parCenters[i], 110, 12, constrain(pNorm, isBip ? -1.0f : 0.0f, 1.0f), isBip, buf);
         }
 
+        const int CHAIN_ORDER[10] = {8, 1, 4, 0, 5, 3, 7, 9, 6, 2};
+        
         int activeIndices[10];
         int activeCount = 0;
         for (int i = 0; i < 10; i++) {
-            if (d.fxStates[i]) activeIndices[activeCount++] = i;
+            int fxIdx = CHAIN_ORDER[i];
+            // Pitch Bend Token: Shows MW when Mono is active, WH when Poly is active
+            bool isEffectActive = (fxIdx == 0) ? (d.fxStates[0] || d.isMonoPolyActive) : d.fxStates[fxIdx];
+            if (isEffectActive) activeIndices[activeCount++] = fxIdx;
         }
 
         if (activeCount > 0) {
-            int badgeW = 28;
-            int totalW = (activeCount * badgeW) + ((activeCount - 1) * 4);
+            int badgeW = 26; 
+            int totalW = (activeCount * badgeW) + ((activeCount - 1) * 2);
             int startX = (320 - totalW) / 2;
             for (int k = 0; k < activeCount; k++) {
                 int fxIdx = activeIndices[k];
-                int bx = startX + (k * (badgeW + 4));
+                int bx = startX + (k * (badgeW + 2));
                 uint16_t bColor = (fxIdx == 0 && d.isMonoPolyActive) ? TFT_DARKGREY : TFT_BLUE;
                 
-                spr.fillRect(bx, 148, badgeW, 16, bColor);
+                const char* bName = FX_NAMES[fxIdx];
+                if (fxIdx == 0 && d.isMonoPolyActive) bName = "MW";
+
+                spr.fillRect(bx, 75, badgeW, 14, bColor);
                 spr.setTextColor(TFT_WHITE, bColor);
                 spr.setTextDatum(TC_DATUM);
-                spr.drawString(FX_NAMES[fxIdx], bx + (badgeW / 2), 156, 1);
+                spr.drawString(bName, bx + (badgeW / 2), 79, 1);
             }
         }
 
         if (SHOW_TELEMETRY) {
-            spr.fillRect(16, 26, 288, 54, TFT_BLACK); 
-            spr.drawRect(16, 26, 288, 54, TFT_YELLOW);
+            spr.fillRect(16, 142, 288, 26, TFT_BLACK); 
+            spr.drawRect(16, 142, 288, 26, TFT_YELLOW);
             
             spr.setTextDatum(TL_DATUM);
             spr.setTextColor(TFT_YELLOW, TFT_BLACK);
             
-            char line1[64], line2[64], line3[64];
-            
-            snprintf(line1, sizeof(line1), "CPU0:%d%% CPU1:%d%% | SR:%lu Hz", 
-                     (int)d.dspCoreLoad, (int)d.ctrlCoreLoad, (unsigned long)d.sampleRate);
+            char line1[128];
+            snprintf(line1, sizeof(line1), "CPU0:%d%% CPU1:%d%% | SR:%luHz | LAT:%ums [W:%d]", 
+                     (int)d.dspCoreLoad, (int)d.ctrlCoreLoad, (unsigned long)d.sampleRate,
+                     (unsigned int)d.peakLatency, d.latencyMode);
                      
-            snprintf(line2, sizeof(line2), "RAM:%uK | PSRAM:%uK | STK:%u", 
-                     (unsigned int)(d.freeSRAM / 1024), (unsigned int)(d.freePSRAM / 1024), (unsigned int)d.stackWatermark);
+            char line2[128];
+            snprintf(line2, sizeof(line2), "RAM:%uK PS:%uK STK:%u UDF:%u", 
+                     (unsigned int)(d.freeSRAM / 1024), (unsigned int)(d.freePSRAM / 1024), 
+                     (unsigned int)d.stackWatermark, (unsigned int)d.underflows);
             
-            snprintf(line3, sizeof(line3), "LATENCY:%ums [WIN:%d] | IN:%.2f OUT:%.2f", 
-                     (unsigned int)d.peakLatency, d.latencyMode, d.inMeter, d.outMeter);
-            
-            spr.drawString(line1, 20, 30, 1);
-            spr.drawString(line2, 20, 44, 1);
-            spr.drawString(line3, 20, 58, 1);
+            spr.drawString(line1, 20, 144, 1);
+            spr.drawString(line2, 20, 156, 1);
         }
 
         if (d.showSavingScreen) {

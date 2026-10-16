@@ -74,6 +74,7 @@ void loop() {
     }
 
     DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
+    
     if (activeDSP) {
         uint32_t watermarkVal = 0;
 #ifdef ENABLE_ADVANCED_TELEMETRY
@@ -97,6 +98,7 @@ void loop() {
 
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) {
         dsp_is_paused.store(true, std::memory_order_release);
+        
         // Explicitly wait for BOTH AudioTask and LUTUpdateTask to acknowledge park state
         while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
             vTaskDelay(pdMS_TO_TICKS(1)); 
@@ -104,21 +106,34 @@ void loop() {
         
         AppSettings currentSettings;
         memset(&currentSettings, 0, sizeof(AppSettings));
+        uint16_t currentFxStates = 0;
         
         for(int i = 0; i < 10; i++) {
             currentSettings.fxMem[i] = effectMemory[i];
             for(int p = 0; p < 5; p++) {
                 currentSettings.params[i][p] = fxParams[i][p];
             }
+            if ((&activeDSP->w)[i]) currentFxStates |= (1 << i);
         }
         
-        preferences.putBytes("dspData", &currentSettings, sizeof(AppSettings));
+        // CRITICAL FIX: Pass all global states into SettingsManager so Sample Rate persists
+        settingsMgr.save(preferences, 
+                         activeDSP->activeMode, 
+                         activeDSP->latMode,
+                         activeDSP->fbIdx, 
+                         isPB2WiperMode, 
+                         isVolumeMode, 
+                         currentFxStates, 
+                         currentSampleRate.load(std::memory_order_acquire),
+                         &currentSettings, 
+                         sizeof(AppSettings));
+                         
         settingsNeedSaving = false;
         
         dsp_is_paused.store(false, std::memory_order_release);
         if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
         if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
-
+        
         // Ensure tasks have safely unparked before re-entering main system loop
         while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { 
             vTaskDelay(pdMS_TO_TICKS(1)); 

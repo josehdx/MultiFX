@@ -77,12 +77,14 @@ public:
 
     static void fetchADC(adc_continuous_handle_t handle, volatile bool& isPaused, volatile int& pb1, volatile int& pb2, volatile int& pb3, volatile int& par1, std::atomic<int>& bat) {
         if (isPaused) return;
+        
         pb1 = analogRead(1); 
         pb2 = analogRead(2); 
 
 #if defined(TARGET_LILYGO)
         par1 = analogRead(3);
         pb3  = analogRead(10);
+        // FIX: Corrected typo std::order_relaxed -> std::memory_order_relaxed
         bat.store(analogRead(4), std::memory_order_relaxed);
 #else
         par1 = analogRead(3);
@@ -106,18 +108,16 @@ public:
         if (millis() - lastDisplayUpdate >= 250 || showSavingScreen || showKnobModeScreen) {
             lastDisplayUpdate = millis();
             DisplayData dData;
-
+            
             // Feed the smoothed value into the UI data struct
             dData.batVoltage = PowerManager::getBatteryVoltage(smoothBatRaw);
             dData.batPercent = PowerManager::getBatteryPercentage(dData.batVoltage);
-
+            
             dData.bleConnected = bleConnected;
             dData.bleHostConnected = BluetoothManager::isHostConnected;
             dData.blePedalConnected = BluetoothManager::isMvaveConnected;
-
             dData.activeMode = activeDSP->activeMode;
             for(int i = 0; i < 10; i++) { dData.fxStates[i] = (&activeDSP->w)[i]; }
-
             dData.pb1 = pb1; 
             dData.pb2 = pb2; 
             dData.pb3 = pb3; 
@@ -139,10 +139,8 @@ public:
 
             dData.inMeter = inMeter; dData.outMeter = outMeter;
             dData.dspCoreLoad = dspLoad; dData.ctrlCoreLoad = ctrlLoad;
-
             dData.freeSRAM = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
             dData.freePSRAM = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-
             dData.sampleRate = sampleRate; dData.peakLatency = peakLatency;
             dData.underflows = underflows; dData.dmaCount = 0; 
             dData.stackWatermark = stackWatermark;
@@ -151,7 +149,10 @@ public:
             dData.showBleWarning = showBleWarning;
             dData.showSavingScreen = showSavingScreen;
             dData.showKnobModeScreen = showKnobModeScreen;
+            
             dData.isMonoPolyActive = isMonoPolyActiveFlag;
+            
+            dData.isVolumeMode = isVolumeMode;
             
             dData.whammyToe = activeDSP->fxMem[0];
             dData.whammyHeel = activeDSP->fxMem[1];

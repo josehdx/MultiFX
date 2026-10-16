@@ -146,8 +146,6 @@ inline void setSampleRate(uint32_t targetSr) {
     
     I2SManager::disableAndDestroyChannels();
     
-    // CRITICAL FIX: ESP-IDF requires a brief delay to cleanly flush hardware DMA descriptors 
-    // after a channel is destroyed. Skipping this causes initChannels to fail silently.
     vTaskDelay(pdMS_TO_TICKS(25));
     
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(targetSr);
@@ -209,12 +207,15 @@ inline void goToLightSleep() {
         vTaskDelay(pdMS_TO_TICKS(1)); 
     }
     
-    // Hard destruction of I2S Channels to prevent DMA unpark freeze
     I2SManager::disableAndDestroyChannels();
     
     // Safely block ADC loop before stopping it to prevent Invalid State panics
     isAdcPaused = true;
-    adc_continuous_stop(multifx_adc_handle);
+    
+    // CRITICAL FIX: Only stop continuous ADC if the driver is actually initialized and running
+    if (multifx_adc_handle != NULL) {
+        adc_continuous_stop(multifx_adc_handle);
+    }
     
     if (dsp_cpu_lock != NULL) esp_pm_lock_release(dsp_cpu_lock);
     
@@ -226,7 +227,10 @@ inline void goToLightSleep() {
     
     if (dsp_cpu_lock != NULL) esp_pm_lock_acquire(dsp_cpu_lock);
     
-    adc_continuous_start(multifx_adc_handle);
+    // CRITICAL FIX: Only start continuous ADC if the driver is actually initialized and running
+    if (multifx_adc_handle != NULL) {
+        adc_continuous_start(multifx_adc_handle);
+    }
     isAdcPaused = false;
     
     memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t)); 
@@ -236,7 +240,6 @@ inline void goToLightSleep() {
     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
     if (diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));
     
-    // Rebuild the I2S channels completely on wake
     I2SManager::initChannels(BoardHAL::getI2SConfig(currentSampleRate.load(std::memory_order_acquire)), HOP_SIZE);
     I2SManager::enableChannels();
     

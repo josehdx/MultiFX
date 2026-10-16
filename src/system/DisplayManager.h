@@ -42,6 +42,9 @@ struct DisplayData {
     bool showKnobModeScreen;
     bool isMonoPolyActive;
     
+    // CRITICAL FIX: Add volume mode boolean to display context
+    bool isVolumeMode;
+    
     float whammyToe;
     float whammyHeel;
 };
@@ -132,7 +135,8 @@ private:
             d.showBleWarning != cache.showBleWarning || 
             d.showSavingScreen != cache.showSavingScreen || 
             d.showKnobModeScreen != cache.showKnobModeScreen ||
-            d.isMonoPolyActive != cache.isMonoPolyActive) return true;
+            d.isMonoPolyActive != cache.isMonoPolyActive ||
+            d.isVolumeMode != cache.isVolumeMode) return true; // CRITICAL FIX: Refresh display if Volume Mode is toggled
             
         if (d.activeMode != cache.activeMode) return true;
         if (d.pb1 != cache.pb1 || d.pb2 != cache.pb2 || d.pb3 != cache.pb3 || d.cc11 != cache.cc11) return true;
@@ -269,7 +273,12 @@ public:
 
         spr.setTextDatum(TC_DATUM);
         char headerBuf[64];
-        if (d.isMonoPolyActive) {
+        
+        // CRITICAL FIX: Explicitly alter the top header text entirely if in Volume Mode
+        if (d.isVolumeMode) {
+            spr.setTextColor(TFT_ORANGE, TFT_BLACK);
+            snprintf(headerBuf, sizeof(headerBuf), "*** VOLUME MODE ***");
+        } else if (d.isMonoPolyActive) {
             spr.setTextColor(TFT_CYAN, TFT_BLACK);
             snprintf(headerBuf, sizeof(headerBuf), "%s [ T:%+d | H:%+d ]", MONO_ALGOS[monoAlgo], (int)d.whammyToe, (int)d.whammyHeel);
         } else {

@@ -13,10 +13,8 @@ extern char bleLatchedDiscReason[64];
 
 #define SHOW_TELEMETRY true
 
-// Hardware-safe color definitions for ST7789 BGR panels:
-// 0x001F lights Red subpixels on BGR screens; 0x07E0 is Green on both.
-#define DISP_COLOR_OFF  0x001F  // Clear red off-state on BGR
-#define DISP_COLOR_ON   TFT_GREEN // 0x07E0
+#define DISP_COLOR_OFF  0x001F 
+#define DISP_COLOR_ON   TFT_GREEN
 
 struct DisplayData {
     float batVoltage;
@@ -36,13 +34,13 @@ struct DisplayData {
     uint32_t peakLatency;
     uint32_t underflows, dmaCount, stackWatermark;
     
+    int latencyMode;
+    
     bool isKnobEditMode;
     bool showBleWarning;
     bool showSavingScreen;
     bool showKnobModeScreen;
     bool isMonoPolyActive;
-    
-    // CRITICAL FIX: Add volume mode boolean to display context
     bool isVolumeMode;
     
     float whammyToe;
@@ -77,8 +75,9 @@ private:
         {"ALGO", "FFT",  "PHS",  "TRN",  "MIX"}
     };
 
+    // CRITICAL FIX: Replaced "MODE" with "GLD" (Glide) for the Polyphonic Whammy's 5th parameter
     const char* POLY_LABELS[10][5] = {
-        {"DRY",  "WET",  "TOE",  "HEEL", "MODE"}, 
+        {"DRY",  "WET",  "TOE",  "HEEL", "GLD"}, 
         {"APF",  "ATTK", "REL",  "FADE", "MIX"},
         {"SPD",  "DRV",  "OFFS", "INTV", "MIX"},
         {"MIX",  "VOIC", "DETN", "DRY",  "WET"},
@@ -136,9 +135,10 @@ private:
             d.showSavingScreen != cache.showSavingScreen || 
             d.showKnobModeScreen != cache.showKnobModeScreen ||
             d.isMonoPolyActive != cache.isMonoPolyActive ||
-            d.isVolumeMode != cache.isVolumeMode) return true; // CRITICAL FIX: Refresh display if Volume Mode is toggled
+            d.isVolumeMode != cache.isVolumeMode) return true;
             
         if (d.activeMode != cache.activeMode) return true;
+        if (d.latencyMode != cache.latencyMode) return true;
         if (d.pb1 != cache.pb1 || d.pb2 != cache.pb2 || d.pb3 != cache.pb3 || d.cc11 != cache.cc11) return true;
         if (fabsf(d.inMeter - cache.inMeter) > 0.02f || fabsf(d.outMeter - cache.outMeter) > 0.02f) return true;
         if (fabsf(d.dspCoreLoad - cache.dspCoreLoad) > 1.0f || fabsf(d.ctrlCoreLoad - cache.ctrlCoreLoad) > 1.0f) return true;
@@ -274,13 +274,13 @@ public:
         spr.setTextDatum(TC_DATUM);
         char headerBuf[64];
         
-        // CRITICAL FIX: Explicitly alter the top header text entirely if in Volume Mode
         if (d.isVolumeMode) {
             spr.setTextColor(TFT_ORANGE, TFT_BLACK);
             snprintf(headerBuf, sizeof(headerBuf), "*** VOLUME MODE ***");
         } else if (d.isMonoPolyActive) {
+            // CRITICAL FIX: Renamed header to "Mono Whammy"
             spr.setTextColor(TFT_CYAN, TFT_BLACK);
-            snprintf(headerBuf, sizeof(headerBuf), "%s [ T:%+d | H:%+d ]", MONO_ALGOS[monoAlgo], (int)d.whammyToe, (int)d.whammyHeel);
+            snprintf(headerBuf, sizeof(headerBuf), "Mono Whammy [ T:%+d | H:%+d ]", (int)d.whammyToe, (int)d.whammyHeel);
         } else {
             spr.setTextColor(TFT_WHITE, TFT_BLACK);
             snprintf(headerBuf, sizeof(headerBuf), "%s [ T:%+d | H:%+d ]", MODE_NAMES[d.activeMode % 10], (int)d.whammyToe, (int)d.whammyHeel);
@@ -292,11 +292,9 @@ public:
             spr.setTextColor(DISP_COLOR_OFF, TFT_BLACK);
             spr.drawString("KNOB MODE", 318, 2, 2);
         } else {
-            // M-Vave connection status
             spr.setTextColor(d.blePedalConnected ? DISP_COLOR_ON : DISP_COLOR_OFF, TFT_BLACK);
             spr.drawString("M-vave", 318, 1, 1);
             
-            // PC connection status
             spr.setTextColor(d.bleHostConnected ? DISP_COLOR_ON : DISP_COLOR_OFF, TFT_BLACK);
             spr.drawString("PC", 318, 10, 1);
         }
@@ -340,8 +338,8 @@ public:
                     pNorm = d.paramVals[i] / 24.0f;
                     isBip = true;
                 } else if (i == 4) {
-                    int algo = constrain((int)(d.paramVals[i] * 4.99f), 0, 4);
-                    snprintf(buf, sizeof(buf), "%s", MONO_ALGOS[algo]);
+                    // CRITICAL FIX: Parameter 4 is now GLD (Glide Speed). Replaced MONO_ALGOS logic.
+                    snprintf(buf, sizeof(buf), "%.2f", d.paramVals[i]);
                     pNorm = d.paramVals[i];
                     isBip = false;
                 } else {
@@ -391,9 +389,9 @@ public:
                      
             snprintf(line2, sizeof(line2), "RAM:%uK | PSRAM:%uK | STK:%u", 
                      (unsigned int)(d.freeSRAM / 1024), (unsigned int)(d.freePSRAM / 1024), (unsigned int)d.stackWatermark);
-                     
-            snprintf(line3, sizeof(line3), "LATENCY:%ums | IN:%.2f OUT:%.2f | UDF:%u", 
-                     (unsigned int)d.peakLatency, d.inMeter, d.outMeter, (unsigned int)d.underflows);
+            
+            snprintf(line3, sizeof(line3), "LATENCY:%ums [WIN:%d] | IN:%.2f OUT:%.2f", 
+                     (unsigned int)d.peakLatency, d.latencyMode, d.inMeter, d.outMeter);
             
             spr.drawString(line1, 20, 30, 1);
             spr.drawString(line2, 20, 44, 1);

@@ -29,8 +29,6 @@ public:
         
         isKnobEditMode = preferences.getBool("knobEditMode", false);
         
-        // --- REMOVED THE HARDCODED "FORCE BLE ON" OVERRIDE HERE ---
-
         Serial0.println("[INIT 2/8] Setting up Control Surface MIDI & Bluetooth...");
         if (!isKnobEditMode) {
             Control_Surface >> pipes >> usbmidi;
@@ -56,9 +54,13 @@ public:
         LUTManager::generateStaticTables();
         AudioBufferManager::allocate();
         monoPolyEngine.allocateBuffers();
-        padVectorFilter.setLPF(1200.0f, (float)currentSampleRate.load(std::memory_order_acquire));
 
-        I2SManager::initChannels(BoardHAL::getI2SConfig(currentSampleRate.load(std::memory_order_acquire)), HOP_SIZE);
+        // CRITICAL FIX: Load the globally saved Sample Rate instead of forcing 96000
+        uint32_t loadedSr = preferences.getUInt("sampleRate", 96000);
+        currentSampleRate.store(loadedSr, std::memory_order_release);
+        
+        padVectorFilter.setLPF(1200.0f, (float)loadedSr);
+        I2SManager::initChannels(BoardHAL::getI2SConfig(loadedSr), HOP_SIZE);
 
         Serial0.println("[INIT 4/8] Setting up Analog Inputs...");
         analogReadResolution(12);
@@ -69,10 +71,12 @@ public:
 
         activeEffectMode.store(0, std::memory_order_release);
         latencyMode.store(constrain(preferences.getInt("latMode", 0), 0, 3), std::memory_order_release);
+        
         isPB2WiperMode = preferences.getBool("pb2Wiper", false);
-        isVolumeMode = false;
-        currentSampleRate.store(96000, std::memory_order_release);
-        freezeLength = 96000;
+        // CRITICAL FIX: Load the saved volume mode rather than forcing it off
+        isVolumeMode = preferences.getBool("volMode", false);
+        
+        freezeLength = loadedSr;
         feedbackIntervalIdx.store(constrain(preferences.getInt("fbIdx", 0), 0, 4), std::memory_order_release);
 
         AppSettings savedSettings;
@@ -85,8 +89,8 @@ public:
         }
 
         commitDSPState();
-
         pedals.resetToCenter();
+
         pinMode(BOOT_SENSE_PIN, INPUT_PULLUP);
         pinMode(BLE_TOGGLE_PIN, INPUT_PULLUP);
         lastActivityTime = millis();
@@ -95,7 +99,8 @@ public:
         calibratePBs();
 
         DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
-        LUTManager::updateDynamicLUT(activeDSP->cp, activeDSP->w, activeDSP->activeMode, effectMemory, activeDSP->fbIdx, currentSampleRate.load(std::memory_order_acquire));
+        LUTManager::updateDynamicLUT(activeDSP->cp, activeDSP->w, activeDSP->activeMode, effectMemory, activeDSP->fbIdx, loadedSr);
+        
         float* currLut = LUTManager::pitchShiftLUT.load(std::memory_order_acquire);
         if (currLut) pitchShiftFactor.store(currLut[8192], std::memory_order_release);
 
@@ -119,6 +124,7 @@ public:
 #else
         esp_task_wdt_init(30, false);
 #endif
+
         Serial0.println("--- SETUP COMPLETE: ENTERING MAIN SYSTEM LOOP ---");
     }
 };

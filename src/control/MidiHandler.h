@@ -32,11 +32,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
                 dspNeedsCommit = true;
                 Control_Surface.sendControlChange({19, Channel_1}, action.val);
             } else {
-                // FIX: Removed asyncLutUpdateRequested guard. The guard was preventing
-                // pitchShiftFactor from updating during a LUT rebuild (which can take
-                // hundreds of ms), making the pitch shift effect feel unresponsive.
-                // The atomic activePitchLUT pointer is safe to read concurrently; the
-                // null-check below is the only guard needed.
                 float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[action.rawValue], std::memory_order_release);
             }
@@ -87,16 +82,10 @@ inline bool channelMessageCallback(ChannelMessage cm) {
         }
 
         case MidiEvent::SR_TOGGLE: {
-            // FIX: Added 500ms debounce to prevent rapid-fire MIDI CCs from stacking
-            // multiple concurrent setSampleRate() calls. Each call blocks with a
-            // vTaskDelay loop waiting for dsp_ack_parked — overlapping calls cause
-            // USBMscManager's resume path to race and prematurely clear dsp_is_paused,
-            // leaving setSampleRate() spinning forever in the ack-wait loop (system hang).
             static unsigned long lastSrToggle = 0;
             if (millis() - lastSrToggle > 500) {
                 lastSrToggle = millis();
                 
-                // Read the current state and invert it, ignoring action.val
                 uint32_t currentSr = currentSampleRate.load(std::memory_order_acquire);
                 uint32_t targetSr = (currentSr == 96000) ? 48000 : 96000;
                 
@@ -116,9 +105,13 @@ inline bool channelMessageCallback(ChannelMessage cm) {
         }
 
         case MidiEvent::VOL_MODE_TOGGLE: {
-            bool targetState = (action.val >= 64);
-            if (isVolumeMode != targetState) {
-                isVolumeMode = targetState;
+            // CRITICAL FIX: Debounced relative toggling, ignores 127 absolute values
+            static unsigned long lastVolToggle = 0;
+            if (millis() - lastVolToggle > 500) {
+                lastVolToggle = millis();
+                
+                isVolumeMode = !isVolumeMode;
+                
                 if (!isVolumeMode) {
                     volumePedalGain = 1.0f; 
                     pedals.lockPB3Whammy(); 
@@ -132,10 +125,10 @@ inline bool channelMessageCallback(ChannelMessage cm) {
                     activePedalSource = 0;
                     volumePedalGain = (float)currentPB3 / 16383.0f;
                 }
-                // FIX: Removed asyncLutUpdateRequested guard (same reason as EXPRESSION_UPDATE).
-                // When switching volume mode, the pitch must snap to centre immediately.
+                
                 float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release);
+                
                 dspNeedsCommit = true; 
                 settingsNeedSaving = true; 
                 lastParameterChangeTime = millis();
@@ -176,7 +169,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             break;
         }
 
-        // CC 17: Controls TOE Range (127 = Decrease, 0 = Increase)
         case MidiEvent::STEP_TOE: {
             float step = (action.val >= 64) ? -1.0f : 1.0f;
             {
@@ -197,7 +189,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             break;
         }
 
-        // CC 18: Controls HEEL Range (127 = Decrease, 0 = Increase)
         case MidiEvent::STEP_HEEL: {
             float step = (action.val >= 64) ? -1.0f : 1.0f;
             {

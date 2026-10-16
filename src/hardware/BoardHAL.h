@@ -84,7 +84,6 @@ public:
 #if defined(TARGET_LILYGO)
         par1 = analogRead(3);
         pb3  = analogRead(10);
-        // FIX: Corrected typo std::order_relaxed -> std::memory_order_relaxed
         bat.store(analogRead(4), std::memory_order_relaxed);
 #else
         par1 = analogRead(3);
@@ -109,7 +108,6 @@ public:
             lastDisplayUpdate = millis();
             DisplayData dData;
             
-            // Feed the smoothed value into the UI data struct
             dData.batVoltage = PowerManager::getBatteryVoltage(smoothBatRaw);
             dData.batPercent = PowerManager::getBatteryPercentage(dData.batVoltage);
             
@@ -123,12 +121,10 @@ public:
             dData.pb3 = pb3; 
             dData.cc11 = cc11;
 
-            // Load visual parameters
             for(int i = 0; i < 5; i++) { 
                 dData.paramVals[i] = activeDSP->params[activeDSP->activeMode % 10][i]; 
             }
             
-            // Override TOE and HEEL parameter data if in Whammy mode
             if (dData.activeMode == 0) {
                 dData.paramVals[2] = activeDSP->fxMem[0];
                 dData.paramVals[3] = activeDSP->fxMem[1];
@@ -144,6 +140,9 @@ public:
             dData.sampleRate = sampleRate; dData.peakLatency = peakLatency;
             dData.underflows = underflows; dData.dmaCount = 0; 
             dData.stackWatermark = stackWatermark;
+            
+            // CRITICAL FIX: Pass latency window mode to UI
+            dData.latencyMode = latencyMode.load(std::memory_order_relaxed);
 
             dData.isKnobEditMode = isKnobEditMode;
             dData.showBleWarning = showBleWarning;
@@ -151,7 +150,6 @@ public:
             dData.showKnobModeScreen = showKnobModeScreen;
             
             dData.isMonoPolyActive = isMonoPolyActiveFlag;
-            
             dData.isVolumeMode = isVolumeMode;
             
             dData.whammyToe = activeDSP->fxMem[0];

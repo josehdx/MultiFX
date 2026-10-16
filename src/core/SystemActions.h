@@ -1,4 +1,5 @@
 #pragma once
+
 #include "SystemState.h"
 #include "BoardHAL.h"
 #include "MidiRouter.h"
@@ -47,6 +48,21 @@ inline void switchEffectMode(int newMode) {
 
 inline void triggerPanicReset() {
     panicResetRequested.store(true, std::memory_order_release);
+    
+    // CRITICAL FIX: Ensure Volume Mode is explicitly killed and pedals are unlocked
+    if (isVolumeMode) {
+        isVolumeMode = false;
+        volumePedalGain = 1.0f; 
+        pedals.lockPB3Whammy(); 
+        currentPB3 = 8192; 
+        lastActivePedal = 8192;
+        activePedalSource = 0;
+        Control_Surface.sendPitchBend(Channel_3, 8192);
+        
+        float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
+        if (currentLUT) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release);
+    }
+    
     switchEffectMode(0);
 }
 
@@ -209,17 +225,14 @@ inline void goToLightSleep() {
     
     I2SManager::disableAndDestroyChannels();
     
-    // Safely block ADC loop before stopping it to prevent Invalid State panics
     isAdcPaused = true;
     
-    // CRITICAL FIX: Only stop continuous ADC if the driver is actually initialized and running
     if (multifx_adc_handle != NULL) {
         adc_continuous_stop(multifx_adc_handle);
     }
     
     if (dsp_cpu_lock != NULL) esp_pm_lock_release(dsp_cpu_lock);
     
-    // Wait until activity wakes it up
     while ((REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN)) &&
            (REG_READ(GPIO_IN_REG) & (1 << BLE_TOGGLE_PIN))) {
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -227,7 +240,6 @@ inline void goToLightSleep() {
     
     if (dsp_cpu_lock != NULL) esp_pm_lock_acquire(dsp_cpu_lock);
     
-    // CRITICAL FIX: Only start continuous ADC if the driver is actually initialized and running
     if (multifx_adc_handle != NULL) {
         adc_continuous_start(multifx_adc_handle);
     }

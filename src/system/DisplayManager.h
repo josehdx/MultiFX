@@ -60,6 +60,7 @@ private:
     char cachedDiscReason[64] = "";
     int lastRenderMode = -1;
     bool lastMonoPolyActive = false;
+    bool lastVolumeMode = false;
     int lastMonoPolyAlgo = -1;
     int bootLogY = 8;
 
@@ -179,6 +180,7 @@ public:
         spr.setTextColor(TFT_WHITE, TFT_BLACK);
         lastRenderMode = -1;
         lastMonoPolyActive = false;
+        lastVolumeMode = false;
         lastMonoPolyAlgo = -1;
         bootLogY = 8;
     }
@@ -220,7 +222,10 @@ public:
             monoAlgo = constrain(monoAlgo, 0, 4);
         }
 
-        if (d.isMonoPolyActive != lastMonoPolyActive || (d.isMonoPolyActive && monoAlgo != lastMonoPolyAlgo)) {
+        // CRITICAL FIX: Trigger background redraw when Volume Mode changes
+        if (d.isMonoPolyActive != lastMonoPolyActive || 
+           (d.isMonoPolyActive && monoAlgo != lastMonoPolyAlgo) || 
+           d.isVolumeMode != lastVolumeMode) {
             lastRenderMode = -1; 
         }
 
@@ -240,7 +245,10 @@ public:
             drawKnobStatic(bgSpr, pbCenters[0], 48, 14, "PB1");
             drawKnobStatic(bgSpr, pbCenters[1], 48, 14, "PB2");
             drawKnobStatic(bgSpr, pbCenters[2], 48, 14, "PB3");
-            drawKnobStatic(bgSpr, pbCenters[3], 48, 14, "CC11");
+            
+            // CRITICAL FIX: Dynamic 4th Knob Label based on Volume Mode
+            const char* pb4Label = d.isVolumeMode ? "CC 19" : "PB4-7B";
+            drawKnobStatic(bgSpr, pbCenters[3], 48, 14, pb4Label);
             
             const char* currentNames[5];
             
@@ -258,6 +266,7 @@ public:
             lastRenderMode = d.activeMode;
             lastMonoPolyActive = d.isMonoPolyActive;
             lastMonoPolyAlgo = monoAlgo;
+            lastVolumeMode = d.isVolumeMode;
         }
 
         spr.pushImage(0, 0, 320, 170, (uint16_t*)bgSpr.getPointer());
@@ -355,7 +364,6 @@ public:
         int activeCount = 0;
         for (int i = 0; i < 10; i++) {
             int fxIdx = CHAIN_ORDER[i];
-            // Pitch Bend Token: Shows MW when Mono is active, WH when Poly is active
             bool isEffectActive = (fxIdx == 0) ? (d.fxStates[0] || d.isMonoPolyActive) : d.fxStates[fxIdx];
             if (isEffectActive) activeIndices[activeCount++] = fxIdx;
         }

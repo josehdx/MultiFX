@@ -12,7 +12,6 @@ inline char bleLatchedDiscReason[64] = "DISC: NONE";
 
 extern void dispatchBleMidi(uint8_t header, uint8_t data1, uint8_t data2);
 
-// Queue definition to protect the Control_Surface library from interrupt context
 struct BleMidiPacket { uint8_t header, data1, data2; };
 static inline QueueHandle_t bleMidiQueue = nullptr;
 
@@ -41,6 +40,7 @@ private:
     static inline NimBLEClient* pClient = nullptr;
     static inline NimBLEServer* pServer = nullptr;
     static inline NimBLECharacteristic* pServerChar = nullptr;
+
     static inline const NimBLEUUID midiServiceUUID{"03B80E5A-EDE8-4B33-A751-6CE34EC4C700"};
     static inline const NimBLEUUID midiCharUUID{"7772E5DB-3868-4112-A1A9-F2669D106BF3"};
 
@@ -88,7 +88,6 @@ private:
         if (hasTarget || isMvaveConnected || millis() < reconnectLockoutUntil) return;
 
         bool isMatch = false;
-
         if (nameStr.length() > 0) {
             String upper = nameStr.c_str();
             upper.toUpperCase();
@@ -264,6 +263,7 @@ public:
         if (bleMidiQueue == nullptr) {
             bleMidiQueue = xQueueCreate(64, sizeof(BleMidiPacket));
         }
+
         strlcpy(bleInitStep, "1: NimBLE init()", sizeof(bleInitStep));
         dualLog("\n[BLE INIT] Initializing Dual-Role NimBLE Stack on Core 1...\n");
         NimBLEDevice::init("Whammy_S3");
@@ -273,6 +273,7 @@ public:
         strlcpy(bleInitStep, "2: createServer()", sizeof(bleInitStep));
         pServer = NimBLEDevice::createServer();
         pServer->setCallbacks(&serverCB);
+
         NimBLEService* pService = pServer->createService(midiServiceUUID);
         pServerChar = pService->createCharacteristic(
             midiCharUUID,
@@ -289,6 +290,7 @@ public:
         advData.setFlags(0x06);
         advData.addServiceUUID(midiServiceUUID);
         pAdvertising->setAdvertisementData(advData);
+
         NimBLEAdvertisementData scanRespData;
         scanRespData.setName("Whammy_S3");
         pAdvertising->setScanResponseData(scanRespData);
@@ -321,8 +323,6 @@ public:
     static void sendMidiToHost(uint8_t header, uint8_t data1, uint8_t data2) {
         if (isHostConnected && pServerChar) {
             uint8_t packet[5] = {0x80, 0x80, header, data1, data2};
-            // CRITICAL FIX: Send notification array directly.
-            // Avoids mutating the characteristic's underlying std::string buffer to prevent memory race condition.
             pServerChar->notify(packet, 5, false);
         }
     }
@@ -332,7 +332,11 @@ public:
             BleMidiPacket pkt;
             while (xQueueReceive(bleMidiQueue, &pkt, 0)) {
                 dispatchBleMidi(pkt.header, pkt.data1, pkt.data2);
-                sendMidiToHost(pkt.header, pkt.data1, pkt.data2);
+                
+                // Do not blindly echo CC 11 here: dispatchBleMidi routes it to CC 11 or CC 19
+                if (!(pkt.header == 0xB0 && pkt.data1 == 11)) {
+                    sendMidiToHost(pkt.header, pkt.data1, pkt.data2);
+                }
             }
         }
 
@@ -351,7 +355,6 @@ public:
                 NimBLEDevice::getScan()->stop();
             }
             vTaskDelay(pdMS_TO_TICKS(150));
-
             if (isMvaveConnected) {
                 hasTarget = false;
                 return;

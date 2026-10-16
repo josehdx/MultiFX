@@ -3,6 +3,7 @@
 #include "SystemState.h"
 #include "SystemActions.h"
 #include "MidiRouter.h"
+#include "BluetoothManager.h"
 
 class InputManager {
 public:
@@ -20,7 +21,6 @@ public:
                 lastActivityTime = millis();
             } else {
                 unsigned long pressDuration = millis() - gpio14PressTime;
-
                 if (pressDuration >= 1000) {
                     #if defined(FW_MODE_HYBRID)
                         DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
@@ -57,7 +57,6 @@ public:
                             vTaskDelay(pdMS_TO_TICKS(150));
                             
                             dsp_is_paused.store(true, std::memory_order_release);
-                            // Safety Check: Wait for BOTH core processing tasks to fully park
                             while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
                                 vTaskDelay(pdMS_TO_TICKS(1)); 
                             }
@@ -65,9 +64,9 @@ public:
                             AppSettings cs; 
                             {
                                 CriticalSectionGuard lock(MidiRouter::paramMux);
-                                for(int i=0; i<10; i++) { 
-                                    cs.fxMem[i]=activeDSP->fxMem[i]; 
-                                    for(int p=0; p<5; p++) cs.params[i][p]=activeDSP->params[i][p]; 
+                                for(int i=0; i<10; i++) {
+                                    cs.fxMem[i]=activeDSP->fxMem[i];
+                                    for(int p=0; p<5; p++) cs.params[i][p]=activeDSP->params[i][p];
                                 }
                             }
                             
@@ -76,12 +75,12 @@ public:
                             if(activeDSP->fb) fxStates|=(1<<2); if(activeDSP->hr) fxStates|=(1<<3); 
                             if(activeDSP->cp) fxStates|=(1<<4); if(activeDSP->sy) fxStates|=(1<<5); 
                             if(activeDSP->pd) fxStates|=(1<<6); if(activeDSP->ch) fxStates|=(1<<7); 
-                            if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9); 
+                            if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9);
                             
-                            settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, 
-                                             constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, 
-                                             isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), 
-                                             &cs, sizeof(AppSettings));
+                            settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode,
+                                              constrain(activeDSP->fbIdx,0,4), isPB2WiperMode,
+                                              isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire),
+                                              &cs, sizeof(AppSettings));
                         }
                         
                         preferences.putBool("knobEditMode", !isKnobEditMode);
@@ -125,12 +124,11 @@ public:
         static int lastProcessedA = 8192;
         static int lastProcessedB = 8192;
         static int lastProcessedC = 8192;
-
         int deltaA = abs((int)currentPB1 - lastProcessedA);
         int deltaB = abs((int)currentPB2 - lastProcessedB);
         int deltaC = abs((int)currentPB3 - lastProcessedC);
 
-        // Active Pedal Arbiter: requires intentional movement (delta > 48) and verified plugged status
+        // PB1: 14-bit Pitch Bend on Channel 1
         if (!pedals.isUnpluggedA() && deltaA > 48) {
             lastProcessedA = currentPB1;
             activePedalSource = 1;
@@ -141,8 +139,13 @@ public:
                 float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB1], std::memory_order_release);
             }
+
+            Control_Surface.sendPitchBend(Channel_1, currentPB1);
+            BluetoothManager::sendMidiToHost(0xE0, currentPB1 & 0x7F, (currentPB1 >> 7) & 0x7F);
+
             pedals.updateLastMidiA();
         }
+        // PB2: 14-bit Pitch Bend on Channel 2
         else if (!pedals.isUnpluggedB() && deltaB > 48) {
             lastProcessedB = currentPB2;
             activePedalSource = 2;
@@ -153,8 +156,13 @@ public:
                 float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB2], std::memory_order_release);
             }
+
+            Control_Surface.sendPitchBend(Channel_2, currentPB2);
+            BluetoothManager::sendMidiToHost(0xE1, currentPB2 & 0x7F, (currentPB2 >> 7) & 0x7F);
+
             pedals.updateLastMidiB();
         }
+        // PB3: 14-bit Pitch Bend on Channel 3
         else if (!pedals.isUnpluggedC() && deltaC > 48) {
             lastProcessedC = currentPB3;
             activePedalSource = 3;
@@ -170,6 +178,11 @@ public:
                     if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB3], std::memory_order_release);
                 }
             }
+
+            // Always transmit 14-bit Pitch Bend on Channel 3
+            Control_Surface.sendPitchBend(Channel_3, currentPB3);
+            BluetoothManager::sendMidiToHost(0xE2, currentPB3 & 0x7F, (currentPB3 >> 7) & 0x7F);
+
             pedals.updateLastMidiC();
         }
     }

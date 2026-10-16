@@ -55,7 +55,6 @@ public:
         AudioBufferManager::allocate();
         monoPolyEngine.allocateBuffers();
 
-        // CRITICAL FIX: Load the globally saved Sample Rate instead of forcing 96000
         uint32_t loadedSr = preferences.getUInt("sampleRate", 96000);
         currentSampleRate.store(loadedSr, std::memory_order_release);
         
@@ -73,8 +72,10 @@ public:
         latencyMode.store(constrain(preferences.getInt("latMode", 0), 0, 3), std::memory_order_release);
         
         isPB2WiperMode = preferences.getBool("pb2Wiper", false);
-        // CRITICAL FIX: Load the saved volume mode rather than forcing it off
-        isVolumeMode = preferences.getBool("volMode", false);
+
+        // Always boot in normal Whammy/Expression mode
+        isVolumeMode = false;
+        volumePedalGain = 1.0f;
         
         freezeLength = loadedSr;
         feedbackIntervalIdx.store(constrain(preferences.getInt("fbIdx", 0), 0, 4), std::memory_order_release);
@@ -124,7 +125,6 @@ public:
 #else
         esp_task_wdt_init(30, false);
 #endif
-
         Serial0.println("--- SETUP COMPLETE: ENTERING MAIN SYSTEM LOOP ---");
     }
 };

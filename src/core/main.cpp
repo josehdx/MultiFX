@@ -12,6 +12,7 @@
 #include "SystemBootloader.h"
 #include "TelemetryManager.h"
 #include "InputManager.h"
+#include "MidiHandler.h"
 
 #if defined(TARGET_LILYGO)
 #include "DisplayManager.h"
@@ -116,7 +117,7 @@ void loop() {
             if ((&activeDSP->w)[i]) currentFxStates |= (1 << i);
         }
         
-        // CRITICAL FIX: Pass all global states into SettingsManager so Sample Rate persists
+        // Pass all global states into SettingsManager so Sample Rate persists
         settingsMgr.save(preferences, 
                          activeDSP->activeMode, 
                          activeDSP->latMode,

@@ -3,6 +3,7 @@
 #include "SystemState.h"
 #include "SystemActions.h"
 #include "MidiRouter.h"
+#include "BluetoothManager.h"
 
 inline char lastMidiDebug[64] = "MIDI: WAITING FOR PACKET...";
 
@@ -20,22 +21,30 @@ inline bool channelMessageCallback(ChannelMessage cm) {
     int currentMode = activeEffectMode.load(std::memory_order_acquire);
     
     switch (action.event) {
-        case MidiEvent::EXPRESSION_UPDATE:
+        case MidiEvent::EXPRESSION_UPDATE: {
             currentCC11 = action.rawValue; 
-            currentPB3 = action.rawValue; 
             lastActivePedal = action.rawValue;
-            activePedalSource = 0; // CC11 Active
-            pedals.updateLastMidiC();
+            activePedalSource = 0; // MIDI Active
+
+            uint8_t original7Bit = action.val;
 
             if (isVolumeMode) {
                 volumePedalGain = (float)action.rawValue / 16383.0f; 
                 dspNeedsCommit = true;
-                Control_Surface.sendControlChange({19, Channel_1}, action.val);
+                
+                // Transmit CC 19 (Volume) over both USB-MIDI and BLE-MIDI (7-bit)
+                Control_Surface.sendControlChange({19, Channel_1}, original7Bit);
+                BluetoothManager::sendMidiToHost(0xB0, 19, original7Bit);
             } else {
                 float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[action.rawValue], std::memory_order_release);
+                
+                // Transmit Pitch Bend on Channel 4 (14-bit interpolated)
+                Control_Surface.sendPitchBend(Channel_4, action.rawValue);
+                BluetoothManager::sendMidiToHost(0xE3, action.rawValue & 0x7F, (action.rawValue >> 7) & 0x7F);
             }
             break;
+        }
 
         case MidiEvent::KNOB_UPDATE: {
             CriticalSectionGuard lock(MidiRouter::paramMux);
@@ -106,7 +115,7 @@ inline bool channelMessageCallback(ChannelMessage cm) {
 
         case MidiEvent::VOL_MODE_TOGGLE: {
             static unsigned long lastVolToggle = 0;
-            if (millis() - lastVolToggle > 500) {
+            if (action.val > 0 && millis() - lastVolToggle > 250) {
                 lastVolToggle = millis();
                 
                 isVolumeMode = !isVolumeMode;
@@ -140,12 +149,9 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             if (action.val > 0 && millis() - lastTgl > 250) {
                 lastTgl = millis();
                 
-                // Mono Whammy Toggle (Target 99)
                 if (action.targetEffect == 99) {
                     bool newState = !isMonoPolyActive.load(std::memory_order_acquire);
                     isMonoPolyActive.store(newState, std::memory_order_release);
-                    // Mutual exclusion: When Mono Whammy is ON, Poly Whammy is OFF.
-                    // When Mono Whammy is OFF, Poly Whammy is restored globally!
                     isWhammyActive = !newState;
                 }
                 else if (action.targetEffect == 1) isFrozen = !isFrozen;

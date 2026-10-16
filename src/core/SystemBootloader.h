@@ -102,8 +102,14 @@ public:
         DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
         LUTManager::updateDynamicLUT(activeDSP->cp, activeDSP->w, activeDSP->activeMode, effectMemory, activeDSP->fbIdx, loadedSr);
         
-        float* currLut = LUTManager::pitchShiftLUT.load(std::memory_order_acquire);
-        if (currLut) pitchShiftFactor.store(currLut[8192], std::memory_order_release);
+        // --- SYNC ACTIVE DSP BUFFER ON BOOT ---
+        float* sourceLut = LUTManager::pitchShiftLUT.load(std::memory_order_acquire);
+        float* destLut = activePitchLUT.load(std::memory_order_acquire);
+        if (sourceLut && destLut) {
+            memcpy(destLut, sourceLut, 16384 * sizeof(float));
+        }
+
+        if (destLut) pitchShiftFactor.store(destLut[8192], std::memory_order_release);
 
         Serial0.println("[INIT 7/8] Spawning Core 0 (Audio) and Core 1 (LUT) FreeRTOS Tasks...");
         I2SManager::enableChannels();

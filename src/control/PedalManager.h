@@ -1,17 +1,20 @@
 #pragma once
-
 #include <Arduino.h>
 
 const int TRS_UNPLUGGED_VOLTAGE = 4050;
 const int TRS_PLUGGED_VOLTAGE   = 3900;
 const int TRS_INSERTION_LOCKOUT = 300;
 const int PEDAL_OUTER_DEADZONE  = 100;
+
 const int PB1_DEFAULT_MIN       = 400;
 const int PB1_DEFAULT_MAX       = 3700;
 const int PB2_DEFAULT_MIN       = 400;
 const int PB2_DEFAULT_MAX       = 3700;
 const int PB3_DEFAULT_MIN       = 1000;
 const int PB3_DEFAULT_MAX       = 3000;
+const int PAR_DEFAULT_MIN       = 50;
+const int PAR_DEFAULT_MAX       = 4000;
+
 const int CENTER_MIDI_VAL       = 8192;
 const int MAX_MIDI_VAL          = 16383;
 const int MIN_MIDI_VAL          = 0;
@@ -23,13 +26,22 @@ private:
     int pb2_center = 2048, pb2_min = PB2_DEFAULT_MIN, pb2_max = PB2_DEFAULT_MAX;
     int pb3_min = PB3_DEFAULT_MIN, pb3_max = PB3_DEFAULT_MAX;
     
+    int par_min[5] = {PAR_DEFAULT_MIN, PAR_DEFAULT_MIN, PAR_DEFAULT_MIN, PAR_DEFAULT_MIN, PAR_DEFAULT_MIN};
+    int par_max[5] = {PAR_DEFAULT_MAX, PAR_DEFAULT_MAX, PAR_DEFAULT_MAX, PAR_DEFAULT_MAX, PAR_DEFAULT_MAX};
+    
     int stableRawA = -1, stableRawB = -1, stableRawC = -1;
+    int stableRawPar[5] = {-1, -1, -1, -1, -1};
+
     bool unpluggedA = false, unpluggedB = false, unpluggedC = false;
     
     int recoveryA = 0, recoveryB = 0, recoveryC = 0;
     int systemRecoveryFrames = 50;
+
     int calA = CENTER_MIDI_VAL, calB = CENTER_MIDI_VAL, calC = CENTER_MIDI_VAL;
+    int calPar[5] = {64, 64, 64, 64, 64};
+
     int lastMidiA = CENTER_MIDI_VAL, lastMidiB = CENTER_MIDI_VAL, lastMidiC = CENTER_MIDI_VAL;
+    int lastMidiPar[5] = {64, 64, 64, 64, 64};
 
     bool pb3_whammy_lock = true;
     int pb3_whammy_ref = -1;
@@ -63,6 +75,7 @@ private:
 
     int map_raw_expression(int raw, uint16_t rMin, uint16_t rMax, bool invert) {
         int heelLockZone = 350; int toeLockZone = 300; int lowerLimit, upperLimit;
+
         if (!invert) {
             lowerLimit = rMin + heelLockZone; upperLimit = rMax - toeLockZone;
             if (lowerLimit >= upperLimit) return MIN_MIDI_VAL;
@@ -73,6 +86,24 @@ private:
             if (lowerLimit >= upperLimit) return MAX_MIDI_VAL;
             if (raw <= lowerLimit) return MAX_MIDI_VAL; if (raw >= upperLimit) return MIN_MIDI_VAL; 
             return map(raw, lowerLimit, upperLimit, MAX_MIDI_VAL, MIN_MIDI_VAL);
+        }
+    }
+
+    int map_raw_expression_7bit(int raw, uint16_t rMin, uint16_t rMax, bool invert) {
+        int heelLockZone = 50; 
+        int toeLockZone = 50; 
+        int lowerLimit, upperLimit;
+
+        if (!invert) {
+            lowerLimit = rMin + heelLockZone; upperLimit = rMax - toeLockZone;
+            if (lowerLimit >= upperLimit) return 0;
+            if (raw <= lowerLimit) return 0; if (raw >= upperLimit) return 127; 
+            return map(raw, lowerLimit, upperLimit, 0, 127);
+        } else {
+            lowerLimit = rMin + toeLockZone; upperLimit = rMax - heelLockZone;
+            if (lowerLimit >= upperLimit) return 127;
+            if (raw <= lowerLimit) return 127; if (raw >= upperLimit) return 0; 
+            return map(raw, lowerLimit, upperLimit, 127, 0);
         }
     }
 
@@ -124,10 +155,16 @@ public:
         lastMidiC = CENTER_MIDI_VAL;
     }
 
-    void process(int rawA, int rawB, int rawC, bool isVolumeMode, bool invertPB3) {
+    void process(int rawA, int rawB, int rawC, int rPar1, int rPar2, int rPar3, int rPar4, int rPar5, bool isVolumeMode, bool invertPB3) {
         if (stableRawA < 0) stableRawA = rawA; else stableRawA = (stableRawA * 7 + rawA) / 8;
         if (stableRawB < 0) stableRawB = rawB; else stableRawB = (stableRawB * 7 + rawB) / 8;
         if (stableRawC < 0) stableRawC = rawC; else stableRawC = (stableRawC * 7 + rawC) / 8;
+        
+        int rawPars[5] = {rPar1, rPar2, rPar3, rPar4, rPar5};
+        for (int i=0; i<5; i++) {
+            if (stableRawPar[i] < 0) stableRawPar[i] = rawPars[i]; 
+            else stableRawPar[i] = (stableRawPar[i] * 7 + rawPars[i]) / 8;
+        }
 
         if (stableRawA > TRS_UNPLUGGED_VOLTAGE) unpluggedA = true;
         else if (stableRawA < TRS_PLUGGED_VOLTAGE) unpluggedA = false;
@@ -173,6 +210,13 @@ public:
             if (stableRawC > pb3_max && stableRawC <= 4095) pb3_max = stableRawC;
         }
 
+        for (int i=0; i<5; i++) {
+            if (systemRecoveryFrames == 0) {
+                if (stableRawPar[i] < par_min[i] && stableRawPar[i] > 10) par_min[i] = stableRawPar[i];
+                if (stableRawPar[i] > par_max[i] && stableRawPar[i] <= 4095) par_max[i] = stableRawPar[i];
+            }
+        }
+
         static int leakTimer = 0;
         if (++leakTimer > 100) {
             if (pb1_min < PB1_DEFAULT_MIN) pb1_min++;
@@ -181,12 +225,20 @@ public:
             if (pb2_max > PB2_DEFAULT_MAX) pb2_max--;
             if (pb3_min < PB3_DEFAULT_MIN) pb3_min++;
             if (pb3_max > PB3_DEFAULT_MAX) pb3_max--;
+            for (int i=0; i<5; i++) {
+                if (par_min[i] < PAR_DEFAULT_MIN) par_min[i]++;
+                if (par_max[i] > PAR_DEFAULT_MAX) par_max[i]--;
+            }
             leakTimer = 0;
         }
         
         calA = map_raw_deadzone(stableRawA, pb1_center, pb1_min, pb1_max, DEADZONE_SIZE);
         calB = map_raw_deadzone(stableRawB, pb2_center, pb2_min, pb2_max, DEADZONE_SIZE);
         calC = map_raw_expression(stableRawC, pb3_min, pb3_max, invertPB3);
+        
+        for (int i=0; i<5; i++) {
+            calPar[i] = map_raw_expression_7bit(stableRawPar[i], par_min[i], par_max[i], false);
+        }
         
         if (!isVolumeMode) {
             if (pb3_whammy_lock) {
@@ -215,14 +267,10 @@ public:
         }
     }
 
-    // Require delta > 96 to prevent floating ADC thermal jitter from generating movement events
-    bool hasMovedA() { return abs(calA - lastMidiA) > 96; }
-    bool hasMovedB() { return abs(calB - lastMidiB) > 96; }
-    bool hasMovedC() { return abs(calC - lastMidiC) >= 128; }
-
     int getCalA() { return calA; }
     int getCalB() { return calB; }
     int getCalC() { return calC; }
+    int getCalPar(int index) { return calPar[index]; }
 
     bool isUnpluggedA() const { return unpluggedA; }
     bool isUnpluggedB() const { return unpluggedB; }
@@ -231,4 +279,7 @@ public:
     void updateLastMidiA() { lastMidiA = calA; }
     void updateLastMidiB() { lastMidiB = calB; }
     void updateLastMidiC() { lastMidiC = calC; }
+    void updateLastMidiPar(int index) { lastMidiPar[index] = calPar[index]; }
+    
+    int getLastMidiPar(int index) { return lastMidiPar[index]; }
 };

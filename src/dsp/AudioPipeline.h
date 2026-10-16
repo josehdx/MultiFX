@@ -59,8 +59,11 @@ public:
     static inline __attribute__((always_inline)) void processBlock(int framesRead, DSPCoreState* activeDSP) {
         float sr = (float)currentSampleRate.load(std::memory_order_relaxed);
         float srScale = 48000.0f / sr;
+
         for(int j=0; j<10; j++) for(int k=0; k<5; k++) c_fx[j][k] = activeDSP->params[j][k];
+
         c_lat = activeDSP->latMode; c_act = activeDSP->activeMode; c_w = activeDSP->w; c_fz = activeDSP->fz; c_fb = activeDSP->fb; c_hr = activeDSP->hr; c_cp = activeDSP->cp; c_sy = activeDSP->sy; c_pd = activeDSP->pd; c_ch = activeDSP->ch; c_sw = activeDSP->sw; c_vb = activeDSP->vb; c_vg = activeDSP->vg;
+
         float c_pt = pitchShiftFactor.load(std::memory_order_acquire);
         
         float targetWindow = LATENCY_WINDOWS[c_lat];
@@ -68,13 +71,19 @@ public:
             currentWindowSize=targetWindow; uint32_t halfWindowFixed=((uint32_t)targetWindow/2)<<16;
             tap_w3_1=0; tap_w3_2=halfWindowFixed; tap_w4_1=0; tap_w4_2=halfWindowFixed; tap_w5_1=0; tap_w5_2=halfWindowFixed;
         }
+
         uint32_t windowSizeLow = 4096; uint32_t windowSizeHigh = 512;
         uint32_t maskLow = windowSizeLow - 1; uint32_t maskHigh = windowSizeHigh - 1;
         uint32_t hannMultLow = (4096U<<16)/windowSizeLow; uint32_t hannMultHigh = (4096U<<16)/windowSizeHigh;
         uint32_t hannIntMult=(4096U<<16)/(uint32_t)currentWindowSize, windowMask=(uint32_t)currentWindowSize-1;
         
-        // Whammy dry/wet parameters always sourced from slot 0
-        float p_w_dry=c_fx[0][0], p_w_wet=c_fx[0][1];
+        bool localMonoPolyActive = isMonoPolyActive.load(std::memory_order_acquire);
+
+        // CRITICAL FIX: Whammy dry/wet parameters. 
+        // When MonoPoly is active, UI knobs 1 & 2 control internal Algo/Range, 
+        // so we must use Knob 5 (c_fx[0][4] - Mix) for the global wet/dry balance.
+        float p_w_dry = localMonoPolyActive ? (1.0f - c_fx[0][4]) : c_fx[0][0];
+        float p_w_wet = localMonoPolyActive ? c_fx[0][4] : c_fx[0][1];
         
         float p_fz_apf=c_fx[1][0], p_fz_att=c_fx[1][1], p_fz_rel=c_fx[1][2];
         float p_fb_spd=c_fx[2][0], p_fb_drv=c_fx[2][1], p_fb_off=c_fx[2][2];
@@ -90,9 +99,9 @@ public:
         
         float chorusPhaseIncr = p_ch_spd / sr;
         float feedbackPhaseIncr = p_fb_spd / sr;
+
         float targetPitch = FX_Whammy::getSpd(c_pt);
         
-        // Individual effects are cleanly driven by their dedicated flags
         bool frzActive = c_fz;
         
         if(__builtin_expect(frzActive && !wasFrozen, 0)) { freezePlayCounterVar=0; int bestStart=freezeWriteIdxVar, tempIdx=freezeWriteIdxVar; for(int s=0; s<4000; s++) { int prev=tempIdx-1; if(prev<0) prev+=freezeLength; if(freezeBuffer[tempIdx]>=0 && freezeBuffer[prev]<0) { bestStart=tempIdx; break; } tempIdx=prev; } freezeStartIdxVar=bestStart; activeFreezeLength=freezeLength; int searchEnd=bestStart-1; if(searchEnd<0) searchEnd+=freezeLength; tempIdx=searchEnd; for(int s=0; s<4000; s++) { int prev=tempIdx-1; if(prev<0) prev+=freezeLength; if(freezeBuffer[tempIdx]>=0 && freezeBuffer[prev]<0) { activeFreezeLength=s; break; } tempIdx=prev; } if(activeFreezeLength<64) activeFreezeLength=freezeLength; }
@@ -108,11 +117,10 @@ public:
         bool swellActive = c_sw;
         bool chorusActive = c_ch;
         bool feedbackActive = c_fb;
+
         if(__builtin_expect(feedbackActive && !wasFeedbackActive, 0)) { fbOutNode=0.0f; fbHpfState=0.0f; feedbackFilterVar=0.0f; } wasFeedbackActive=feedbackActive; 
         bool vibratoActive = c_vb;
         bool capoActive = c_cp;
-        
-        bool localMonoPolyActive = isMonoPolyActive.load(std::memory_order_acquire);
         
         float localSwellGain=swellGain, localVolGain=c_vg, localFrzRamp=freezeRamp, localFbRamp=feedbackRamp, target_delay=constrain((float)(sr*p_fb_off), 0.0f, (float)(FB_BUFFER_SIZE-1)); smoothed_delay_samples+= (target_delay-smoothed_delay_samples)*0.01f*srScale+DC_OFFSET; int delaySamples=(int)smoothed_delay_samples;
         
@@ -135,12 +143,13 @@ public:
         float g_frz = (!frzActive && localFrzRamp > 0.0f) ? 0.5f : 0.0f;
         float g_fb  = (feedbackActive || localFbRamp > 0.0f) ? 0.6f : 0.0f;
         
-        // Whammy wet/dry mix enabled globally via c_w or Mono Whammy
         float g_whammy = (c_w || localMonoPolyActive) ? p_w_wet : 0.0f;
         float g_dry    = (c_w || localMonoPolyActive) ? p_w_dry : 1.0f;
         
         float vol_alpha=0.01f*srScale, envRetain=powf(0.99f,srScale), envAttack=1.0f-envRetain;
+
         if(__builtin_expect(isnan(synthFilter)||isinf(synthFilter), 0)) synthFilter=0.0f; if(__builtin_expect(isnan(synthBandpass)||isinf(synthBandpass), 0)) synthBandpass=0.0f; if(__builtin_expect(isnan(feedbackFilterVar)||isinf(feedbackFilterVar), 0)) feedbackFilterVar=0.0f; if(__builtin_expect(isnan(fbHpfState)||isinf(fbHpfState), 0)) fbHpfState=0.0f;
+
         float localVibPhase=vibratoLfoPhase, localChoPhase=chorusLfoPhase, localFbPhase=feedbackLfoPhase, localFbHpf=fbHpfState;
         float cross_alpha = (sr == 96000) ? 0.0163f : 0.0326f;
         
@@ -150,6 +159,7 @@ public:
         } else {
             for (int i = 0; i < HOP_SIZE; i++) activeDmaWriteBuf[i] = delayBuffer[(prefetchIdx + i) & BUFFER_MASK];
         }
+
         int prefetchIdxFB = (fbDelayWriteIdx - delaySamples + FB_BUFFER_SIZE) & FB_BUFFER_MASK;
         int aheadFB = (prefetchIdxFB + 32) & FB_BUFFER_MASK;
         __builtin_prefetch(&fbDelayBuffer[aheadFB], 0, 3);
@@ -163,6 +173,7 @@ public:
         
         for(int i=0; i<framesRead; i++) {
             float procSample=inBuf[i];
+
             if(__builtin_expect(apfNeedsClear, 0)) { memset(LUTManager::apf1Buffer,0,1009*sizeof(float)); memset(LUTManager::apf2Buffer,0,863*sizeof(float)); apf1Idx=0; apf2Idx=0; apfNeedsClear=false; }
             FX_Freeze::process(frzActive, procSample, p_fz_att, p_fz_rel, srScale, p_fz_apf, activeInvFreqLength, activeFreezeLength, freezeLength, LUTManager::hannLUT, freezeBuffer, LUTManager::apf1Buffer, LUTManager::apf2Buffer, freezeWriteIdxVar, freezePlayCounterVar, freezeStartIdxVar, localFrzRamp, fzOutBuf[i], apf1Idx, apf2Idx);
             
@@ -205,12 +216,14 @@ public:
                 float w1_lo = DSPEngine::processDualPitchTap_SIMD(tap_w1_lo_1, tap_w1_lo_2, sramPitchLow, sramWriteIdx, maskLow, hannMultLow, LUTManager::hannLUT, LUTManager::pitchSincLUT);
                 float w1_hi = DSPEngine::processDualPitchTap_SIMD(tap_w1_hi_1, tap_w1_hi_2, sramPitchHigh, sramWriteIdx, maskHigh, hannMultHigh, LUTManager::hannLUT, LUTManager::pitchSincLUT);
                 float rawW1 = w1_lo + w1_hi;
+
                 float dampCutoff = (currentPitch > 1.498f) ? __builtin_fmaxf(0.1f, 1.0f - (currentPitch - 1.498f) * 0.5f) : 1.0f;
                 dampState = DSPEngine::AntiDenormal(__builtin_fmaf(dampCutoff, (rawW1 - dampState), dampState)); 
                 w1Buf[i] = dampState;
             }
             
             FX_Feedback::process(feedbackActive, srScale, p_fb_drv, fbHpfCoeff, fbLpfCoeff, fbLpfRetain, LUTManager::globalFbRatio.load(std::memory_order_relaxed), currentPitch, LUTManager::lfoLUT, localFbPhase, feedbackPhaseIncr, wowRng, wowState, spd4, spd5, w4, w5, envBuf[i], localFbRamp, fzOutBuf[i], frzActive, localFrzRamp, localFbHpf, feedbackFilterVar, fbDelayBuffer, delaySamples, fbDelayWriteIdx, fbOutNode);
+
             w2Buf[i]=0.0f;
             if(__builtin_expect(harmActive, 0)) {
                 float w2_lo = DSPEngine::processDualPitchTap_SIMD(tap_w2_lo_1, tap_w2_lo_2, sramPitchLow, sramWriteIdx, maskLow, hannMultLow, LUTManager::hannLUT, LUTManager::pitchSincLUT);
@@ -233,6 +246,7 @@ public:
         vibratoLfoPhase=localVibPhase; chorusLfoPhase=localChoPhase; feedbackLfoPhase=localFbPhase; fbHpfState=localFbHpf;
         
         int16_t* tempDmaPtr = activeDmaReadBuf; activeDmaReadBuf = activeDmaWriteBuf; activeDmaWriteBuf = tempDmaPtr;
+
         int targetPsramIdx = (writeIndex - framesRead + MAX_BUFFER_SIZE) & BUFFER_MASK;
         if (__builtin_expect(MAX_BUFFER_SIZE - targetPsramIdx >= HOP_SIZE, 1)) {
             memcpy(&delayBuffer[targetPsramIdx], sramDryBlock, HOP_SIZE * sizeof(int16_t));

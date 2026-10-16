@@ -115,7 +115,14 @@ public:
     }
 
     static void processPedals() {
-        pedals.process(latestPB1, latestPB2, latestPB3, isVolumeMode, INVERT_PB3);
+        // ==============================================================================
+        // POLLING PAUSED: Physical PB 1-3 and PAR 1-5 processing is explicitly disabled.
+        // PB4 (CC 11) will continue working as it is driven natively by MidiHandler.h
+        // ==============================================================================
+        return; 
+
+#if 0
+        pedals.process(latestPB1, latestPB2, latestPB3, latestPar1, latestPar2, latestPar3, latestPar4, latestPar5, isVolumeMode, INVERT_PB3);
         
         currentPB1 = pedals.getCalA(); 
         currentPB2 = pedals.getCalB(); 
@@ -124,6 +131,7 @@ public:
         static int lastProcessedA = 8192;
         static int lastProcessedB = 8192;
         static int lastProcessedC = 8192;
+        
         int deltaA = abs((int)currentPB1 - lastProcessedA);
         int deltaB = abs((int)currentPB2 - lastProcessedB);
         int deltaC = abs((int)currentPB3 - lastProcessedC);
@@ -190,5 +198,36 @@ public:
             }
             pedals.updateLastMidiC();
         }
+
+        // PAR 1-5: 7-bit UI Knob Controllers (CC 24-28)
+        for (int i = 0; i < 5; i++) {
+            int currentParVal = pedals.getCalPar(i);
+            int deltaPar = abs(currentParVal - pedals.getLastMidiPar(i));
+            
+            // Standard 7-bit threshold. The EMA inside PedalManager already prevents ADC noise jitter.
+            if (deltaPar >= 1) { 
+                pedals.updateLastMidiPar(i);
+                lastActivityTime = millis();
+                
+                uint8_t ccCoarse = 24 + i;
+                uint8_t val = (uint8_t)(currentParVal & 0x7F);
+                
+                // Update internal DSP state
+                int currentMode = activeEffectMode.load(std::memory_order_acquire);
+                {
+                    CriticalSectionGuard lock(MidiRouter::paramMux);
+                    MidiRouter::updateParameter(ccCoarse, val, currentMode, effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+                    settingsNeedSaving = true; 
+                    lastParameterChangeTime = millis();
+                }
+
+                // Forward 7-bit CC via USB-MIDI
+                Control_Surface.sendControlChange({ccCoarse, Channel_1}, val);
+
+                // Forward 7-bit CC via BLE-MIDI
+                BluetoothManager::sendMidiToHost(0xB0, ccCoarse, val);
+            }
+        }
+#endif
     }
 };

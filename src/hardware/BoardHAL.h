@@ -71,7 +71,7 @@ public:
                 },
             },
         };
-        std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
+        std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
         return std_cfg;
     }
 

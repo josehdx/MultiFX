@@ -168,7 +168,7 @@ inline void setSampleRate(uint32_t targetSr) {
     vTaskDelay(pdMS_TO_TICKS(25));
     
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(targetSr);
-    clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
+    clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
     
     I2SManager::initChannels(BoardHAL::getI2SConfig(targetSr), HOP_SIZE);
     

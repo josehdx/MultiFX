@@ -13,7 +13,6 @@ inline char bleLatchedDiscReason[64] = "DISC: NONE";
 extern void dispatchBleMidi(uint8_t header, uint8_t data1, uint8_t data2);
 
 struct BleMidiPacket { uint8_t header, data1, data2; };
-
 static inline QueueHandle_t bleMidiQueue = nullptr;
 
 class BluetoothManager {
@@ -45,6 +44,7 @@ private:
     static inline NimBLERemoteCharacteristic* pClientRemoteChar = nullptr;
     static inline NimBLEServer* pServer = nullptr;
     static inline NimBLECharacteristic* pServerChar = nullptr;
+
     static inline const NimBLEUUID midiServiceUUID{"03B80E5A-EDE8-4B33-A751-6CE34EC4C700"};
     static inline const NimBLEUUID midiCharUUID{"7772E5DB-3868-4112-A1A9-F2669D106BF3"};
 
@@ -204,7 +204,8 @@ public:
     static void pedalNotifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
         if (length >= 5) {
             BleMidiPacket pkt = {pData[2], pData[3], pData[4]};
-            if (bleMidiQueue) xQueueSendFromISR(bleMidiQueue, &pkt, NULL);
+            // CRITICAL FIX: Use task-safe xQueueSend with 0 block time. NimBLE callbacks are not Hardware ISRs.
+            if (bleMidiQueue) xQueueSend(bleMidiQueue, &pkt, 0);
         }
     }
 
@@ -292,8 +293,10 @@ public:
                         strlcpy(bleHostStatusStr, "WAIT", sizeof(bleHostStatusStr));
                     }
                 }
+
                 BleMidiPacket pkt = {header, data1, data2};
-                if (bleMidiQueue) xQueueSendFromISR(bleMidiQueue, &pkt, NULL);
+                // CRITICAL FIX: Use task-safe xQueueSend with 0 block time. NimBLE callbacks are not Hardware ISRs.
+                if (bleMidiQueue) xQueueSend(bleMidiQueue, &pkt, 0);
             }
         }
     };
@@ -307,6 +310,7 @@ public:
 
         strlcpy(bleInitStep, "1: NimBLE init()", sizeof(bleInitStep));
         dualLog("\n[BLE INIT] Initializing Dual-Role NimBLE Stack...\n");
+
         NimBLEDevice::init("Whammy_S3");
         NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
@@ -330,6 +334,7 @@ public:
         advData.setFlags(0x06);
         advData.addServiceUUID(midiServiceUUID);
         pAdvertising->setAdvertisementData(advData);
+
         NimBLEAdvertisementData scanRespData;
         scanRespData.setName("Whammy_S3");
         pAdvertising->setScanResponseData(scanRespData);
@@ -337,9 +342,7 @@ public:
         pAdvertising->setMinInterval(400);
         pAdvertising->setMaxInterval(800);
         pAdvertising->start();
-
         lastConnectionEventTime = millis();
-
         dualLog("[BLE SERVER] Advertising as 'Whammy_S3'.\n");
 
         strlcpy(bleInitStep, "4: getScan()", sizeof(bleInitStep));
@@ -349,7 +352,6 @@ public:
         pScan->setMaxResults(0);
         pScan->setInterval(100);
         pScan->setWindow(40);
-
         snprintf(bleEventDebug, sizeof(bleEventDebug), "DUAL: ADV & SCAN");
         snprintf(bleScanDebug, sizeof(bleScanDebug), "SCAN: LISTENING...");
 
@@ -391,6 +393,7 @@ public:
             pendingHostServerConnLog = false;
             dualLog("\n[BLE SERVER] Host PC/Mac connected (Handle: %u)!\n", hostServerConnHandle);
         }
+
         if (pendingClientDiscReason != -1) {
             dualLog("[BLE WARN] Client connection lost (0x%02X - %s).\n", pendingClientDiscReason, getHciReasonString(pendingClientDiscReason));
             pendingClientDiscReason = -1;
@@ -420,7 +423,6 @@ public:
 
         // Strictly limit max connections to 2 to prevent NimBLE array out-of-bounds panics
         int activeConnections = (pServer ? pServer->getConnectedCount() : 0) + (pClient && pClient->isConnected() ? 1 : 0);
-
         if (activeConnections >= 2) {
             if (NimBLEDevice::getScan()->isScanning()) NimBLEDevice::getScan()->stop();
             if (pServer && NimBLEDevice::getAdvertising()->isAdvertising()) NimBLEDevice::getAdvertising()->stop();
@@ -431,7 +433,7 @@ public:
         if (millis() - lastConnectionEventTime < 2000) return;
 
         if (((isMvaveConnected && isHostConnected) || (isMvaveConnected && isNuxConnected)) && 
-            NimBLEDevice::getScan()->isScanning()) {
+             NimBLEDevice::getScan()->isScanning()) {
             NimBLEDevice::getScan()->stop();
         }
 
@@ -447,6 +449,7 @@ public:
 
         static unsigned long lastScanCall = 0;
         bool clientConnected = (pClient && pClient->isConnected());
+        
         if (!hasTarget && !clientConnected && millis() >= reconnectLockoutUntil) {
             if (!NimBLEDevice::getScan()->isScanning() && (millis() - lastScanCall > 2000)) {
                 NimBLEDevice::getScan()->start(0, false, true);
@@ -506,5 +509,4 @@ public:
         }
     }
 };
-
 #endif // BLUETOOTH_MANAGER_H

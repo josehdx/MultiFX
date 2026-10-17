@@ -1,5 +1,4 @@
 #pragma once
-
 #include "SystemState.h"
 #include "LUTManager.h"
 #include <dsps_fft2r.h>
@@ -19,7 +18,9 @@ private:
     int timerCount = 0;
     float confidenceMix = 0.0f;
 
-    float analysisBuffer[2048] __attribute__((aligned(16))) = {0.0f};
+    // CRITICAL FIX: Expanded from 2048 to 4096 to prevent buffer wrap-around corruption 
+    // at 96kHz when looking back (2.5 * 1371) = 3427 samples.
+    float analysisBuffer[4096] __attribute__((aligned(16))) = {0.0f};
     int writeIdx = 0;
     
     float detectedT0 = 200.0f; // Default safe period (~240 Hz)
@@ -61,6 +62,7 @@ private:
     float* pvPhaseWorkspace = nullptr;
     float* pvLastPhase = nullptr;
     float* pvSumPhase = nullptr;
+    
     int pvWriteIdx = 0;
     int pvReadIdx = 0;
     int pvHopCounter = 0;
@@ -94,7 +96,7 @@ public:
                         float p1, float p2, float p3, float p4, float p5) __attribute__((always_inline)) {
         
         analysisBuffer[writeIdx] = inSample;
-        writeIdx = (writeIdx + 1) & 2047;
+        writeIdx = (writeIdx + 1) & 4095; // Mask updated to match new buffer size
         
         int algo = constrain((int)(p1 * 4.99f), 0, 4);
         
@@ -159,7 +161,7 @@ private:
         
         float r0 = 0.0f;
         for (int i = 0; i < window; i++) {
-            int idx = (writeIdx - window + i + 2048) & 2047;
+            int idx = (writeIdx - window + i + 4096) & 4095; // Applied offset update
             float val = analysisBuffer[idx];
             r0 = __builtin_fmaf(val, val, r0);
         }
@@ -170,12 +172,13 @@ private:
         for (int lag = lagMin; lag <= lagMax; lag++) {
             float rLag = 0.0f;
             for (int i = 0; i < window; i++) {
-                int idx1 = (writeIdx - window - lag + i + 2048) & 2047;
-                int idx2 = (writeIdx - window + i + 2048) & 2047;
+                int idx1 = (writeIdx - window - lag + i + 4096) & 4095; // Applied offset update
+                int idx2 = (writeIdx - window + i + 4096) & 4095; // Applied offset update
                 rLag = __builtin_fmaf(analysisBuffer[idx1], analysisBuffer[idx2], rLag);
             }
             if (rLag > maxR) { maxR = rLag; bestLag = lag; }
         }
+
         if ((maxR / r0) > 0.85f) { detectedT0 = (float)bestLag; return true; }
         return false;
     }
@@ -183,15 +186,18 @@ private:
     inline float processTap(uint32_t tapPhase, const float* buffer, int currentWriteIdx, uint32_t windowMask, uint32_t hannIntMult) __attribute__((always_inline)) {
         int T = (tapPhase >> 16) & windowMask;
         float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f;
+
         int effTap = T + 2;
         int idx1 = (currentWriteIdx - effTap + 8192) & 8191;
         int idx0 = (idx1 + 1) & 8191;
         int idx2 = (idx1 - 1 + 8192) & 8191;
         int idx3 = (idx1 - 2 + 8192) & 8191;
+
         float y0 = buffer[idx0];
         float y1 = buffer[idx1];
         float y2 = buffer[idx2];
         float y3 = buffer[idx3];
+
         float d1 = y2 - y0;
         float d2 = y1 - y2;
         float d3 = y3 - y0;
@@ -199,6 +205,7 @@ private:
         float c3 = __builtin_fmaf(1.5f, d2, 0.5f * d3);
         float c2 = y0 - y1 + c1 - c3;
         float sample = __builtin_fmaf(__builtin_fmaf(__builtin_fmaf(c3, frac, c2), frac, c1), frac, y1);
+
         int lutIdx = ((uint32_t)(T * hannIntMult) >> 16) & 4095;
         float val = sample * LUTManager::hannLUT[lutIdx];
         
@@ -209,26 +216,29 @@ private:
 
     inline float executeTDPSOLA(float sample, float targetPitch, float T0, float p_frm, float p_tol) __attribute__((always_inline)) {
         if (T0 < 2.0f || targetPitch < 0.01f) return 0.0f;
+
         float T1 = T0 / targetPitch; 
         synthesisPhase += 1.0f;
         
         if (synthesisPhase >= T1) {
             synthesisPhase -= T1; 
-            int searchStart = (writeIdx - (int)(2.5f * T0) + 4096) & 2047;
-            int searchLen = (int)(T0 * (0.1f + p_tol * 0.9f));
 
+            int searchStart = (writeIdx - (int)(2.5f * T0) + 4096) & 4095; // Applied offset update
+            int searchLen = (int)(T0 * (0.1f + p_tol * 0.9f));
             float maxVal = -1.0f; int epochIdx = searchStart;
+
             for (int i = 0; i < searchLen; i++) {
-                int idx = (searchStart + i) & 2047;
+                int idx = (searchStart + i) & 4095; // Applied offset update
                 float absVal = fabsf(analysisBuffer[idx]);
                 if (absVal > maxVal) { maxVal = absVal; epochIdx = idx; }
             }
 
             float windowMultiplier = 1.5f + (p_frm * 1.5f);
+            
             for (int i = 0; i < 8; i++) {
                 if (!grains[i].active) {
                     grains[i].active = true; grains[i].winSpan = windowMultiplier * T0;
-                    grains[i].anchorIdx = (epochIdx - (int)(grains[i].winSpan * 0.5f) + 4096) & 2047;
+                    grains[i].anchorIdx = (epochIdx - (int)(grains[i].winSpan * 0.5f) + 4096) & 4095; // Applied offset update
                     grains[i].currentPhase = 0.0f; grains[i].phaseInc = 1.0f / grains[i].winSpan; break;
                 }
             }
@@ -238,9 +248,8 @@ private:
         for (int i = 0; i < 8; i++) {
             if (grains[i].active) {
                 int readOffset = (int)(grains[i].currentPhase * grains[i].winSpan);
-                int readIdx = (grains[i].anchorIdx + readOffset) & 2047;
+                int readIdx = (grains[i].anchorIdx + readOffset) & 4095; // Applied offset update
                 float rawSample = analysisBuffer[readIdx];
-
                 int lutIdx = ((int)(grains[i].currentPhase * 4095.0f)) & 4095;
                 outSample = __builtin_fmaf(rawSample, LUTManager::hannLUT[lutIdx], outSample);
 
@@ -257,11 +266,13 @@ private:
 
     inline float executeYinSynth(float targetPitch, float T0, float p_wav, float p_gld, float p_oct, float sr) __attribute__((always_inline)) {
         if (T0 <= 0.1f) return 0.0f;
+
         float F0 = sr / T0; 
         if (p_oct > 0.5f) targetPitch = exp2f(roundf(log2f(targetPitch)));
-        float F1 = F0 * targetPitch;
 
+        float F1 = F0 * targetPitch;
         if (currentState == UNVOICED || currentState == WAITING) smoothedFreq = F1;
+
         float alpha = (p_gld > 0.01f) ? (1.0f / (p_gld * sr * 0.5f)) : 1.0f;
         smoothedFreq += (F1 - smoothedFreq) * alpha;
 
@@ -278,11 +289,12 @@ private:
 
     inline float executeECKF(float targetPitch, float T0, float p_Q, float p_R, float p_spd, float sr) __attribute__((always_inline)) {
         if (T0 <= 0.1f) return 0.0f;
+
         float F0_meas = sr / T0;
         if (currentState == UNVOICED) { kf_freq = F0_meas; kf_p = 1.0f; }
         
         float Q = 0.0001f + (p_Q * 0.05f); 
-        float R = 0.01f + (p_R * 10.0f);
+        float R = 0.01f + (p_R * 10.0f); 
         
         float p_pred = kf_p + Q;
         float K = __builtin_fminf(p_pred / (p_pred + R), 0.1f + (p_spd * 0.9f));
@@ -319,8 +331,8 @@ private:
     inline float executePhaseVocoder(float sample, float targetPitch, float p_blr, float p_phs, float p_trn, float sr) __attribute__((always_inline)) {
         float absSample = fabsf(sample);
         pvEnv = __builtin_fmaxf(0.0f, __builtin_fmaf(absSample - pvEnv, (absSample > pvEnv) ? 0.2f : 0.001f, pvEnv));
-        float transientSpike = absSample / (pvEnv + 0.001f);
 
+        float transientSpike = absSample / (pvEnv + 0.001f);
         if (p_trn > 0.05f && transientSpike > (10.0f - p_trn * 8.0f)) pvTransientMix = 1.0f;
         pvTransientMix *= 0.995f;
 
@@ -346,6 +358,7 @@ private:
                 int idx = (pvWriteIdx - 512 + i + 512) & 511;
                 pvWorkspace[i*2] = pvInput[idx] * LUTManager::hannLUT[(i * 8) & 4095]; 
                 pvWorkspace[i*2+1] = 0.0f;
+
                 pvMagWorkspace[i] = 0.0f;
                 pvPhaseWorkspace[i] = 0.0f;
             }
@@ -366,7 +379,6 @@ private:
                 deltaPhase -= (float)k * 6.2831853f * (float)hopSize / 512.0f;
                 
                 deltaPhase = deltaPhase - 6.2831853f * roundf(deltaPhase * 0.1591549f);
-
                 float trueFreq = ((float)k * 6.2831853f / 512.0f) + (deltaPhase / (float)hopSize);
 
                 int newBin = (int)((float)k * currentShift);

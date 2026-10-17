@@ -21,17 +21,25 @@ inline bool channelMessageCallback(ChannelMessage cm) {
     
     switch (action.event) {
         case MidiEvent::EXPRESSION_UPDATE: {
-            CriticalSectionGuard lock(MidiRouter::paramMux);
-            currentCC11 = action.rawValue; 
-            lastActivePedal = action.rawValue;
-            activePedalSource = 0; // MIDI Active
-            
             uint8_t original7Bit = action.val;
-
-            if (isVolumeMode) {
-                volumePedalGain = (float)action.rawValue / 16383.0f;
-                dspNeedsCommit = true;
+            bool localIsVolMode = false;
+            
+            {
+                // CRITICAL FIX: Scope the spinlock strictly to variable updates to prevent USB/BLE deadlocks
+                CriticalSectionGuard lock(MidiRouter::paramMux);
+                currentCC11 = action.rawValue;
+                lastActivePedal = action.rawValue;
+                activePedalSource = 0; // MIDI Active
+                localIsVolMode = isVolumeMode;
                 
+                if (localIsVolMode) {
+                    volumePedalGain = (float)action.rawValue / 16383.0f;
+                    dspNeedsCommit = true;
+                }
+            }
+            
+            // Execute blocking MIDI sends outside the spinlock
+            if (localIsVolMode) {
                 // Transmit CC 19 (Volume) over both USB-MIDI and BLE-MIDI (7-bit)
                 Control_Surface.sendControlChange({19, Channel_1}, original7Bit);
                 BluetoothManager::sendMidiToHost(0xB0, 19, original7Bit);
@@ -45,7 +53,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             }
             break;
         }
-
         case MidiEvent::KNOB_UPDATE: {
             // updateParameter already handles its own paramMux internally
             MidiRouter::updateParameter(action.cc, action.val, currentMode, effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
@@ -53,7 +60,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             lastParameterChangeTime = millis();
             break;
         }
-
         case MidiEvent::PREV_MODE: {
             static unsigned long lastPrev = 0;
             if (action.val > 0 && millis() - lastPrev > 250) {
@@ -62,7 +68,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             }
             break;
         }
-
         case MidiEvent::NEXT_MODE: {
             static unsigned long lastNext = 0;
             if (action.val > 0 && millis() - lastNext > 250) {
@@ -71,7 +76,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             }
             break;
         }
-
         case MidiEvent::LATENCY_CYCLE: {
             static unsigned long lastLat = 0;
             if (action.val > 0 && millis() - lastLat > 500) {
@@ -80,7 +84,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             }
             break;
         }
-
         case MidiEvent::PANIC_RESET: {
             static unsigned long lastPanic = 0;
             if (action.val > 0 && millis() - lastPanic > 500) {
@@ -89,7 +92,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             }
             break;
         }
-
         case MidiEvent::SR_TOGGLE: {
             static unsigned long lastSrToggle = 0;
             if (millis() - lastSrToggle > 500) {
@@ -103,50 +105,56 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             }
             break;
         }
-
         case MidiEvent::PB2_WIPER_TOGGLE: {
             bool targetState = (action.val >= 64);
             if (isPB2WiperMode != targetState) {
                 CriticalSectionGuard lock(MidiRouter::paramMux);
-                isPB2WiperMode = targetState; 
+                isPB2WiperMode = targetState;
                 dspNeedsCommit = true; 
                 pb2ToggleRequested = true; 
             }
             break;
         }
-
         case MidiEvent::VOL_MODE_TOGGLE: {
             static unsigned long lastVolToggle = 0;
             if (action.val > 0 && millis() - lastVolToggle > 250) {
                 lastVolToggle = millis();
                 
-                CriticalSectionGuard lock(MidiRouter::paramMux);
-                isVolumeMode = !isVolumeMode;
+                bool localIsVolMode = false;
+                {
+                    // CRITICAL FIX: Scope the spinlock strictly to variable updates
+                    CriticalSectionGuard lock(MidiRouter::paramMux);
+                    isVolumeMode = !isVolumeMode;
+                    localIsVolMode = isVolumeMode;
+                    
+                    if (!localIsVolMode) {
+                        volumePedalGain = 1.0f; 
+                        pedals.lockPB3Whammy(); 
+                        currentPB3 = 8192; 
+                        lastActivePedal = 8192;
+                        activePedalSource = 0;
+                    } else {
+                        pedals.lockPB3Volume(); 
+                        lastActivePedal = 8192; 
+                        activePedalSource = 0;
+                        volumePedalGain = (float)currentPB3 / 16383.0f;
+                    }
+                    
+                    dspNeedsCommit = true; 
+                    settingsNeedSaving = true; 
+                    lastParameterChangeTime = millis();
+                }
                 
-                if (!isVolumeMode) {
-                    volumePedalGain = 1.0f; 
-                    pedals.lockPB3Whammy(); 
-                    currentPB3 = 8192; 
-                    lastActivePedal = 8192;
-                    activePedalSource = 0;
+                // Execute blocking MIDI sends outside the spinlock
+                if (!localIsVolMode) {
                     Control_Surface.sendPitchBend(Channel_3, 8192);
-                } else {
-                    pedals.lockPB3Volume(); 
-                    lastActivePedal = 8192; 
-                    activePedalSource = 0;
-                    volumePedalGain = (float)currentPB3 / 16383.0f;
                 }
                 
                 float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release);
-                
-                dspNeedsCommit = true; 
-                settingsNeedSaving = true; 
-                lastParameterChangeTime = millis();
             }
             break;
         }
-
         case MidiEvent::TOGGLE_EFFECT: {
             static unsigned long lastTgl = 0;
             if (action.val > 0 && millis() - lastTgl > 250) {
@@ -178,7 +186,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             }
             break;
         }
-
         case MidiEvent::STEP_TOE: {
             float step = (action.val >= 64) ? -1.0f : 1.0f;
             {
@@ -198,7 +205,6 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             lastParameterChangeTime = millis();
             break;
         }
-
         case MidiEvent::STEP_HEEL: {
             float step = (action.val >= 64) ? -1.0f : 1.0f;
             {
@@ -221,10 +227,8 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             lastParameterChangeTime = millis();
             break;
         }
-
         case MidiEvent::NONE: 
             break;
     }
-
     return false;
 }

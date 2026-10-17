@@ -1,5 +1,4 @@
 #pragma once
-
 #include <Arduino.h>
 #include <Update.h>
 #include <dirent.h>
@@ -44,7 +43,7 @@ private:
                 bool isTargetSFN = (memcmp(&sectorBuf[i], "FIRMWARE", 8) == 0) ||
                                    (memcmp(&sectorBuf[i], "FIRMWA~1", 8) == 0);
                 bool isTargetLFN = false;
-
+                
                 if (sectorBuf[i + 11] == 0x0F) {
                     if ((sectorBuf[i + 1] == 'f' || sectorBuf[i + 1] == 'F') &&
                         (sectorBuf[i + 3] == 'i' || sectorBuf[i + 3] == 'I') &&
@@ -60,11 +59,13 @@ private:
                     fileDeleted = true;
                 }
             }
+
             if (sectorModified) {
                 esp_partition_erase_range(part, offset, 4096);
                 esp_partition_write(part, offset, sectorBuf, 4096);
             }
         }
+
         if (fileDeleted) {
             logOutput("[OTA] firmware.bin erased from storage.");
         }
@@ -72,11 +73,12 @@ private:
 
     static bool scanAndFlashRawPartition(const esp_partition_t* part) {
         logOutput("[OTA] Scanning partition sectors directly...", 0xFFE0);
+
         uint8_t sec[4096];
         uint32_t foundOffset = 0;
         bool found = false;
-
         uint32_t scanLimit = min((uint32_t)part->size, (uint32_t)(4 * 1024 * 1024));
+
         for (uint32_t off = 0; off < scanLimit; off += 4096) {
             if (esp_partition_read(part, off, sec, 4096) != ESP_OK) continue;
             // Check for ESP32-S3 app binary magic byte 0xE9 and descriptor magic 0xABCD5432
@@ -98,6 +100,7 @@ private:
 
         esp_app_desc_t new_app;
         esp_partition_read(part, foundOffset + 0x20, &new_app, sizeof(esp_app_desc_t));
+
         const esp_partition_t* running = esp_ota_get_running_partition();
         esp_app_desc_t running_app;
         esp_ota_get_partition_description(running, &running_app);
@@ -128,6 +131,7 @@ private:
             esp_partition_read(part, off, sec, 4096);
             Update.write(sec, 4096);
             written += 4096;
+
             int pct = (int)((written * 100) / binSize);
             if (pct != lastPct && pct % 10 == 0) {
                 lastPct = pct;
@@ -139,22 +143,20 @@ private:
 
         if (Update.end(true)) {
             logOutput("[OTA] Update complete! Rebooting...", 0x07E0);
-            
             // Erase the first sector of the found firmware payload to destroy the 0xE9 magic byte
             esp_partition_erase_range(part, foundOffset, 4096);
-            
             deleteFirmwareFileRaw();
             delay(1200);
             ESP.restart();
             return true;
         }
-
         return false;
     }
 
 public:
     static void checkAndApplyUpdate() {
         logOutput("[SYSTEM] Checking storage partition...");
+
         const esp_partition_t* part = esp_partition_find_first(
             ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, "ffat");
             
@@ -227,6 +229,16 @@ public:
 
                 if (Update.begin(fileSize, U_FLASH)) {
                     uint8_t* buf = (uint8_t*)malloc(4096);
+                    
+                    // CRITICAL FIX: Ensure allocation succeeded before passing to fread
+                    if (!buf) {
+                        logOutput("[OTA] Error: Malloc failed!", 0xF800);
+                        Update.end(false);
+                        fclose(updateFile);
+                        esp_vfs_fat_spiflash_unmount_ro("/ffat", "ffat");
+                        return;
+                    }
+
                     size_t written = 0;
                     int lastPct = -1;
 
@@ -246,6 +258,7 @@ public:
 #endif
                         }
                     }
+
                     free(buf);
 
                     if (written == fileSize && Update.end(true)) {

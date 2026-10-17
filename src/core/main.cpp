@@ -2,7 +2,6 @@
 #include <Preferences.h>
 #include <Update.h>
 #include "esp_log.h"
-
 #define FW_VERSION "v5.00H"
 
 // Core System Includes
@@ -18,6 +17,7 @@
 #include "DisplayManager.h"
 DisplayManager displayManager;
 #endif
+
 #include "FirmwareManager.h"
 
 // Define the global flags
@@ -34,7 +34,7 @@ void dispatchBleMidi(uint8_t header, uint8_t data1, uint8_t data2) {
 
 void setup() {
     esp_log_level_set("task_wdt", ESP_LOG_NONE);
-
+    
 #if defined(TARGET_LILYGO)
     pinMode(15, OUTPUT);
     digitalWrite(15, HIGH);
@@ -128,17 +128,17 @@ void loop() {
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) {
         snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVING NVS...");
         
-        // Only park the DSP and tear down I2S if the USB is connected and mounted to a Host PC.
-        // This prevents the audio from dropping when saving settings while playing normally unplugged.
         bool usbActive = (bool)USB;
         
+        // CRITICAL FIX: We MUST always park the DSP before NVS Flash Writes.
+        // NVS writes disable the SPI cache. Since the DSP Audio Pipeline accesses delay buffers
+        // in PSRAM, leaving it unparked triggers a fatal "Cache disabled" hardware exception.
+        dsp_is_paused.store(true, std::memory_order_release);
+        while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) {
+              vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        
         if (usbActive) {
-            dsp_is_paused.store(true, std::memory_order_release);
-            
-            while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) {
-                  vTaskDelay(pdMS_TO_TICKS(1));
-              }
-            
             // Temporarily disable TX to avoid loud static during the flash block
             if (I2SManager::tx_chan != NULL) {
                 i2s_channel_disable((i2s_chan_handle_t)I2SManager::tx_chan);
@@ -158,16 +158,16 @@ void loop() {
         }
         
         settingsMgr.save(preferences, 
-                          activeDSP->activeMode, 
-                          activeDSP->latMode,
+                         activeDSP->activeMode, 
+                         activeDSP->latMode, 
                          activeDSP->fbIdx, 
-                          isPB2WiperMode, 
-                          isVolumeMode, 
-                          currentFxStates, 
-                          currentSampleRate.load(std::memory_order_acquire),
+                         isPB2WiperMode, 
+                         isVolumeMode, 
+                         currentFxStates, 
+                         currentSampleRate.load(std::memory_order_acquire), 
                          &currentSettings, 
-                          sizeof(AppSettings));
-                  
+                         sizeof(AppSettings));
+                         
         settingsNeedSaving = false;
         
         if (usbActive) {
@@ -175,18 +175,16 @@ void loop() {
             if (I2SManager::tx_chan != NULL) {
                 i2s_channel_enable((i2s_chan_handle_t)I2SManager::tx_chan);
             }
-            
-            snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVE COMPLETE");
-            
-            dsp_is_paused.store(false, std::memory_order_release);
-            if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
-            if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
-            
-            while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) {
-                  vTaskDelay(pdMS_TO_TICKS(1));
-              }
-        } else {
-            snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVE COMPLETE");
+        }
+        
+        snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVE COMPLETE");
+        
+        dsp_is_paused.store(false, std::memory_order_release);
+        if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
+        if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
+        
+        while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) {
+              vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
 

@@ -1,5 +1,4 @@
 #pragma once
-
 #include <Arduino.h>
 #include "SystemState.h"
 #include "PowerManager.h"
@@ -21,7 +20,6 @@ extern bool showBleWarning;
 // 0 = Full I2S Audio Mode (GPIO 43=MCLK, 44=BCLK, 18=WS, 17=DIN)
 //     NOTE: Serial0 MUST be detached in Mode 0 to prevent seizing GPIO 43/44!
 // =========================================================================
-
 #define ENABLE_SERIAL_DEBUG 0
 
 class BoardHAL {
@@ -78,8 +76,13 @@ public:
     static void fetchADC(adc_continuous_handle_t handle, volatile bool& isPaused, volatile int& pb1, volatile int& pb2, volatile int& pb3, volatile int& par1, std::atomic<int>& bat) {
         if (isPaused) return;
         
+        // CRITICAL FIX: Lock multiple sequential analogRead calls to prevent 
+        // light-sleep tearing down the hardware mid-conversion.
+        if (adcLock.test_and_set(std::memory_order_acquire)) return;
+        
         pb1 = analogRead(1); 
         pb2 = analogRead(2); 
+
 #if defined(TARGET_LILYGO)
         par1 = analogRead(3);
         pb3  = analogRead(10);
@@ -92,6 +95,8 @@ public:
         latestPar4 = analogRead(7);
         latestPar5 = analogRead(11);
 #endif
+
+        adcLock.clear(std::memory_order_release);
     }
 
     static void updateUI(DSPCoreState* activeDSP, uint16_t pb1, uint16_t pb2, uint16_t pb3, uint16_t cc11, float inMeter, float outMeter, float dspLoad, float ctrlLoad, uint32_t sampleRate, uint32_t peakLatency, uint32_t underflows, uint32_t stackWatermark, bool bleConnected, float batVal, bool isMonoPolyActiveFlag, const char* dbgMsg) {
@@ -113,10 +118,8 @@ public:
             dData.bleHostConnected = BluetoothManager::isHostConnected || BluetoothManager::isNuxConnected;
             dData.blePedalConnected = BluetoothManager::isMvaveConnected;
             dData.activeMode = activeDSP->activeMode;
-
             for(int i = 0; i < 10; i++) { dData.fxStates[i] = (&activeDSP->w)[i]; }
             dData.pb1 = pb1;  dData.pb2 = pb2;  dData.pb3 = pb3;  dData.cc11 = cc11;
-
             for(int i = 0; i < 5; i++) { 
                 dData.paramVals[i] = activeDSP->params[activeDSP->activeMode % 10][i]; 
             }
@@ -125,10 +128,8 @@ public:
                 dData.paramVals[2] = activeDSP->fxMem[0];
                 dData.paramVals[3] = activeDSP->fxMem[1];
             }
-
             dData.paramNames[0] = "P1"; dData.paramNames[1] = "P2"; dData.paramNames[2] = "P3"; 
             dData.paramNames[3] = "P4"; dData.paramNames[4] = "P5";
-
             dData.inMeter = inMeter; dData.outMeter = outMeter;
             dData.dspCoreLoad = dspLoad; dData.ctrlCoreLoad = ctrlLoad;
             dData.freeSRAM = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);

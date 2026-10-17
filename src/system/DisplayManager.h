@@ -12,7 +12,6 @@ extern char bleScanDebug[64];
 extern char bleLatchedDiscReason[64];
 
 #define SHOW_TELEMETRY true
-
 #define DISP_COLOR_OFF  0x001F 
 #define DISP_COLOR_ON   TFT_GREEN
 
@@ -23,13 +22,13 @@ struct DisplayData {
     bool bleConnected;
     bool bleHostConnected;
     bool blePedalConnected;
-
+    bool isNuxConnected;
+    
     int activeMode;
     bool fxStates[10];
     uint16_t pb1, pb2, pb3, cc11;
     float paramVals[5];
     const char* paramNames[5];
-
     float inMeter, outMeter;
     float dspCoreLoad, ctrlCoreLoad;
     uint32_t freeSRAM, freePSRAM;
@@ -43,13 +42,13 @@ struct DisplayData {
     bool showBleWarning;
     bool showSavingScreen;
     bool showKnobModeScreen;
-
+    
     bool isMonoPolyActive;
     bool isVolumeMode;
     
     float whammyToe;
     float whammyHeel;
-
+    
     char debugMsg[64];
 };
 
@@ -68,7 +67,7 @@ private:
     bool lastMonoPolyActive = false;
     bool lastVolumeMode = false;
     int lastMonoPolyAlgo = -1;
-
+    
     int bootLogY = 8;
 
     const char* FX_NAMES[10] = {"WH", "FZ", "FB", "HR", "CP", "SY", "PD", "CH", "SW", "VB"};
@@ -109,12 +108,10 @@ private:
     void drawKnobDynamic(TFT_eSprite& s, int cx, int cy, int r, float normVal, bool isBipolar, const char* valStr) {
         float angleDeg = isBipolar ? (normVal * 135.0f) : (-135.0f + (normVal * 270.0f));
         float rad = (angleDeg - 90.0f) * 0.0174532925f;
-
         int px = cx + (int)(cosf(rad) * (r - 3));
         int py = cy + (int)(sinf(rad) * (r - 3));
         
         uint16_t color = isBipolar ? TFT_CYAN : TFT_GREEN;
-
         s.drawLine(cx, cy, px, py, color);
         s.fillCircle(px, py, 2, color);
         
@@ -131,7 +128,8 @@ private:
             strcmp(bleScanDebug, cachedBleScan) != 0 ||
             strcmp(bleLatchedDiscReason, cachedDiscReason) != 0 ||
             d.bleHostConnected != cache.bleHostConnected ||
-            d.blePedalConnected != cache.blePedalConnected) {
+            d.blePedalConnected != cache.blePedalConnected ||
+            d.isNuxConnected != cache.isNuxConnected) {
             
             strlcpy(cachedMidiDebug, lastMidiDebug, sizeof(cachedMidiDebug));
             strlcpy(cachedBleEvent, bleEventDebug, sizeof(cachedBleEvent));
@@ -150,11 +148,9 @@ private:
         if (d.activeMode != cache.activeMode) return true;
         if (d.latencyMode != cache.latencyMode) return true;
         if (d.pb1 != cache.pb1 || d.pb2 != cache.pb2 || d.pb3 != cache.pb3 || d.cc11 != cache.cc11) return true;
-
         if (fabsf(d.inMeter - cache.inMeter) > 0.02f || fabsf(d.outMeter - cache.outMeter) > 0.02f) return true;
         if (fabsf(d.dspCoreLoad - cache.dspCoreLoad) > 1.0f || fabsf(d.ctrlCoreLoad - cache.ctrlCoreLoad) > 1.0f) return true;
         if (d.batPercent != cache.batPercent || d.sampleRate != cache.sampleRate) return true;
-
         if (d.peakLatency != cache.peakLatency || d.underflows != cache.underflows || d.dmaCount != cache.dmaCount || d.stackWatermark != cache.stackWatermark) return true;
         if ((d.freeSRAM / 1024) != (cache.freeSRAM / 1024) || (d.freePSRAM / 1024) != (cache.freePSRAM / 1024)) return true;
         
@@ -165,7 +161,6 @@ private:
         for (int i = 0; i < 10; i++) {
             if (d.fxStates[i] != cache.fxStates[i]) return true;
         }
-
         for (int i = 0; i < 5; i++) {
             if (fabsf(d.paramVals[i] - cache.paramVals[i]) > 0.005f) return true;
         }
@@ -175,16 +170,16 @@ private:
 public:
     void begin() {
         pinMode(15, OUTPUT);
-        digitalWrite(15, HIGH);                
+        digitalWrite(15, HIGH);
         
         pinMode(38, OUTPUT);
         digitalWrite(38, HIGH); 
         delay(100);             
-
+        
         tft.init();
         tft.setRotation(1);
         tft.fillScreen(TFT_BLACK);
-        digitalWrite(38, HIGH);          
+        digitalWrite(38, HIGH); 
 
         spr.setColorDepth(16);
         bgSpr.setColorDepth(16);
@@ -193,6 +188,7 @@ public:
         bgSpr.createSprite(320, 170);
         
         spr.setTextColor(TFT_WHITE, TFT_BLACK);
+
         lastRenderMode = -1;
         lastMonoPolyActive = false;
         lastVolumeMode = false;
@@ -262,11 +258,9 @@ public:
             drawKnobStatic(bgSpr, pbCenters[0], 48, 14, "PB1");
             drawKnobStatic(bgSpr, pbCenters[1], 48, 14, "PB2");
             
-            // PB3 Label adapts to Volume Mode
             const char* pb3Label = d.isVolumeMode ? "Vol" : "PB3";
             drawKnobStatic(bgSpr, pbCenters[2], 48, 14, pb3Label);
             
-            // PB4/MIDI Label adapts to Volume Mode
             const char* pb4Label = d.isVolumeMode ? "Vol" : "PB4-14B";
             drawKnobStatic(bgSpr, pbCenters[3], 48, 14, pb4Label);
             
@@ -311,7 +305,6 @@ public:
             spr.setTextColor(TFT_WHITE, TFT_BLACK);
             snprintf(headerBuf, sizeof(headerBuf), "%s [ T:%+d | H:%+d ]", MODE_NAMES[d.activeMode % 10], (int)d.whammyToe, (int)d.whammyHeel);
         }
-
         spr.drawString(headerBuf, 160, 2, 2);
         
         spr.setTextDatum(TR_DATUM);
@@ -319,11 +312,16 @@ public:
             spr.setTextColor(DISP_COLOR_OFF, TFT_BLACK);
             spr.drawString("KNOB MODE", 318, 2, 2);
         } else {
+            // Line 1: M-vave Foot Controller
             spr.setTextColor(d.blePedalConnected ? DISP_COLOR_ON : DISP_COLOR_OFF, TFT_BLACK);
             spr.drawString("M-vave", 318, 1, 1);
             
+            // Line 2: Independent PC and NUX indicators
             spr.setTextColor(d.bleHostConnected ? DISP_COLOR_ON : DISP_COLOR_OFF, TFT_BLACK);
-            spr.drawString("PC", 318, 10, 1);
+            spr.drawString("PC", 294, 10, 1);
+            
+            spr.setTextColor(d.isNuxConnected ? DISP_COLOR_ON : DISP_COLOR_OFF, TFT_BLACK);
+            spr.drawString("NUX", 318, 10, 1);
         }
 
         spr.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -340,6 +338,7 @@ public:
         float cc11_norm = (float)d.cc11 / 16383.0f;
 
         char buf[16];
+
         snprintf(buf, sizeof(buf), "%d%%", (int)(pb1_norm * 100.0f));
         drawKnobDynamic(spr, pbCenters[0], 48, 14, pb1_norm, true, buf);
 
@@ -348,7 +347,7 @@ public:
 
         snprintf(buf, sizeof(buf), "%d%%", (int)(pb3_norm * 100.0f));
         drawKnobDynamic(spr, pbCenters[2], 48, 14, pb3_norm, false, buf);
-
+        
         snprintf(buf, sizeof(buf), "%d%%", (int)(cc11_norm * 100.0f));
         drawKnobDynamic(spr, pbCenters[3], 48, 14, cc11_norm, false, buf);
 
@@ -384,9 +383,11 @@ public:
         
         int activeIndices[10];
         int activeCount = 0;
+
         for (int i = 0; i < 10; i++) {
             int fxIdx = CHAIN_ORDER[i];
             bool isEffectActive = (fxIdx == 0) ? (d.fxStates[0] || d.isMonoPolyActive) : d.fxStates[fxIdx];
+
             if (isEffectActive) activeIndices[activeCount++] = fxIdx;
         }
 

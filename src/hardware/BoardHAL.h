@@ -1,4 +1,5 @@
 #pragma once
+
 #include <Arduino.h>
 #include "SystemState.h"
 #include "PowerManager.h"
@@ -49,7 +50,7 @@ public:
     #if ENABLE_SERIAL_DEBUG
                 .ws   = (gpio_num_t)-1, 
                 .dout = (gpio_num_t)21,
-                .din  = (gpio_num_t)-1, 
+                .din  = (gpio_num_t)-1,     
     #else
                 .ws   = (gpio_num_t)18,
                 .dout = (gpio_num_t)21,
@@ -69,6 +70,7 @@ public:
                 },
             },
         };
+
         std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384; 
         return std_cfg;
     }
@@ -76,8 +78,6 @@ public:
     static void fetchADC(adc_continuous_handle_t handle, volatile bool& isPaused, volatile int& pb1, volatile int& pb2, volatile int& pb3, volatile int& par1, std::atomic<int>& bat) {
         if (isPaused) return;
         
-        // CRITICAL FIX: Lock multiple sequential analogRead calls to prevent 
-        // light-sleep tearing down the hardware mid-conversion.
         if (adcLock.test_and_set(std::memory_order_acquire)) return;
         
         pb1 = analogRead(1); 
@@ -115,11 +115,14 @@ public:
             dData.batPercent = PowerManager::getBatteryPercentage(dData.batVoltage);
             
             dData.bleConnected = bleConnected;
-            dData.bleHostConnected = BluetoothManager::isHostConnected || BluetoothManager::isNuxConnected;
+            dData.bleHostConnected = BluetoothManager::isHostConnected;
             dData.blePedalConnected = BluetoothManager::isMvaveConnected;
+            dData.isNuxConnected = BluetoothManager::isNuxConnected;
+            
             dData.activeMode = activeDSP->activeMode;
             for(int i = 0; i < 10; i++) { dData.fxStates[i] = (&activeDSP->w)[i]; }
             dData.pb1 = pb1;  dData.pb2 = pb2;  dData.pb3 = pb3;  dData.cc11 = cc11;
+            
             for(int i = 0; i < 5; i++) { 
                 dData.paramVals[i] = activeDSP->params[activeDSP->activeMode % 10][i]; 
             }
@@ -128,12 +131,15 @@ public:
                 dData.paramVals[2] = activeDSP->fxMem[0];
                 dData.paramVals[3] = activeDSP->fxMem[1];
             }
+
             dData.paramNames[0] = "P1"; dData.paramNames[1] = "P2"; dData.paramNames[2] = "P3"; 
             dData.paramNames[3] = "P4"; dData.paramNames[4] = "P5";
+
             dData.inMeter = inMeter; dData.outMeter = outMeter;
             dData.dspCoreLoad = dspLoad; dData.ctrlCoreLoad = ctrlLoad;
             dData.freeSRAM = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
             dData.freePSRAM = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
             dData.sampleRate = sampleRate; dData.peakLatency = peakLatency;
             dData.underflows = underflows; dData.dmaCount = 0; 
             dData.stackWatermark = stackWatermark;

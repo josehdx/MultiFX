@@ -69,7 +69,7 @@ void loop() {
 
     bool btConnected = false;
 #if !defined(FW_MODE_KNOBS_ONLY)
-    btConnected = BluetoothManager::isMvaveConnected || BluetoothManager::isHostConnected;
+    btConnected = BluetoothManager::isMvaveConnected || BluetoothManager::isHostConnected || BluetoothManager::isNuxConnected;
 #endif
     InputManager::processInputs(btConnected);
     InputManager::processPedals();
@@ -140,11 +140,6 @@ void loop() {
         vTaskDelay(pdMS_TO_TICKS(50)); // Allow time for the SPI bus to paint the TFT
 #endif
 
-        bool usbActive = (bool)USB;
-        
-        // CRITICAL FIX: We MUST always park the DSP before NVS Flash Writes.
-        // NVS writes disable the SPI cache. Since the DSP Audio Pipeline accesses delay buffers
-        // in PSRAM, leaving it unparked triggers a fatal "Cache disabled" hardware exception.
         dsp_is_paused.store(true, std::memory_order_release);
         while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) {
               vTaskDelay(pdMS_TO_TICKS(1));
@@ -181,7 +176,7 @@ void loop() {
         // REBUILD I2S COMPLETELY to ensure clean DMA and Left/Right channel phase alignment
         I2SManager::initChannels(BoardHAL::getI2SConfig(currentSampleRate.load(std::memory_order_acquire)), HOP_SIZE);
 
-        // CLEAR PSRAM BUFFERS to prevent playing back garbage that causes harmonic distortion
+        // CLEAR PSRAM BUFFERS to prevent playing back stale data causing harmonic distortion
         memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t));
         memset(sramPitchLow, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t));
         memset(sramPitchHigh, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t));
@@ -195,7 +190,6 @@ void loop() {
         
         snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVE COMPLETE");
         
-        // CRITICAL FIX: Flush internal DSP buffers before resuming to clear out corrupted history/artifacts
         globalAudioResetRequested.store(true, std::memory_order_release);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         

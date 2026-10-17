@@ -12,7 +12,10 @@ inline char bleLatchedDiscReason[64] = "DISC: NONE";
 
 extern void dispatchBleMidi(uint8_t header, uint8_t data1, uint8_t data2);
 
-struct BleMidiPacket { uint8_t header, data1, data2; };
+struct BleMidiPacket {
+    uint8_t header, data1, data2;
+};
+
 static inline QueueHandle_t bleMidiQueue = nullptr;
 
 class BluetoothManager {
@@ -20,6 +23,7 @@ public:
     static inline volatile bool isMvaveConnected = false;
     static inline volatile bool isHostConnected = false;
     static inline volatile bool isNuxConnected = false;
+    
     static inline uint32_t packetCount = 0;
     
     static inline char bleHostStatusStr[16] = "WAIT";
@@ -28,13 +32,16 @@ public:
     static inline char bleLastSeenStr[32] = "WAITING...";
     static inline char bleInitStep[64] = "0: UNINITIALIZED";
 
-    // Shared cooldown timer to completely isolate the radio state machine during connections
+    // Shared cooldown timer to isolate the radio state machine during connections
     static inline volatile unsigned long lastConnectionEventTime = 0;
 
 private:
     static inline NimBLEAddress targetAddress;
     static inline volatile bool hasTarget = false;
-    static inline unsigned long reconnectLockoutUntil = 0; // RESTORED MISSING DECLARATION
+    static inline volatile bool targetIsPedal = false;
+    static inline volatile bool clientIsPedal = false;
+    
+    static inline unsigned long reconnectLockoutUntil = 0;
     static inline unsigned long clientConnectTimestamp = 0;
     
     static inline uint16_t hostServerConnHandle = 0xFFFF;
@@ -42,6 +49,7 @@ private:
     
     static inline NimBLEClient* pClient = nullptr;
     static inline NimBLERemoteCharacteristic* pClientRemoteChar = nullptr;
+
     static inline NimBLEServer* pServer = nullptr;
     static inline NimBLECharacteristic* pServerChar = nullptr;
 
@@ -79,6 +87,7 @@ private:
         va_start(args, fmt);
         vsnprintf(buf, sizeof(buf), fmt, args);
         va_end(args);
+        
         Serial0.print(buf);
     }
 
@@ -108,45 +117,56 @@ private:
             snprintf(bleScanDebug, sizeof(bleScanDebug), "#%lu %s", (unsigned long)packetCount, addrStr.c_str());
         }
 
-        // Ignore discovery if we are cooling down from a connection change
+        // Ignore discovery if cooling down from a connection event or already have a target
         if (hasTarget || (pClient && pClient->isConnected()) || millis() - lastConnectionEventTime < 2000) return;
 
-        // Prevent targeting if we are already at capacity
+        // Prevent targeting if at connection capacity
         int activeConnections = (pServer ? pServer->getConnectedCount() : 0) + (pClient && pClient->isConnected() ? 1 : 0);
         if (activeConnections >= 2) return;
 
-        bool isMatch = false;
+        bool isPedal = false;
+        bool isAmp = false;
+        
         if (nameStr.length() > 0) {
             String upper = nameStr.c_str();
             upper.toUpperCase();
-            if (upper.indexOf("FOOTCTRL") != -1  || upper.indexOf("CHOCOLATE") != -1 ||
-                upper.indexOf("M-VAVE") != -1    || upper.indexOf("FOOT") != -1      ||
-                upper.indexOf("CTRL") != -1      || upper.indexOf("CUBE") != -1      ||
-                upper.indexOf("MIGHTY") != -1    || upper.indexOf("NUX") != -1       ||
-                upper.indexOf("MIDI") != -1) {
-                isMatch = true;
+            if (upper.indexOf("CHOCOLATE") != -1 || upper.indexOf("M-VAVE") != -1 ||
+                upper.indexOf("FOOTCTRL") != -1  || upper.indexOf("FOOT") != -1   ||
+                upper.indexOf("PEDAL") != -1) {
+                isPedal = true;
+            } else if (upper.indexOf("NUX") != -1    || upper.indexOf("MIGHTY") != -1 ||
+                       upper.indexOf("CUBE") != -1   || upper.indexOf("AMP") != -1) {
+                isAmp = true;
+            } else if (upper.indexOf("MIDI") != -1 || upper.indexOf("CTRL") != -1) {
+                if (isPedalAddress(addrStr)) isPedal = true;
+                else isAmp = true;
             }
         }
-
-        if (!isMatch && isPedalAddress(addrStr)) {
-            isMatch = true;
+        
+        if (!isPedal && !isAmp && isPedalAddress(addrStr)) {
+            isPedal = true;
             if (nameStr.length() == 0) nameStr = "M-Vave (Hidden)";
         }
-
-        if (!isMatch && advertisedDevice->haveServiceUUID()) {
+        
+        if (!isPedal && !isAmp && advertisedDevice->haveServiceUUID()) {
             if (advertisedDevice->isAdvertisingService(midiServiceUUID)) {
-                isMatch = true;
+                isAmp = true;
             }
         }
 
-        if (isMatch) {
+        // CRITICAL FIX: Never target a pedal if M-vave is already connected (e.g. as Central on Server)
+        if (isPedal && isMvaveConnected) return;
+        // Never target an amp if NUX is already connected
+        if (isAmp && isNuxConnected) return;
+
+        if (isPedal || isAmp) {
             hasTarget = true;
+            targetIsPedal = isPedal;
             targetAddress = advertisedDevice->getAddress();
             strlcpy(bleTargetStr, nameStr.length() > 0 ? nameStr.c_str() : addrStr.c_str(), sizeof(bleTargetStr));
-            snprintf(bleEventDebug, sizeof(bleEventDebug), "TARGET ACQUIRED");
-            clientConnectTimestamp = millis() + 500; // Shorter delay since we stop scan immediately
+            snprintf(bleEventDebug, sizeof(bleEventDebug), "TARGET: %s", isPedal ? "PEDAL" : "AMP");
+            clientConnectTimestamp = millis() + 500;
             
-            // Hard stop the scanner immediately to clear the hardware state
             if (NimBLEDevice::getScan()->isScanning()) {
                 NimBLEDevice::getScan()->stop();
             }
@@ -159,13 +179,15 @@ public:
             std::string addrStr = client->getPeerAddress().toString();
             lastConnectionEventTime = millis();
             
-            if (isPedalAddress(addrStr)) {
+            if (targetIsPedal || isPedalAddress(addrStr)) {
+                clientIsPedal = true;
                 isMvaveConnected = true;
                 strlcpy(blePedalStatusStr, "CONN", sizeof(blePedalStatusStr));
                 snprintf(bleEventDebug, sizeof(bleEventDebug), "PEDAL LINKED!");
                 snprintf(bleScanDebug, sizeof(bleScanDebug), "PEDAL: %s", bleTargetStr);
                 pendingPedalClientConnLog = true;
             } else {
+                clientIsPedal = false;
                 isNuxConnected = true;
                 strlcpy(bleHostStatusStr, "CONN (NUX)", sizeof(bleHostStatusStr));
                 snprintf(bleEventDebug, sizeof(bleEventDebug), "NUX LINKED!");
@@ -175,20 +197,24 @@ public:
 
         void onDisconnect(NimBLEClient* client, int reason) override {
             pClientRemoteChar = nullptr;
-            isMvaveConnected = false;
-            isNuxConnected = false;
             hasTarget = false;
             lastConnectionEventTime = millis();
             
-            // Purge whitelist so NimBLE doesn't auto-reuse a corrupted handle
             NimBLEDevice::whiteListRemove(client->getPeerAddress());
-            
             reconnectLockoutUntil = millis() + 2000;
             
-            strlcpy(blePedalStatusStr, "WAIT", sizeof(blePedalStatusStr));
-            if (hostServerConnHandle == 0xFFFF) {
-                isHostConnected = false;
-                strlcpy(bleHostStatusStr, "WAIT", sizeof(bleHostStatusStr));
+            // CRITICAL FIX: Only clear the specific device that disconnected
+            if (clientIsPedal) {
+                clientIsPedal = false;
+                if (pedalServerConnHandle == 0xFFFF) {
+                    isMvaveConnected = false;
+                    strlcpy(blePedalStatusStr, "WAIT", sizeof(blePedalStatusStr));
+                }
+            } else {
+                isNuxConnected = false;
+                if (hostServerConnHandle == 0xFFFF) {
+                    strlcpy(bleHostStatusStr, "WAIT", sizeof(bleHostStatusStr));
+                }
             }
             
             int hciCode = reason & 0xFF;
@@ -198,13 +224,11 @@ public:
             pendingClientDiscReason = hciCode;
         }
     };
-
     static inline ClientCallbacks clientCB;
 
     static void pedalNotifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
         if (length >= 5) {
             BleMidiPacket pkt = {pData[2], pData[3], pData[4]};
-            // CRITICAL FIX: Use task-safe xQueueSend with 0 block time. NimBLE callbacks are not Hardware ISRs.
             if (bleMidiQueue) xQueueSend(bleMidiQueue, &pkt, 0);
         }
     }
@@ -214,14 +238,12 @@ public:
             handleDiscoveredDevice(advertisedDevice);
         }
     };
-
     static inline ScanCallbacks scanCB;
 
     class ServerCallbacks : public NimBLEServerCallbacks {
         void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
             uint16_t connHandle = connInfo.getConnHandle();
             
-            // Failsafe: Reject if we exceed our strict 2-connection limit to prevent array panics
             int activeConnections = (pServer ? pServer->getConnectedCount() : 0) + (pClient && pClient->isConnected() ? 1 : 0);
             if (activeConnections > 2) {
                 server->disconnect(connHandle);
@@ -231,7 +253,7 @@ public:
             std::string addrStr = connInfo.getAddress().toString();
             lastConnectionEventTime = millis();
             
-            if (isPedalAddress(addrStr) || (hasTarget && addrStr == targetAddress.toString())) {
+            if (isPedalAddress(addrStr) || (hasTarget && targetIsPedal && addrStr == targetAddress.toString())) {
                 isMvaveConnected = true;
                 hasTarget = false;
                 pedalServerConnHandle = connHandle;
@@ -253,9 +275,11 @@ public:
             lastConnectionEventTime = millis();
 
             if (connHandle == pedalServerConnHandle) {
-                isMvaveConnected = false;
                 pedalServerConnHandle = 0xFFFF;
-                strlcpy(blePedalStatusStr, "WAIT", sizeof(blePedalStatusStr));
+                if (!clientIsPedal) {
+                    isMvaveConnected = false;
+                    strlcpy(blePedalStatusStr, "WAIT", sizeof(blePedalStatusStr));
+                }
                 snprintf(bleEventDebug, sizeof(bleEventDebug), "PEDAL DISC (0x%02X)", hciCode);
                 pendingPedalServerDiscReason = hciCode;
             } else if (connHandle == hostServerConnHandle) {
@@ -270,7 +294,6 @@ public:
             }
         }
     };
-
     static inline ServerCallbacks serverCB;
 
     class ServerCharCallbacks : public NimBLECharacteristicCallbacks {
@@ -286,21 +309,20 @@ public:
                     if (header == 0xB0 || (header & 0xF0) == 0xC0) {
                         isMvaveConnected = true;
                         isHostConnected = false;
-                        hasTarget = false;
                         pedalServerConnHandle = hostServerConnHandle;
                         hostServerConnHandle = 0xFFFF;
                         strlcpy(blePedalStatusStr, "CONN", sizeof(blePedalStatusStr));
-                        strlcpy(bleHostStatusStr, "WAIT", sizeof(bleHostStatusStr));
+                        if (!isNuxConnected) {
+                            strlcpy(bleHostStatusStr, "WAIT", sizeof(bleHostStatusStr));
+                        }
                     }
                 }
 
                 BleMidiPacket pkt = {header, data1, data2};
-                // CRITICAL FIX: Use task-safe xQueueSend with 0 block time. NimBLE callbacks are not Hardware ISRs.
                 if (bleMidiQueue) xQueueSend(bleMidiQueue, &pkt, 0);
             }
         }
     };
-
     static inline ServerCharCallbacks serverCharCB;
 
     static void initDualRole() {
@@ -310,7 +332,6 @@ public:
 
         strlcpy(bleInitStep, "1: NimBLE init()", sizeof(bleInitStep));
         dualLog("\n[BLE INIT] Initializing Dual-Role NimBLE Stack...\n");
-
         NimBLEDevice::init("Whammy_S3");
         NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
@@ -338,10 +359,12 @@ public:
         NimBLEAdvertisementData scanRespData;
         scanRespData.setName("Whammy_S3");
         pAdvertising->setScanResponseData(scanRespData);
+
         pAdvertising->enableScanResponse(true);
         pAdvertising->setMinInterval(400);
         pAdvertising->setMaxInterval(800);
         pAdvertising->start();
+
         lastConnectionEventTime = millis();
         dualLog("[BLE SERVER] Advertising as 'Whammy_S3'.\n");
 
@@ -352,6 +375,7 @@ public:
         pScan->setMaxResults(0);
         pScan->setInterval(100);
         pScan->setWindow(40);
+
         snprintf(bleEventDebug, sizeof(bleEventDebug), "DUAL: ADV & SCAN");
         snprintf(bleScanDebug, sizeof(bleScanDebug), "SCAN: LISTENING...");
 
@@ -421,15 +445,13 @@ public:
             }
         }
 
-        // Strictly limit max connections to 2 to prevent NimBLE array out-of-bounds panics
         int activeConnections = (pServer ? pServer->getConnectedCount() : 0) + (pClient && pClient->isConnected() ? 1 : 0);
         if (activeConnections >= 2) {
             if (NimBLEDevice::getScan()->isScanning()) NimBLEDevice::getScan()->stop();
             if (pServer && NimBLEDevice::getAdvertising()->isAdvertising()) NimBLEDevice::getAdvertising()->stop();
-            return; // Abort further processing if we are fully connected
+            return;
         }
 
-        // Strict 2-second global connection cooldown to prevent all state machine collisions
         if (millis() - lastConnectionEventTime < 2000) return;
 
         if (((isMvaveConnected && isHostConnected) || (isMvaveConnected && isNuxConnected)) && 
@@ -450,7 +472,8 @@ public:
         static unsigned long lastScanCall = 0;
         bool clientConnected = (pClient && pClient->isConnected());
         
-        if (!hasTarget && !clientConnected && millis() >= reconnectLockoutUntil) {
+        // Scan if client is not connected and we still need a peripheral (pedal or Nux)
+        if (!hasTarget && !clientConnected && millis() >= reconnectLockoutUntil && (!isMvaveConnected || !isNuxConnected)) {
             if (!NimBLEDevice::getScan()->isScanning() && (millis() - lastScanCall > 2000)) {
                 NimBLEDevice::getScan()->start(0, false, true);
                 lastScanCall = millis();
@@ -460,7 +483,6 @@ public:
         }
 
         if (hasTarget && !clientConnected && millis() >= clientConnectTimestamp) {
-            // Already stopped in handleDiscoveredDevice, but left as a safety net
             if (NimBLEDevice::getScan()->isScanning()) {
                 NimBLEDevice::getScan()->stop();
             }
@@ -509,4 +531,5 @@ public:
         }
     }
 };
+
 #endif // BLUETOOTH_MANAGER_H

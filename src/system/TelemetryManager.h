@@ -14,31 +14,37 @@ public:
         if (!activeDSP) return;
         
         TelemetryData tData = {};
+
         tData.dspCoreLoad = core0_dsp_load.load(std::memory_order_relaxed);
         tData.ctrlCoreLoad = core1_ctrl_load.load(std::memory_order_relaxed);
         tData.sampleRate = currentSampleRate.load(std::memory_order_acquire);
         tData.latencyMode = latencyMode.load(std::memory_order_relaxed);
+
         tData.batVoltage = 4.00f;
         tData.batPercent = 100;
         tData.isCharging = false;
 
 #if !defined(FW_MODE_KNOBS_ONLY)
-        tData.bleConnected = BluetoothManager::isMvaveConnected || BluetoothManager::isHostConnected;
+        tData.bleConnected = BluetoothManager::isMvaveConnected || BluetoothManager::isHostConnected || BluetoothManager::isNuxConnected;
         tData.bleHostConnected = BluetoothManager::isHostConnected;
         tData.blePedalConnected = BluetoothManager::isMvaveConnected;
+        
         strlcpy(tData.bleHostStatus, BluetoothManager::bleHostStatusStr, sizeof(tData.bleHostStatus));
         strlcpy(tData.blePedalStatus, BluetoothManager::blePedalStatusStr, sizeof(tData.blePedalStatus));
         strlcpy(tData.bleTarget, BluetoothManager::bleTargetStr, sizeof(tData.bleTarget));
         strlcpy(tData.bleLastSeen, BluetoothManager::bleLastSeenStr, sizeof(tData.bleLastSeen));
+        
         tData.blePackets = BluetoothManager::packetCount;
 #else
         tData.bleConnected = false;
         tData.bleHostConnected = false;
         tData.blePedalConnected = false;
+        
         strlcpy(tData.bleHostStatus, "DISABLED", sizeof(tData.bleHostStatus));
         strlcpy(tData.blePedalStatus, "DISABLED", sizeof(tData.blePedalStatus));
         strlcpy(tData.bleTarget, "NONE", sizeof(tData.bleTarget));
         strlcpy(tData.bleLastSeen, "KNOB_MODE", sizeof(tData.bleLastSeen));
+        
         tData.blePackets = 0;
 #endif
 

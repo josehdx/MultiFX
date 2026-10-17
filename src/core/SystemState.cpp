@@ -2,7 +2,6 @@
 
 MonoPolyTracker monoPolyEngine;
 VectorBiquadS3 padVectorFilter;
-
 Preferences preferences;
 SettingsManager settingsMgr;
 
@@ -28,9 +27,11 @@ float fxParams[10][5] = {
 const bool INVERT_PB3 = false;
 
 std::atomic<bool> dsp_is_paused{false}, dsp_ack_parked{false}, lut_ack_parked{false}, ui_clear_meters_requested{false}, globalAudioResetRequested{false}, panicResetRequested{false}, bleEnabled{true};
-std::atomic<float> pitchShiftFactor{1.0f};
+std::atomic<bool> manualSaveRequested{false};
 
+std::atomic<float> pitchShiftFactor{1.0f};
 std::atomic<uint32_t> currentSampleRate{96000};
+
 // Default to Polyphonic mode on boot
 std::atomic<bool> isMonoPolyActive{false}; 
 std::atomic<int> monoPolyAlgo{0};
@@ -40,6 +41,7 @@ unsigned long warningTimer = 0;
 
 std::atomic<bool> isScreenOff{false};
 std::atomic<bool> wakeupPending{false};
+
 const unsigned long LIGHT_SLEEP_TIMEOUT = 120000;
 const unsigned long SCREEN_OFF_TIMEOUT = 30000;
 
@@ -53,22 +55,19 @@ __attribute__((aligned(64))) int16_t dmaPingBuffer[HOP_SIZE] = {0};
 __attribute__((aligned(64))) int16_t dmaPongBuffer[HOP_SIZE] = {0};
 int16_t* activeDmaReadBuf = dmaPingBuffer;
 int16_t* activeDmaWriteBuf = dmaPongBuffer;
-
 __attribute__((aligned(64))) int16_t sramDryBlock[HOP_SIZE] = {0};
 
 DSPCoreState dspStates[2];
 std::atomic<DSPCoreState*> dspActiveState{&dspStates[0]};
 int dspWriteIndex = 1;
-
 volatile bool dspNeedsCommit = false;
 std::atomic<bool> dspAckCommit{true};
 
 volatile uint16_t lastActivePedal = 8192;
 volatile uint8_t activePedalSource = 0; // 0=CC11, 1=PB1, 2=PB2, 3=PB3
+
 volatile float effectMemory[10]={12.0f,-12.0f,0.0f,5.0f,-2.0f,-12.0f,-12.0f,12.0f,0.0f,0.0f}; 
-
 volatile bool isWhammyActive=true, isFrozen=false, isFeedbackActive=false, isHarmonizerMode=false, isSynthMode=false, isPadMode=false, isCapoMode=false, isChorusMode=false, isSwellMode=false, isVibratoMode=false, isVolumeMode=false, isPB2WiperMode=false;
-
 volatile float volumePedalGain=1.0f;
 std::atomic<int> latencyMode{0}, activeEffectMode{0}, feedbackIntervalIdx{0};
 
@@ -84,7 +83,6 @@ int writeIndex = 0, fbDelayWriteIdx = 0, sramWriteIdx = 0;
 
 std::atomic<bool> asyncLutUpdateRequested{false};
 volatile bool lutNeedsUpdate = false;
-
 float *pitchLutBufferA = nullptr, *pitchLutBufferB = nullptr;
 std::atomic<float*> activePitchLUT{nullptr};
 
@@ -93,14 +91,12 @@ uint32_t tap_w2_lo_1=0, tap_w2_lo_2=2048<<16, tap_w2_hi_1=0, tap_w2_hi_2=256<<16
 uint32_t tap_w3_1=0, tap_w3_2=256<<16, tap_w4_1=0, tap_w4_2=256<<16, tap_w5_1=0, tap_w5_2=256<<16;
 
 float currentWindowSize = 512.0f;
-
 int freezeLength = 96000;
 bool wasFrozen = false;
 volatile bool apfNeedsClear = false;
 
 volatile float freezeRamp = 0.0f, chorusLfoPhase=0.0f, feedbackLfoPhase=0.0f, vibratoLfoPhase=0.0f, swellGain=0.0f, feedbackRamp=0.0f;
 float fbHpfState=0.0f, feedbackFilter=0.0f; 
-
 std::atomic<int> hardwareSyncMuteFrames{0};
 volatile bool sampleRateToggleRequested=false, pb2ToggleRequested=false;
 
@@ -118,16 +114,16 @@ std::atomic<float> ui_audio_level __attribute__((aligned(64))) {0.0f}, ui_output
 #endif
 
 volatile bool isAdcPaused=false;
+
 adc_continuous_handle_t multifx_adc_handle = NULL;
 volatile int latestPB1=2048, latestPB2=2048, latestPB3=2048, latestPar1=2048;
 std::atomic<int> latestBat{2048};
 
 const int BOOT_SENSE_PIN=0, BLE_TOGGLE_PIN=14;
-
 volatile uint16_t currentPB1=8192, currentPB2=8192, currentPB3=8192, currentCC11=0;
 
 USBMIDI_Interface usbmidi;
 MIDI_PipeFactory<4> pipes;
-PedalManager pedals;
 
+PedalManager pedals;
 volatile int latestPar2=2048, latestPar3=2048, latestPar4=2048, latestPar5=2048;

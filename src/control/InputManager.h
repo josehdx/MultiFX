@@ -1,5 +1,4 @@
 #pragma once
-
 #include "SystemState.h"
 #include "SystemActions.h"
 #include "MidiRouter.h"
@@ -17,7 +16,7 @@ public:
             lastDebounceTime = millis();
             
             if (!reading) { 
-                gpio14PressTime = millis(); 
+                gpio14PressTime = millis();
                 lastActivityTime = millis();
             } else {
                 unsigned long pressDuration = millis() - gpio14PressTime;
@@ -60,8 +59,8 @@ public:
                             vTaskDelay(pdMS_TO_TICKS(150));
                             
                             dsp_is_paused.store(true, std::memory_order_release);
-                            while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
-                                vTaskDelay(pdMS_TO_TICKS(1)); 
+                            while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) {
+                                 vTaskDelay(pdMS_TO_TICKS(1)); 
                             }
                             
                             AppSettings cs; 
@@ -109,12 +108,42 @@ public:
 
         if (showBleWarning && (millis() - warningTimer > 3000)) showBleWarning = false;
 
-        bool currentBootState = (REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN)) != 0;
-        if(!currentBootState && lastBootState) { 
-            switchEffectMode(activeEffectMode.load(std::memory_order_acquire) + 1);
+        // BOOT BUTTON LOGIC (GPIO 0)
+        static unsigned long bootPressTime = 0;
+        static bool bootHandled = false;
+        static bool wakeUpConsumed = false;
+        
+        bool currentBootState = (REG_READ(GPIO_IN_REG) & (1 << BOOT_SENSE_PIN)) != 0; // LOW when pressed
+        
+        if (!currentBootState && lastBootState) { // Button just pressed
+            bootPressTime = millis();
+            bootHandled = false;
             lastActivityTime = millis();
-            vTaskDelay(pdMS_TO_TICKS(50));
+            
+            // If the screen was off, consume this press solely for waking up
+            if (isScreenOff.load(std::memory_order_acquire)) {
+                wakeUpConsumed = true;
+            } else {
+                wakeUpConsumed = false;
+            }
+        } 
+        else if (!currentBootState && !lastBootState) { // Button is being held
+            if (!bootHandled && !wakeUpConsumed && (millis() - bootPressTime >= 1000)) {
+                // Trigger manual save
+                manualSaveRequested.store(true, std::memory_order_release);
+                bootHandled = true; // Prevent multiple triggers
+                lastActivityTime = millis();
+            }
+        } 
+        else if (currentBootState && !lastBootState) { // Button just released
+            if (!bootHandled && !wakeUpConsumed && (millis() - bootPressTime < 1000)) {
+                // Short press: cycle mode
+                switchEffectMode(activeEffectMode.load(std::memory_order_acquire) + 1);
+                lastActivityTime = millis();
+            }
+            wakeUpConsumed = false; // Reset wake-up consumption on release
         }
+        
         lastBootState = currentBootState;
     }
 
@@ -130,7 +159,7 @@ public:
         
         currentPB1 = pedals.getCalA(); 
         currentPB2 = pedals.getCalB(); 
-        currentPB3 = pedals.getCalC();
+        currentPB3 = pedals.getCalC(); 
         
         static int lastProcessedA = 8192;
         static int lastProcessedB = 8192;
@@ -151,10 +180,12 @@ public:
                 float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB1], std::memory_order_release);
             }
+
             Control_Surface.sendPitchBend(Channel_1, currentPB1);
             BluetoothManager::sendMidiToHost(0xE0, currentPB1 & 0x7F, (currentPB1 >> 7) & 0x7F);
             pedals.updateLastMidiA();
         }
+
         // PB2: 14-bit Pitch Bend on Channel 2
         else if (!pedals.isUnpluggedB() && deltaB > 48) {
             lastProcessedB = currentPB2;
@@ -166,10 +197,12 @@ public:
                 float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB2], std::memory_order_release);
             }
+
             Control_Surface.sendPitchBend(Channel_2, currentPB2);
             BluetoothManager::sendMidiToHost(0xE1, currentPB2 & 0x7F, (currentPB2 >> 7) & 0x7F);
             pedals.updateLastMidiB();
         }
+
         // PB3: Physical Expression Treadle (Channel 3 output)
         else if (!pedals.isUnpluggedC() && deltaC > 48) {
             lastProcessedC = currentPB3;
@@ -182,6 +215,7 @@ public:
             if (isVolumeMode) {
                 volumePedalGain = (float)currentPB3 / 16383.0f;
                 dspNeedsCommit = true;
+
                 // 7-bit Volume: CC 19 on Channel 3
                 Control_Surface.sendControlChange({19, Channel_3}, msb);
                 BluetoothManager::sendMidiToHost(0xB2, 19, msb); // 0xB2 = Control Change on Channel 3
@@ -190,6 +224,7 @@ public:
                     float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                     if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB3], std::memory_order_release);
                 }
+
                 // 14-bit Pitch Bend on Channel 3
                 Control_Surface.sendPitchBend(Channel_3, currentPB3);
                 BluetoothManager::sendMidiToHost(0xE2, currentPB3 & 0x7F, (currentPB3 >> 7) & 0x7F);
@@ -221,6 +256,7 @@ public:
 
                 // Forward 7-bit CC via USB-MIDI
                 Control_Surface.sendControlChange({ccCoarse, Channel_1}, val);
+
                 // Forward 7-bit CC via BLE-MIDI
                 BluetoothManager::sendMidiToHost(0xB0, ccCoarse, val);
             }

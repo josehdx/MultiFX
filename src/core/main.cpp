@@ -124,7 +124,7 @@ void loop() {
         executePanicReset();
     }
 
-    if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) {
+    if (manualSaveRequested.exchange(false, std::memory_order_acq_rel)) {
         snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVING NVS...");
         
 #if defined(TARGET_LILYGO)
@@ -180,6 +180,17 @@ void loop() {
         
         // REBUILD I2S COMPLETELY to ensure clean DMA and Left/Right channel phase alignment
         I2SManager::initChannels(BoardHAL::getI2SConfig(currentSampleRate.load(std::memory_order_acquire)), HOP_SIZE);
+
+        // CLEAR PSRAM BUFFERS to prevent playing back garbage that causes harmonic distortion
+        memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t));
+        memset(sramPitchLow, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t));
+        memset(sramPitchHigh, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t));
+        memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t));
+        memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
+        if (diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));
+
+        vTaskDelay(pdMS_TO_TICKS(30)); // Allow I2S PLLs to stabilize
+
         I2SManager::enableChannels();
         
         snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVE COMPLETE");

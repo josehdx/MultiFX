@@ -18,13 +18,17 @@
 #include "DisplayManager.h"
 DisplayManager displayManager;
 #endif
-
 #include "FirmwareManager.h"
+
+// Define the global flags
+volatile bool pendingModeSwitch = false;
+volatile int targetEffectMode = 0;
+volatile bool pendingLatencyCycle = false;
+volatile bool pendingSampleRateCycle = false;
+volatile bool pendingPanicReset = false;
 
 void dispatchBleMidi(uint8_t header, uint8_t data1, uint8_t data2) {
     ChannelMessage cm(MIDIMessage(header, data1, data2, Cable_1));
-    // CRITICAL FIX: Global spinlock removed to prevent vTaskDelay deadlocks
-    // Individual handlers inside channelMessageCallback now handle their own thread safety
     channelMessageCallback(cm);
 }
 
@@ -94,18 +98,52 @@ void loop() {
                             max_loop_latency_ms.exchange(0, std::memory_order_relaxed),
                             audio_underflow_count.load(std::memory_order_relaxed),
                             watermarkVal, btConnected, latestBat,
-                            isMonoPolyActive.load(std::memory_order_acquire));
+                            isMonoPolyActive.load(std::memory_order_acquire),
+                            uiDebugMessage);
 #endif
         TelemetryManager::report(activeDSP);
     }
 
+    // Process deferred system actions OUTSIDE of all locks and interrupts
+    if (pendingModeSwitch) {
+        pendingModeSwitch = false;
+        executeModeSwitch();
+    }
+    
+    if (pendingLatencyCycle) {
+        pendingLatencyCycle = false;
+        executeLatencyCycle();
+    }
+    
+    if (pendingSampleRateCycle) {
+        pendingSampleRateCycle = false;
+        executeSampleRateCycle();
+    }
+    
+    if (pendingPanicReset) {
+        pendingPanicReset = false;
+        executePanicReset();
+    }
+
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) {
-        dsp_is_paused.store(true, std::memory_order_release);
+        snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVING NVS...");
         
-        // Explicitly wait for BOTH AudioTask and LUTUpdateTask to acknowledge park state
-        while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
-             vTaskDelay(pdMS_TO_TICKS(1)); 
-         }
+        // Only park the DSP and tear down I2S if the USB is connected and mounted to a Host PC.
+        // This prevents the audio from dropping when saving settings while playing normally unplugged.
+        bool usbActive = (bool)USB;
+        
+        if (usbActive) {
+            dsp_is_paused.store(true, std::memory_order_release);
+            
+            while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) {
+                  vTaskDelay(pdMS_TO_TICKS(1));
+              }
+            
+            // Temporarily disable TX to avoid loud static during the flash block
+            if (I2SManager::tx_chan != NULL) {
+                i2s_channel_disable((i2s_chan_handle_t)I2SManager::tx_chan);
+            }
+        }
         
         AppSettings currentSettings;
         memset(&currentSettings, 0, sizeof(AppSettings));
@@ -119,28 +157,37 @@ void loop() {
             if ((&activeDSP->w)[i]) currentFxStates |= (1 << i);
         }
         
-        // Pass all global states into SettingsManager so Sample Rate persists
         settingsMgr.save(preferences, 
-                         activeDSP->activeMode, 
-                         activeDSP->latMode,
+                          activeDSP->activeMode, 
+                          activeDSP->latMode,
                          activeDSP->fbIdx, 
-                         isPB2WiperMode, 
-                         isVolumeMode, 
-                         currentFxStates, 
-                         currentSampleRate.load(std::memory_order_acquire),
+                          isPB2WiperMode, 
+                          isVolumeMode, 
+                          currentFxStates, 
+                          currentSampleRate.load(std::memory_order_acquire),
                          &currentSettings, 
-                         sizeof(AppSettings));
-                         
+                          sizeof(AppSettings));
+                  
         settingsNeedSaving = false;
         
-        dsp_is_paused.store(false, std::memory_order_release);
-        if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
-        if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
-        
-        // Ensure tasks have safely unparked before re-entering main system loop
-        while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { 
-             vTaskDelay(pdMS_TO_TICKS(1)); 
-         }
+        if (usbActive) {
+            // Re-enable I2S hardware gracefully
+            if (I2SManager::tx_chan != NULL) {
+                i2s_channel_enable((i2s_chan_handle_t)I2SManager::tx_chan);
+            }
+            
+            snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVE COMPLETE");
+            
+            dsp_is_paused.store(false, std::memory_order_release);
+            if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
+            if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
+            
+            while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) {
+                  vTaskDelay(pdMS_TO_TICKS(1));
+              }
+        } else {
+            snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVE COMPLETE");
+        }
     }
 
     if (panicResetRequested.load(std::memory_order_acquire)) {

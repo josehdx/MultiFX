@@ -1,5 +1,4 @@
 #pragma once
-
 #define ENABLE_ADVANCED_TELEMETRY 
 
 #include <Arduino.h>
@@ -18,7 +17,6 @@
 #include <USBMIDI.h>
 #include <Control_Surface.h>
 #include <NimBLEDevice.h>
-
 #include "PedalManager.h"
 #include "SettingsManager.h"
 #include "DSPEngine.h"
@@ -54,12 +52,23 @@ extern Preferences preferences;
 extern SettingsManager settingsMgr;
 extern volatile bool settingsNeedSaving;
 extern volatile unsigned long lastParameterChangeTime;
+
+// DEFERRED SYSTEM ACTIONS FLAGS
+extern volatile bool pendingModeSwitch;
+extern volatile int targetEffectMode;
+extern volatile bool pendingLatencyCycle;
+extern volatile bool pendingSampleRateCycle;
+extern volatile bool pendingPanicReset;
+
+extern char uiDebugMessage[64];
+
 extern float fxParams[10][5];
 extern const bool INVERT_PB3;
 
 extern std::atomic<bool> dsp_is_paused, dsp_ack_parked, lut_ack_parked, ui_clear_meters_requested, globalAudioResetRequested, panicResetRequested, bleEnabled;
 extern std::atomic<float> pitchShiftFactor;
 extern std::atomic<uint32_t> currentSampleRate;
+
 extern bool isKnobEditMode, showBleWarning, showSavingScreen, showKnobModeScreen;
 extern unsigned long warningTimer;
 
@@ -72,7 +81,6 @@ extern const float LATENCY_WINDOWS[];
 
 extern int32_t *i2s_in_block, *i2s_out_block;
 extern float *inBuf, *envBuf, *fzOutBuf, *masterGainBuf, *w1Buf, *w2Buf, *w3Buf, *padFilterBuf, *dryBuf, *fbOutBuf, *sMixBuf;
-
 extern esp_pm_lock_handle_t dsp_cpu_lock;
 
 extern int16_t dmaPingBuffer[HOP_SIZE];
@@ -90,9 +98,10 @@ extern std::atomic<bool> dspAckCommit;
 extern volatile uint16_t lastActivePedal;
 extern volatile uint8_t activePedalSource; // 0=CC11, 1=PB1, 2=PB2, 3=PB3
 extern volatile float effectMemory[10];
-extern volatile bool isWhammyActive, isFrozen, isFeedbackActive, isHarmonizerMode, isSynthMode, isPadMode, isCapoMode, isChorusMode, isSwellMode, isVibratoMode, isVolumeMode, isPB2WiperMode;
 
+extern volatile bool isWhammyActive, isFrozen, isFeedbackActive, isHarmonizerMode, isSynthMode, isPadMode, isCapoMode, isChorusMode, isSwellMode, isVibratoMode, isVolumeMode, isPB2WiperMode;
 extern volatile float volumePedalGain;
+
 extern std::atomic<int> latencyMode, activeEffectMode, feedbackIntervalIdx;
 extern int16_t *sramPitchLow, *sramPitchHigh, *delayBuffer, *fbDelayBuffer, *freezeBuffer;
 extern float *diffuserBuf;
@@ -101,8 +110,8 @@ extern int diffuserIdx;
 extern TaskHandle_t audioTaskHandle, lutTaskHandle;
 extern StackType_t *dspTaskStack, *lutTaskStack;
 extern StaticTask_t *dspTaskTCB, *lutTaskTCB;
-
 extern int writeIndex, fbDelayWriteIdx, sramWriteIdx;
+
 extern std::atomic<bool> asyncLutUpdateRequested;
 extern volatile bool lutNeedsUpdate;
 
@@ -116,7 +125,6 @@ extern uint32_t tap_w3_1, tap_w3_2, tap_w4_1, tap_w4_2, tap_w5_1, tap_w5_2;
 extern float currentWindowSize;
 extern int freezeLength;
 extern bool wasFrozen;
-
 extern volatile bool apfNeedsClear;
 extern volatile float freezeRamp, chorusLfoPhase, feedbackLfoPhase, vibratoLfoPhase, swellGain, feedbackRamp;
 extern float fbHpfState, feedbackFilter;
@@ -141,6 +149,7 @@ extern adc_continuous_handle_t multifx_adc_handle;
 
 extern volatile int latestPB1, latestPB2, latestPB3, latestPar1;
 extern std::atomic<int> latestBat;
+
 extern const int BOOT_SENSE_PIN, BLE_TOGGLE_PIN;
 extern volatile uint16_t currentPB1, currentPB2, currentPB3, currentCC11;
 

@@ -6,9 +6,9 @@
 static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParameters) {
     DSPCoreState* lastAckedDSP = nullptr;
 
-    while (LUTManager::hannLUT == nullptr || LUTManager::lfoLUT == nullptr || LUTManager::synthLUT == nullptr || LUTManager::apf1Buffer == nullptr || LUTManager::apf2Buffer == nullptr || LUTManager::pitchSincLUT == nullptr) { 
-         vTaskDelay(pdMS_TO_TICKS(10)); 
-     }
+    while (LUTManager::hannLUT == nullptr || LUTManager::lfoLUT == nullptr || LUTManager::synthLUT == nullptr || LUTManager::apf1Buffer == nullptr || LUTManager::apf2Buffer == nullptr || LUTManager::pitchSincLUT == nullptr) {
+          vTaskDelay(pdMS_TO_TICKS(10));
+      }
 
     for(;;) {
 #ifdef ENABLE_ADVANCED_TELEMETRY
@@ -17,18 +17,22 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
 #endif
 
         if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
-            // CRITICAL FIX: Cleanly stop I2S from within the audio task before sleeping
-            I2SManager::disableAndDestroyChannels();
+            // CRITICAL FIX: I2SManager::disableAndDestroyChannels() removed from here!
+            // Destroying channels caused an infinite underflow loop because they were never recreated after settings saves.
             
             while (dsp_is_paused.load(std::memory_order_acquire)) {
                 dsp_ack_parked.store(true, std::memory_order_release);
                 ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
             }
             dsp_ack_parked.store(false, std::memory_order_release);
+            
+            // Flush the DMA blocks to prevent stale noise bursts on un-park
+            memset(i2s_in_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
+            memset(i2s_out_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
         }
 
-        size_t bytesRead = 0; 
-        
+        size_t bytesRead = 0;
+          
         // Ensure channels are alive before reading to prevent null pointer exceptions
         if (I2SManager::rx_chan != NULL && I2SManager::tx_chan != NULL) {
             i2s_channel_read((i2s_chan_handle_t)I2SManager::rx_chan, i2s_in_block, HOP_SIZE*2*sizeof(int32_t), &bytesRead, pdMS_TO_TICKS(10));
@@ -37,7 +41,7 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
         if(__builtin_expect(bytesRead > 0, 1)) {
             int framesRead = bytesRead / 8;
             if(__builtin_expect(framesRead == HOP_SIZE, 1)) {
-                
+                 
                 // --- 1. HANDLE SYSTEM RESET EVENTS ---
                 if(__builtin_expect(panicResetRequested.load(std::memory_order_acquire), 0)) {
                     AudioPipeline::handlePanicReset();
@@ -48,12 +52,12 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
 
                 int currentMute = hardwareSyncMuteFrames.load(std::memory_order_acquire); bool isMuted = false;
                 if(__builtin_expect(currentMute > 0, 0)) { hardwareSyncMuteFrames.store(currentMute - 1, std::memory_order_release); isMuted = true; }
-                
-                uint32_t start_cycles=xthal_get_ccount(); 
-                
+                 
+                uint32_t start_cycles=xthal_get_ccount();
+                  
                 // Fetch latest control state safely
                 DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
-                
+                 
                 // --- 2. EXECUTE THE INLINED DSP MATH PIPELINE ---
                 AudioPipeline::processBlock(framesRead, activeDSP);
 
@@ -63,12 +67,12 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
 
                 // --- 3. HARDWARE MUTE & I2S WRITE ---
                 if(__builtin_expect(isMuted, 0)) memset(i2s_out_block, 0, framesRead * 2 * sizeof(int32_t));
-                
+                 
                 size_t bytesWrittenCount;
                 if (I2SManager::tx_chan != NULL) {
                     i2s_channel_write((i2s_chan_handle_t)I2SManager::tx_chan, i2s_out_block, framesRead*8, &bytesWrittenCount, pdMS_TO_TICKS(20));
                 }
-                
+                 
                 if (__builtin_expect(activeDSP != lastAckedDSP, 0)) {
                     lastAckedDSP = activeDSP;
                     dspAckCommit.store(true, std::memory_order_release);

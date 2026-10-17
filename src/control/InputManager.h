@@ -21,6 +21,7 @@ public:
                 lastActivityTime = millis();
             } else {
                 unsigned long pressDuration = millis() - gpio14PressTime;
+
                 if (pressDuration >= 1000) {
                     #if defined(FW_MODE_HYBRID)
                         DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
@@ -40,7 +41,8 @@ public:
                                                max_loop_latency_ms.exchange(0, std::memory_order_relaxed),
                                                audio_underflow_count.load(std::memory_order_relaxed),
                                                watermarkVal, currentBtState, latestBat,
-                                               isMonoPolyActive.load(std::memory_order_acquire));
+                                               isMonoPolyActive.load(std::memory_order_acquire),
+                                               uiDebugMessage);
                             vTaskDelay(pdMS_TO_TICKS(150));
                         } else {
                             showSavingScreen = true;
@@ -53,7 +55,8 @@ public:
                                                max_loop_latency_ms.exchange(0, std::memory_order_relaxed),
                                                audio_underflow_count.load(std::memory_order_relaxed),
                                                watermarkVal, currentBtState, latestBat,
-                                               isMonoPolyActive.load(std::memory_order_acquire));
+                                               isMonoPolyActive.load(std::memory_order_acquire),
+                                               uiDebugMessage);
                             vTaskDelay(pdMS_TO_TICKS(150));
                             
                             dsp_is_paused.store(true, std::memory_order_release);
@@ -63,6 +66,7 @@ public:
                             
                             AppSettings cs; 
                             {
+                                // CRITICAL FIX: Explicitly scope the lock to release immediately
                                 CriticalSectionGuard lock(MidiRouter::paramMux);
                                 for(int i=0; i<10; i++) {
                                     cs.fxMem[i]=activeDSP->fxMem[i];
@@ -75,12 +79,12 @@ public:
                             if(activeDSP->fb) fxStates|=(1<<2); if(activeDSP->hr) fxStates|=(1<<3); 
                             if(activeDSP->cp) fxStates|=(1<<4); if(activeDSP->sy) fxStates|=(1<<5); 
                             if(activeDSP->pd) fxStates|=(1<<6); if(activeDSP->ch) fxStates|=(1<<7); 
-                            if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9);
+                            if(activeDSP->sw) fxStates|=(1<<8); if(activeDSP->vb) fxStates|=(1<<9); 
                             
-                            settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode,
-                                              constrain(activeDSP->fbIdx,0,4), isPB2WiperMode,
-                                              isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire),
-                                              &cs, sizeof(AppSettings));
+                            settingsMgr.save(preferences, activeDSP->activeMode, activeDSP->latMode, 
+                                             constrain(activeDSP->fbIdx,0,4), isPB2WiperMode, 
+                                             isVolumeMode, fxStates, currentSampleRate.load(std::memory_order_acquire), 
+                                             &cs, sizeof(AppSettings));
                         }
                         
                         preferences.putBool("knobEditMode", !isKnobEditMode);
@@ -147,10 +151,8 @@ public:
                 float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB1], std::memory_order_release);
             }
-
             Control_Surface.sendPitchBend(Channel_1, currentPB1);
             BluetoothManager::sendMidiToHost(0xE0, currentPB1 & 0x7F, (currentPB1 >> 7) & 0x7F);
-
             pedals.updateLastMidiA();
         }
         // PB2: 14-bit Pitch Bend on Channel 2
@@ -164,10 +166,8 @@ public:
                 float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                 if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB2], std::memory_order_release);
             }
-
             Control_Surface.sendPitchBend(Channel_2, currentPB2);
             BluetoothManager::sendMidiToHost(0xE1, currentPB2 & 0x7F, (currentPB2 >> 7) & 0x7F);
-
             pedals.updateLastMidiB();
         }
         // PB3: Physical Expression Treadle (Channel 3 output)
@@ -182,7 +182,6 @@ public:
             if (isVolumeMode) {
                 volumePedalGain = (float)currentPB3 / 16383.0f;
                 dspNeedsCommit = true;
-
                 // 7-bit Volume: CC 19 on Channel 3
                 Control_Surface.sendControlChange({19, Channel_3}, msb);
                 BluetoothManager::sendMidiToHost(0xB2, 19, msb); // 0xB2 = Control Change on Channel 3
@@ -191,7 +190,6 @@ public:
                     float* currentLUT = activePitchLUT.load(std::memory_order_acquire);
                     if (currentLUT) pitchShiftFactor.store(currentLUT[currentPB3], std::memory_order_release);
                 }
-
                 // 14-bit Pitch Bend on Channel 3
                 Control_Surface.sendPitchBend(Channel_3, currentPB3);
                 BluetoothManager::sendMidiToHost(0xE2, currentPB3 & 0x7F, (currentPB3 >> 7) & 0x7F);
@@ -223,7 +221,6 @@ public:
 
                 // Forward 7-bit CC via USB-MIDI
                 Control_Surface.sendControlChange({ccCoarse, Channel_1}, val);
-
                 // Forward 7-bit CC via BLE-MIDI
                 BluetoothManager::sendMidiToHost(0xB0, ccCoarse, val);
             }

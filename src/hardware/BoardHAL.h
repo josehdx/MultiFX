@@ -21,6 +21,7 @@ extern bool showBleWarning;
 // 0 = Full I2S Audio Mode (GPIO 43=MCLK, 44=BCLK, 18=WS, 17=DIN)
 //     NOTE: Serial0 MUST be detached in Mode 0 to prevent seizing GPIO 43/44!
 // =========================================================================
+
 #define ENABLE_SERIAL_DEBUG 0
 
 class BoardHAL {
@@ -30,7 +31,6 @@ public:
     #if ENABLE_SERIAL_DEBUG
         Serial0.begin(115200, SERIAL_8N1, 18, 17);
     #else
-        // Disables UART0 completely so it releases GPIO 43 (MCLK) and GPIO 44 (BCLK)
         Serial0.end();
         pinMode(43, OUTPUT);
         pinMode(44, OUTPUT);
@@ -49,9 +49,9 @@ public:
                 .mclk = (gpio_num_t)43,
                 .bclk = (gpio_num_t)44,
     #if ENABLE_SERIAL_DEBUG
-                .ws   = (gpio_num_t)-1, // Freed for UART RX
+                .ws   = (gpio_num_t)-1, 
                 .dout = (gpio_num_t)21,
-                .din  = (gpio_num_t)-1, // Freed for UART TX
+                .din  = (gpio_num_t)-1, 
     #else
                 .ws   = (gpio_num_t)18,
                 .dout = (gpio_num_t)21,
@@ -71,7 +71,6 @@ public:
                 },
             },
         };
-        // Reverted to 384x to restore PCM1808 / PCM5102A audio stream
         std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384; 
         return std_cfg;
     }
@@ -95,11 +94,10 @@ public:
 #endif
     }
 
-    static void updateUI(DSPCoreState* activeDSP, uint16_t pb1, uint16_t pb2, uint16_t pb3, uint16_t cc11, float inMeter, float outMeter, float dspLoad, float ctrlLoad, uint32_t sampleRate, uint32_t peakLatency, uint32_t underflows, uint32_t stackWatermark, bool bleConnected, float batVal, bool isMonoPolyActiveFlag) {
+    static void updateUI(DSPCoreState* activeDSP, uint16_t pb1, uint16_t pb2, uint16_t pb3, uint16_t cc11, float inMeter, float outMeter, float dspLoad, float ctrlLoad, uint32_t sampleRate, uint32_t peakLatency, uint32_t underflows, uint32_t stackWatermark, bool bleConnected, float batVal, bool isMonoPolyActiveFlag, const char* dbgMsg) {
 #if defined(TARGET_LILYGO)
         static unsigned long lastDisplayUpdate = 0;
         
-        // Apply low-pass filter to raw ADC battery value every cycle for stability
         static float smoothBatRaw = -1.0f;
         if (smoothBatRaw < 0) smoothBatRaw = batVal;
         else smoothBatRaw = (smoothBatRaw * 0.98f) + (batVal * 0.02f);
@@ -112,7 +110,6 @@ public:
             dData.batPercent = PowerManager::getBatteryPercentage(dData.batVoltage);
             
             dData.bleConnected = bleConnected;
-            // CRITICAL FIX: Light up the PC icon if either a real PC/Mac or the NUX Amp is connected
             dData.bleHostConnected = BluetoothManager::isHostConnected || BluetoothManager::isNuxConnected;
             dData.blePedalConnected = BluetoothManager::isMvaveConnected;
             dData.activeMode = activeDSP->activeMode;
@@ -151,6 +148,8 @@ public:
             
             dData.whammyToe = activeDSP->fxMem[0];
             dData.whammyHeel = activeDSP->fxMem[1];
+            
+            strlcpy(dData.debugMsg, dbgMsg, sizeof(dData.debugMsg));
             
             displayManager.render(dData);
         }

@@ -19,14 +19,17 @@ extern char bleLatchedDiscReason[64];
 struct DisplayData {
     float batVoltage;
     int batPercent;
+    
     bool bleConnected;
     bool bleHostConnected;
     bool blePedalConnected;
+
     int activeMode;
     bool fxStates[10];
     uint16_t pb1, pb2, pb3, cc11;
     float paramVals[5];
     const char* paramNames[5];
+
     float inMeter, outMeter;
     float dspCoreLoad, ctrlCoreLoad;
     uint32_t freeSRAM, freePSRAM;
@@ -40,11 +43,14 @@ struct DisplayData {
     bool showBleWarning;
     bool showSavingScreen;
     bool showKnobModeScreen;
+
     bool isMonoPolyActive;
     bool isVolumeMode;
     
     float whammyToe;
     float whammyHeel;
+
+    char debugMsg[64];
 };
 
 class DisplayManager {
@@ -52,8 +58,8 @@ private:
     TFT_eSPI tft = TFT_eSPI();
     TFT_eSprite spr = TFT_eSprite(&tft);
     TFT_eSprite bgSpr = TFT_eSprite(&tft);
-    DisplayData cache = {};
 
+    DisplayData cache = {};
     char cachedMidiDebug[64] = "";
     char cachedBleEvent[64] = "";
     char cachedBleScan[64] = "";
@@ -62,12 +68,14 @@ private:
     bool lastMonoPolyActive = false;
     bool lastVolumeMode = false;
     int lastMonoPolyAlgo = -1;
+
     int bootLogY = 8;
 
     const char* FX_NAMES[10] = {"WH", "FZ", "FB", "HR", "CP", "SY", "PD", "CH", "SW", "VB"};
     const char* MODE_NAMES[10] = {"WHAMMY", "FREEZE", "FEEDBACK", "HARMONY", "CAPO", "SYNTH", "PAD", "CHORUS", "SWELL", "VIBRATO"};
     
     const char* MONO_ALGOS[5] = {"PSOLA", "YIN SYNTH", "ECKF", "VAR DELAY", "VOCODER"};
+
     const char* MONO_LABELS[5][5] = {
         {"ALGO", "RNG",  "FRM",  "TOL",  "MIX"},
         {"ALGO", "WAV",  "GLD",  "OCT",  "MIX"},
@@ -101,10 +109,12 @@ private:
     void drawKnobDynamic(TFT_eSprite& s, int cx, int cy, int r, float normVal, bool isBipolar, const char* valStr) {
         float angleDeg = isBipolar ? (normVal * 135.0f) : (-135.0f + (normVal * 270.0f));
         float rad = (angleDeg - 90.0f) * 0.0174532925f;
+
         int px = cx + (int)(cosf(rad) * (r - 3));
         int py = cy + (int)(sinf(rad) * (r - 3));
         
         uint16_t color = isBipolar ? TFT_CYAN : TFT_GREEN;
+
         s.drawLine(cx, cy, px, py, color);
         s.fillCircle(px, py, 2, color);
         
@@ -140,17 +150,22 @@ private:
         if (d.activeMode != cache.activeMode) return true;
         if (d.latencyMode != cache.latencyMode) return true;
         if (d.pb1 != cache.pb1 || d.pb2 != cache.pb2 || d.pb3 != cache.pb3 || d.cc11 != cache.cc11) return true;
+
         if (fabsf(d.inMeter - cache.inMeter) > 0.02f || fabsf(d.outMeter - cache.outMeter) > 0.02f) return true;
         if (fabsf(d.dspCoreLoad - cache.dspCoreLoad) > 1.0f || fabsf(d.ctrlCoreLoad - cache.ctrlCoreLoad) > 1.0f) return true;
         if (d.batPercent != cache.batPercent || d.sampleRate != cache.sampleRate) return true;
+
         if (d.peakLatency != cache.peakLatency || d.underflows != cache.underflows || d.dmaCount != cache.dmaCount || d.stackWatermark != cache.stackWatermark) return true;
         if ((d.freeSRAM / 1024) != (cache.freeSRAM / 1024) || (d.freePSRAM / 1024) != (cache.freePSRAM / 1024)) return true;
         
         if (d.whammyToe != cache.whammyToe || d.whammyHeel != cache.whammyHeel) return true;
+        
+        if (strcmp(d.debugMsg, cache.debugMsg) != 0) return true;
 
         for (int i = 0; i < 10; i++) {
             if (d.fxStates[i] != cache.fxStates[i]) return true;
         }
+
         for (int i = 0; i < 5; i++) {
             if (fabsf(d.paramVals[i] - cache.paramVals[i]) > 0.005f) return true;
         }
@@ -160,7 +175,7 @@ private:
 public:
     void begin() {
         pinMode(15, OUTPUT);
-        digitalWrite(15, HIGH);       
+        digitalWrite(15, HIGH);                
         
         pinMode(38, OUTPUT);
         digitalWrite(38, HIGH); 
@@ -169,8 +184,8 @@ public:
         tft.init();
         tft.setRotation(1);
         tft.fillScreen(TFT_BLACK);
-        digitalWrite(38, HIGH); 
-        
+        digitalWrite(38, HIGH);          
+
         spr.setColorDepth(16);
         bgSpr.setColorDepth(16);
         
@@ -190,6 +205,7 @@ public:
         tft.setTextDatum(TL_DATUM);
         tft.drawString(line, 6, bootLogY, 2);
         bootLogY += 19;
+
         if (bootLogY > 150) {
             bootLogY = 8;
             tft.fillScreen(TFT_BLACK);
@@ -200,6 +216,7 @@ public:
         tft.drawRect(20, 130, 280, 14, TFT_WHITE);
         int fillW = constrain((percent * 276) / 100, 0, 276);
         tft.fillRect(22, 132, fillW, 10, TFT_GREEN);
+        
         char pBuf[16];
         snprintf(pBuf, sizeof(pBuf), "%d%%", percent);
         tft.setTextDatum(MC_DATUM);
@@ -210,6 +227,7 @@ public:
     void render(const DisplayData& d) {
         if (!checkIsDirty(d)) return;
         cache = d;
+        strlcpy(cache.debugMsg, d.debugMsg, sizeof(cache.debugMsg));
 
         if (!spr.getPointer() || !bgSpr.getPointer()) return;
 
@@ -222,9 +240,9 @@ public:
             monoAlgo = constrain(monoAlgo, 0, 4);
         }
 
-        if (d.isMonoPolyActive != lastMonoPolyActive || 
-           (d.isMonoPolyActive && monoAlgo != lastMonoPolyAlgo) || 
-           d.isVolumeMode != lastVolumeMode) {
+        if (d.isMonoPolyActive != lastMonoPolyActive ||
+            (d.isMonoPolyActive && monoAlgo != lastMonoPolyAlgo) ||
+            d.isVolumeMode != lastVolumeMode) {
             lastRenderMode = -1; 
         }
 
@@ -293,6 +311,7 @@ public:
             spr.setTextColor(TFT_WHITE, TFT_BLACK);
             snprintf(headerBuf, sizeof(headerBuf), "%s [ T:%+d | H:%+d ]", MODE_NAMES[d.activeMode % 10], (int)d.whammyToe, (int)d.whammyHeel);
         }
+
         spr.drawString(headerBuf, 160, 2, 2);
         
         spr.setTextDatum(TR_DATUM);
@@ -357,6 +376,7 @@ public:
                 isBip = (i == 0 && d.paramVals[i] < 0.0f) || (i == 0);
                 pNorm = isBip ? (d.paramVals[i] / 24.0f) : d.paramVals[i];
             }
+
             drawKnobDynamic(spr, parCenters[i], 110, 12, constrain(pNorm, isBip ? -1.0f : 0.0f, 1.0f), isBip, buf);
         }
 
@@ -374,6 +394,7 @@ public:
             int badgeW = 26; 
             int totalW = (activeCount * badgeW) + ((activeCount - 1) * 2);
             int startX = (320 - totalW) / 2;
+
             for (int k = 0; k < activeCount; k++) {
                 int fxIdx = activeIndices[k];
                 int bx = startX + (k * (badgeW + 2));
@@ -402,10 +423,10 @@ public:
                      (unsigned int)d.peakLatency, d.latencyMode);
                      
             char line2[128];
-            snprintf(line2, sizeof(line2), "RAM:%uK PS:%uK STK:%u UDF:%u", 
+            snprintf(line2, sizeof(line2), "RAM:%uK PS:%uK UDF:%u | %s", 
                      (unsigned int)(d.freeSRAM / 1024), (unsigned int)(d.freePSRAM / 1024), 
-                     (unsigned int)d.stackWatermark, (unsigned int)d.underflows);
-            
+                     (unsigned int)d.underflows, d.debugMsg);
+
             spr.drawString(line1, 20, 144, 1);
             spr.drawString(line2, 20, 156, 1);
         }

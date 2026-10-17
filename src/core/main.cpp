@@ -2,6 +2,7 @@
 #include <Preferences.h>
 #include <Update.h>
 #include "esp_log.h"
+
 #define FW_VERSION "v5.00H"
 
 // Core System Includes
@@ -22,8 +23,8 @@ DisplayManager displayManager;
 
 void dispatchBleMidi(uint8_t header, uint8_t data1, uint8_t data2) {
     ChannelMessage cm(MIDIMessage(header, data1, data2, Cable_1));
-    // Wrap the dispatch in the parameter mux to prevent RTOS collisions
-    CriticalSectionGuard lock(MidiRouter::paramMux);
+    // CRITICAL FIX: Global spinlock removed to prevent vTaskDelay deadlocks
+    // Individual handlers inside channelMessageCallback now handle their own thread safety
     channelMessageCallback(cm);
 }
 

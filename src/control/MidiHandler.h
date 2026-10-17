@@ -1,5 +1,4 @@
 #pragma once
-
 #include "SystemState.h"
 #include "SystemActions.h"
 #include "MidiRouter.h"
@@ -22,14 +21,15 @@ inline bool channelMessageCallback(ChannelMessage cm) {
     
     switch (action.event) {
         case MidiEvent::EXPRESSION_UPDATE: {
+            CriticalSectionGuard lock(MidiRouter::paramMux);
             currentCC11 = action.rawValue; 
             lastActivePedal = action.rawValue;
             activePedalSource = 0; // MIDI Active
-
+            
             uint8_t original7Bit = action.val;
 
             if (isVolumeMode) {
-                volumePedalGain = (float)action.rawValue / 16383.0f; 
+                volumePedalGain = (float)action.rawValue / 16383.0f;
                 dspNeedsCommit = true;
                 
                 // Transmit CC 19 (Volume) over both USB-MIDI and BLE-MIDI (7-bit)
@@ -47,7 +47,7 @@ inline bool channelMessageCallback(ChannelMessage cm) {
         }
 
         case MidiEvent::KNOB_UPDATE: {
-            CriticalSectionGuard lock(MidiRouter::paramMux);
+            // updateParameter already handles its own paramMux internally
             MidiRouter::updateParameter(action.cc, action.val, currentMode, effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
             settingsNeedSaving = true; 
             lastParameterChangeTime = millis();
@@ -98,6 +98,7 @@ inline bool channelMessageCallback(ChannelMessage cm) {
                 uint32_t currentSr = currentSampleRate.load(std::memory_order_acquire);
                 uint32_t targetSr = (currentSr == 96000) ? 48000 : 96000;
                 
+                // NO CriticalSectionGuard here - setSampleRate uses vTaskDelay internally
                 setSampleRate(targetSr);
             }
             break;
@@ -106,6 +107,7 @@ inline bool channelMessageCallback(ChannelMessage cm) {
         case MidiEvent::PB2_WIPER_TOGGLE: {
             bool targetState = (action.val >= 64);
             if (isPB2WiperMode != targetState) {
+                CriticalSectionGuard lock(MidiRouter::paramMux);
                 isPB2WiperMode = targetState; 
                 dspNeedsCommit = true; 
                 pb2ToggleRequested = true; 
@@ -118,6 +120,7 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             if (action.val > 0 && millis() - lastVolToggle > 250) {
                 lastVolToggle = millis();
                 
+                CriticalSectionGuard lock(MidiRouter::paramMux);
                 isVolumeMode = !isVolumeMode;
                 
                 if (!isVolumeMode) {
@@ -149,6 +152,7 @@ inline bool channelMessageCallback(ChannelMessage cm) {
             if (action.val > 0 && millis() - lastTgl > 250) {
                 lastTgl = millis();
                 
+                CriticalSectionGuard lock(MidiRouter::paramMux);
                 if (action.targetEffect == 99) {
                     bool newState = !isMonoPolyActive.load(std::memory_order_acquire);
                     isMonoPolyActive.store(newState, std::memory_order_release);

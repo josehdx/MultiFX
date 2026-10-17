@@ -71,7 +71,8 @@ public:
                 },
             },
         };
-        std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+        // Reverted to 384x to restore PCM1808 / PCM5102A audio stream
+        std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384; 
         return std_cfg;
     }
 

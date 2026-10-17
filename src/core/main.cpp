@@ -2,7 +2,7 @@
 #include <Preferences.h>
 #include <Update.h>
 #include "esp_log.h"
-#define FW_VERSION "v5.00J"
+#define FW_VERSION "v5.00H"
 
 // Core System Includes
 #include "SystemState.h"

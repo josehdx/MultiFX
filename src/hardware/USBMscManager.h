@@ -28,13 +28,13 @@ private:
         if (!dsp_is_paused.load(std::memory_order_acquire)) {
             Serial0.println("[USB] File copy in progress: Stopping DSP to protect flash...");
             
-            // 1. Tell the tasks to park (The audio task will disable I2S automatically)
+            // 1. Tell the tasks to park
             dsp_is_paused.store(true, std::memory_order_release);
             
             // 2. Wait for tasks to acknowledge they are parked
-            while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) {
-                 vTaskDelay(pdMS_TO_TICKS(1)); 
-             }
+            while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
+                vTaskDelay(pdMS_TO_TICKS(1));  
+            }
             msc_paused_dsp = true;
         }
     }
@@ -50,7 +50,6 @@ private:
 
     static int32_t read_cb(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
         if (!ffat_partition) return -1;
-
         uint32_t abs_offset = (lba * 4096) + offset;
         esp_partition_read(ffat_partition, abs_offset, buffer, bufsize);
         
@@ -66,7 +65,6 @@ private:
                 uint32_t overlap_len = overlap_end - overlap_start;
                 uint32_t buffer_offset = overlap_start - read_start;
                 uint32_t cache_offset = overlap_start - cache_start;
-
                 memcpy((uint8_t*)buffer + buffer_offset, msc_cache + cache_offset, overlap_len);
             }
         }
@@ -75,8 +73,8 @@ private:
 
     static int32_t write_cb(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
         if (!ffat_partition) return -1;
-
         uint32_t abs_offset = (lba * 4096) + offset;
+
         for (uint32_t i = 0; i < bufsize; ) {
             uint32_t current_addr = abs_offset + i;
             uint32_t sector = current_addr / 4096;
@@ -116,11 +114,10 @@ private:
 public:
     static void ensureMBR() {
         if (!ffat_partition) return;
+
         const uint32_t SECTOR_SIZE = 4096;
         static uint8_t sec[4096];
-
         if (esp_partition_read(ffat_partition, 0, sec, SECTOR_SIZE) != ESP_OK) return;
-
         if (sec[510] == 0x55 && sec[511] == 0xAA && sec[446 + 4] == 0x01) return;
 
         Serial0.println("[USB] Provisioning FAT12 filesystem with MBR partition table...");
@@ -130,12 +127,9 @@ public:
 
         memset(sec, 0, SECTOR_SIZE);
         uint8_t* p = &sec[446]; 
-        p[0] = 0x00;            
-        p[1] = 0x01; p[2] = 0x01; p[3] = 0x00; 
-        p[4] = 0x01;            
-        p[5] = 0xFE; p[6] = 0xFF; p[7] = 0xFF; 
-        *(uint32_t*)&p[8]  = 1;           
-        *(uint32_t*)&p[12] = partSectors; 
+        p[0] = 0x00;                    p[1] = 0x01; p[2] = 0x01; p[3] = 0x00; 
+        p[4] = 0x01;                    p[5] = 0xFE; p[6] = 0xFF; p[7] = 0xFF; 
+        *(uint32_t*)&p[8]  = 1;                   *(uint32_t*)&p[12] = partSectors; 
         sec[510] = 0x55;
         sec[511] = 0xAA;
         esp_partition_erase_range(ffat_partition, 0, SECTOR_SIZE);
@@ -143,27 +137,18 @@ public:
 
         memset(sec, 0, SECTOR_SIZE);
         sec[0] = 0xEB; sec[1] = 0x3C; sec[2] = 0x90; 
-        memcpy(&sec[3], "MSDOS5.0", 8);              
-        *(uint16_t*)&sec[11] = 4096;                 
-        sec[13] = 1;                                 
-        *(uint16_t*)&sec[14] = 1;                    
-        sec[16] = 2;                                 
-        *(uint16_t*)&sec[17] = 512;                  
+        memcpy(&sec[3], "MSDOS5.0", 8);                      *(uint16_t*)&sec[11] = 4096;                         
+        sec[13] = 1;                                         *(uint16_t*)&sec[14] = 1;                            
+        sec[16] = 2;                                         *(uint16_t*)&sec[17] = 512;                          
         *(uint16_t*)&sec[19] = (partSectors <= 65535) ? (uint16_t)partSectors : 0; 
-        sec[21] = 0xF8;                              
-        *(uint16_t*)&sec[22] = 1;                    
-        *(uint16_t*)&sec[24] = 32;                   
-        *(uint16_t*)&sec[26] = 16;                   
-        *(uint32_t*)&sec[28] = 1;                    
-        *(uint32_t*)&sec[32] = (partSectors > 65535) ? partSectors : 0; 
-        sec[36] = 0x80;                              
-        sec[38] = 0x29;                              
-        *(uint32_t*)&sec[39] = 0x12345678;           
-        memcpy(&sec[43], "MULTIFX    ", 11);         
-        memcpy(&sec[54], "FAT12   ", 8);             
+        sec[21] = 0xF8;                                      *(uint16_t*)&sec[22] = 1;                            
+        *(uint16_t*)&sec[24] = 32;                           *(uint16_t*)&sec[26] = 16;                           
+        *(uint32_t*)&sec[28] = 1;                            *(uint32_t*)&sec[32] = (partSectors > 65535) ? partSectors : 0; 
+        sec[36] = 0x80;                                      sec[38] = 0x29;                                      
+        *(uint32_t*)&sec[39] = 0x12345678;                   memcpy(&sec[43], "MULTIFX    ", 11);                 
+        memcpy(&sec[54], "FAT12   ", 8);                     
         sec[510] = 0x55;
         sec[511] = 0xAA;
-
         esp_partition_erase_range(ffat_partition, 1 * SECTOR_SIZE, SECTOR_SIZE);
         esp_partition_write(ffat_partition, 1 * SECTOR_SIZE, sec, SECTOR_SIZE);
 
@@ -171,7 +156,6 @@ public:
         sec[0] = 0xF8; sec[1] = 0xFF; sec[2] = 0xFF; 
         esp_partition_erase_range(ffat_partition, 2 * SECTOR_SIZE, SECTOR_SIZE);
         esp_partition_write(ffat_partition, 2 * SECTOR_SIZE, sec, SECTOR_SIZE);
-
         esp_partition_erase_range(ffat_partition, 3 * SECTOR_SIZE, SECTOR_SIZE);
         esp_partition_write(ffat_partition, 3 * SECTOR_SIZE, sec, SECTOR_SIZE);
 
@@ -180,7 +164,6 @@ public:
             esp_partition_erase_range(ffat_partition, s * SECTOR_SIZE, SECTOR_SIZE);
             esp_partition_write(ffat_partition, s * SECTOR_SIZE, sec, SECTOR_SIZE);
         }
-
         Serial0.println("[USB] Partition layout written. Volume ready to mount.");
     }
 
@@ -224,10 +207,6 @@ public:
 
         if (msc_paused_dsp && !msc_cache_dirty && (!usbConnected || (millis() - msc_last_write_time > 2000))) {
             Serial0.println("[USB] File copy complete or physically disconnected: Resuming DSP...");
-            
-            // Re-init the I2S channels using the currently saved sample rate
-            I2SManager::initChannels(BoardHAL::getI2SConfig(currentSampleRate.load(std::memory_order_acquire)), HOP_SIZE);
-            I2SManager::enableChannels();
             
             // Request full audio buffer zero-out before unpausing to prevent artifacts
             globalAudioResetRequested.store(true, std::memory_order_release);

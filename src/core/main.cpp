@@ -2,6 +2,7 @@
 #include <Preferences.h>
 #include <Update.h>
 #include "esp_log.h"
+
 #define FW_VERSION "v5.00H"
 
 // Core System Includes
@@ -70,7 +71,6 @@ void loop() {
 #if !defined(FW_MODE_KNOBS_ONLY)
     btConnected = BluetoothManager::isMvaveConnected || BluetoothManager::isHostConnected;
 #endif
-
     InputManager::processInputs(btConnected);
     InputManager::processPedals();
 
@@ -87,7 +87,6 @@ void loop() {
 #ifdef ENABLE_ADVANCED_TELEMETRY
         watermarkVal = lut_stack_watermark.load(std::memory_order_relaxed);
 #endif
-
 #if defined(TARGET_LILYGO)
         BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
                             ui_audio_level.load(std::memory_order_acquire),
@@ -128,6 +127,19 @@ void loop() {
     if (settingsNeedSaving && (millis() - lastParameterChangeTime > 2000)) {
         snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVING NVS...");
         
+#if defined(TARGET_LILYGO)
+        BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
+                           ui_audio_level.load(std::memory_order_acquire),
+                           ui_output_level.load(std::memory_order_acquire),
+                           core0_dsp_load.load(std::memory_order_relaxed),
+                           core1_ctrl_load.load(std::memory_order_relaxed),
+                           currentSampleRate.load(std::memory_order_acquire),
+                           max_loop_latency_ms.exchange(0, std::memory_order_relaxed),
+                           audio_underflow_count.load(std::memory_order_relaxed),
+                           0, false, latestBat, isMonoPolyActive.load(std::memory_order_acquire), uiDebugMessage);
+        vTaskDelay(pdMS_TO_TICKS(50)); // Allow time for the SPI bus to paint the TFT
+#endif
+
         bool usbActive = (bool)USB;
         
         // CRITICAL FIX: We MUST always park the DSP before NVS Flash Writes.
@@ -138,12 +150,8 @@ void loop() {
               vTaskDelay(pdMS_TO_TICKS(1));
         }
         
-        if (usbActive) {
-            // Temporarily disable TX to avoid loud static during the flash block
-            if (I2SManager::tx_chan != NULL) {
-                i2s_channel_disable((i2s_chan_handle_t)I2SManager::tx_chan);
-            }
-        }
+        // TEAR DOWN I2S COMPLETELY to prevent hardware FIFO/DMA misalignment during cache-disabled flash writes
+        I2SManager::disableAndDestroyChannels();
         
         AppSettings currentSettings;
         memset(&currentSettings, 0, sizeof(AppSettings));
@@ -158,26 +166,27 @@ void loop() {
         }
         
         settingsMgr.save(preferences, 
-                         activeDSP->activeMode, 
-                         activeDSP->latMode, 
-                         activeDSP->fbIdx, 
-                         isPB2WiperMode, 
-                         isVolumeMode, 
-                         currentFxStates, 
-                         currentSampleRate.load(std::memory_order_acquire), 
-                         &currentSettings, 
-                         sizeof(AppSettings));
-                         
+                          activeDSP->activeMode, 
+                          activeDSP->latMode, 
+                          activeDSP->fbIdx, 
+                          isPB2WiperMode, 
+                          isVolumeMode, 
+                          currentFxStates, 
+                          currentSampleRate.load(std::memory_order_acquire), 
+                          &currentSettings, 
+                          sizeof(AppSettings));
+                          
         settingsNeedSaving = false;
         
-        if (usbActive) {
-            // Re-enable I2S hardware gracefully
-            if (I2SManager::tx_chan != NULL) {
-                i2s_channel_enable((i2s_chan_handle_t)I2SManager::tx_chan);
-            }
-        }
+        // REBUILD I2S COMPLETELY to ensure clean DMA and Left/Right channel phase alignment
+        I2SManager::initChannels(BoardHAL::getI2SConfig(currentSampleRate.load(std::memory_order_acquire)), HOP_SIZE);
+        I2SManager::enableChannels();
         
         snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVE COMPLETE");
+        
+        // CRITICAL FIX: Flush internal DSP buffers before resuming to clear out corrupted history/artifacts
+        globalAudioResetRequested.store(true, std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         
         dsp_is_paused.store(false, std::memory_order_release);
         if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);

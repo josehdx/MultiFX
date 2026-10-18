@@ -70,9 +70,8 @@ public:
             },
         };
 
-        // CRITICAL FIX: Downscale MCLK multiple from 384 to 256. 
-        // Keeps the APLL within safe hardware spec limits at 96kHz.
-        std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256; 
+        // CRITICAL FIX: Reverted to 384x. External DAC/ADC PLLs require standard 384x oversampling.
+        std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384; 
         return std_cfg;
     }
 

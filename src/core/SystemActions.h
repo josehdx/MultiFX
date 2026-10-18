@@ -45,7 +45,6 @@ inline void executeModeSwitch() {
         case 8: isSwellMode      = true; break;
         case 9: isVibratoMode    = true; break;
     }
-
     Serial0.printf("[SYSTEM] Switched Effect Mode cleanly to: %d\n", targetEffectMode);
     
     dspNeedsCommit = true;
@@ -113,7 +112,7 @@ inline bool commitDSPState() {
     
     dspAckCommit.store(false, std::memory_order_release); 
     dspActiveState.store(backBuffer, std::memory_order_release);
-    dspWriteIndex = (dspWriteIndex + 1) & 1;      
+    dspWriteIndex = (dspWriteIndex + 1) & 1;          
     
     return true;
 }
@@ -140,9 +139,13 @@ inline void cycleLatencyMode() {
 inline void executeLatencyCycle() {
     snprintf(uiDebugMessage, sizeof(uiDebugMessage), "LATENCY CYCLE");
     dsp_is_paused.store(true, std::memory_order_release);
-    while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) {
-         vTaskDelay(pdMS_TO_TICKS(1)); 
+    while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
+        vTaskDelay(pdMS_TO_TICKS(1)); 
     }
+    
+    // CRITICAL FIX: Tear down DMA channels completely to clear ring buffer head pointers.
+    // Previously, disableChannels() was used, which left residual bytes and broke phase lock on resume.
+    I2SManager::disableAndDestroyChannels();
     
     latencyMode.store((latencyMode.load(std::memory_order_acquire) + 1) % 4, std::memory_order_release);
     
@@ -153,6 +156,9 @@ inline void executeLatencyCycle() {
     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
     if (diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));
     
+    uint32_t currentSr = currentSampleRate.load(std::memory_order_acquire);
+    I2SManager::initChannels(BoardHAL::getI2SConfig(currentSr), HOP_SIZE);
+    
     globalAudioResetRequested.store(true, std::memory_order_release);
     dspNeedsCommit = true; 
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -162,9 +168,11 @@ inline void executeLatencyCycle() {
     if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
     if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
     
-    while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) {
-         vTaskDelay(pdMS_TO_TICKS(1)); 
+    while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { 
+        vTaskDelay(pdMS_TO_TICKS(1)); 
     }
+    
+    I2SManager::enableChannels();
     
     settingsNeedSaving = true; 
     lastParameterChangeTime = millis();
@@ -182,8 +190,8 @@ inline void executeSampleRateCycle() {
     snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SR TOGGLE: %lu", targetSr);
     
     dsp_is_paused.store(true, std::memory_order_release);
-    while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) {
-         vTaskDelay(pdMS_TO_TICKS(1)); 
+    while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
+        vTaskDelay(pdMS_TO_TICKS(1)); 
     }
     
     currentSampleRate.store(targetSr, std::memory_order_release);
@@ -196,8 +204,6 @@ inline void executeSampleRateCycle() {
     
     I2SManager::disableAndDestroyChannels();
     
-    // CRITICAL FIX: Increased from 25ms to 250ms. External DAC/ADC PLLs require 
-    // a sustained clock loss to trigger an internal hardware reset and resync.
     vTaskDelay(pdMS_TO_TICKS(250));
     
     I2SManager::initChannels(BoardHAL::getI2SConfig(targetSr), HOP_SIZE);
@@ -213,8 +219,6 @@ inline void executeSampleRateCycle() {
     
     vTaskDelay(pdMS_TO_TICKS(30));
     
-    I2SManager::enableChannels();
-    
     globalAudioResetRequested.store(true, std::memory_order_release); 
     hardwareSyncMuteFrames.store((targetSr/HOP_SIZE)*0.40f, std::memory_order_release);
     
@@ -225,9 +229,11 @@ inline void executeSampleRateCycle() {
     if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
     if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
     
-    while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) {
-         vTaskDelay(pdMS_TO_TICKS(1)); 
+    while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { 
+        vTaskDelay(pdMS_TO_TICKS(1)); 
     }
+    
+    I2SManager::enableChannels();
     
     pedals.triggerSystemRecovery(); 
     settingsNeedSaving = true; 
@@ -252,8 +258,8 @@ inline void goToLightSleep() {
     turnScreenOff();
     
     dsp_is_paused.store(true, std::memory_order_release);
-    while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) {
-         vTaskDelay(pdMS_TO_TICKS(1)); 
+    while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
+        vTaskDelay(pdMS_TO_TICKS(1)); 
     }
     
     I2SManager::disableAndDestroyChannels();
@@ -284,8 +290,10 @@ inline void goToLightSleep() {
     memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
     if (diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));
     
-    I2SManager::initChannels(BoardHAL::getI2SConfig(currentSampleRate.load(std::memory_order_acquire)), HOP_SIZE);
-    I2SManager::enableChannels();
+    uint32_t wakeSr = currentSampleRate.load(std::memory_order_acquire);
+    I2SManager::initChannels(BoardHAL::getI2SConfig(wakeSr), HOP_SIZE);
+    vTaskDelay(pdMS_TO_TICKS(30)); // Allow I2S PLLs to stabilize
+    hardwareSyncMuteFrames.store((wakeSr / HOP_SIZE) * 0.40f, std::memory_order_release);
     
     globalAudioResetRequested.store(true, std::memory_order_release);
     
@@ -295,9 +303,11 @@ inline void goToLightSleep() {
     if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
     if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
     
-    while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) {
-         vTaskDelay(pdMS_TO_TICKS(1)); 
+    while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) { 
+        vTaskDelay(pdMS_TO_TICKS(1)); 
     }
+    
+    I2SManager::enableChannels();
     
     turnScreenOn();
     pedals.triggerSystemRecovery(); 

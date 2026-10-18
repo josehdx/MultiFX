@@ -68,6 +68,7 @@ extern const bool INVERT_PB3;
 
 extern std::atomic<bool> dsp_is_paused, dsp_ack_parked, lut_ack_parked, ui_clear_meters_requested, globalAudioResetRequested, panicResetRequested, bleEnabled;
 extern std::atomic<bool> manualSaveRequested;
+extern std::atomic<bool> dsp_ready_for_i2s;
 
 extern std::atomic<float> pitchShiftFactor;
 extern std::atomic<uint32_t> currentSampleRate;

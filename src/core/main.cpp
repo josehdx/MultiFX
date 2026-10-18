@@ -24,6 +24,7 @@ DisplayManager displayManager;
 // Define the global flags
 volatile bool pendingModeSwitch = false;
 volatile int targetEffectMode = 0;
+
 volatile bool pendingLatencyCycle = false;
 volatile bool pendingSampleRateCycle = false;
 volatile bool pendingPanicReset = false;
@@ -71,6 +72,7 @@ void loop() {
 #if !defined(FW_MODE_KNOBS_ONLY)
     btConnected = BluetoothManager::isMvaveConnected || BluetoothManager::isHostConnected || BluetoothManager::isNuxConnected;
 #endif
+
     InputManager::processInputs(btConnected);
     InputManager::processPedals();
 
@@ -87,6 +89,7 @@ void loop() {
 #ifdef ENABLE_ADVANCED_TELEMETRY
         watermarkVal = lut_stack_watermark.load(std::memory_order_relaxed);
 #endif
+
 #if defined(TARGET_LILYGO)
         BoardHAL::updateUI(activeDSP, currentPB1, currentPB2, currentPB3, currentCC11,
                             ui_audio_level.load(std::memory_order_acquire),
@@ -100,6 +103,7 @@ void loop() {
                             isMonoPolyActive.load(std::memory_order_acquire),
                             uiDebugMessage);
 #endif
+
         TelemetryManager::report(activeDSP);
     }
 
@@ -139,13 +143,11 @@ void loop() {
                            0, false, latestBat, isMonoPolyActive.load(std::memory_order_acquire), uiDebugMessage);
         vTaskDelay(pdMS_TO_TICKS(50)); // Allow time for the SPI bus to paint the TFT
 #endif
-
         dsp_is_paused.store(true, std::memory_order_release);
         while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) {
               vTaskDelay(pdMS_TO_TICKS(1));
         }
         
-        // TEAR DOWN I2S COMPLETELY to prevent hardware FIFO/DMA misalignment during cache-disabled flash writes
         I2SManager::disableAndDestroyChannels();
         
         AppSettings currentSettings;
@@ -160,33 +162,32 @@ void loop() {
             if ((&activeDSP->w)[i]) currentFxStates |= (1 << i);
         }
         
-        settingsMgr.save(preferences, 
-                          activeDSP->activeMode, 
-                          activeDSP->latMode, 
-                          activeDSP->fbIdx, 
-                          isPB2WiperMode, 
-                          isVolumeMode, 
-                          currentFxStates, 
-                          currentSampleRate.load(std::memory_order_acquire), 
-                          &currentSettings, 
-                          sizeof(AppSettings));
-                          
+        settingsMgr.save(preferences,
+                           activeDSP->activeMode,
+                           activeDSP->latMode,
+                           activeDSP->fbIdx,
+                           isPB2WiperMode,
+                           isVolumeMode,
+                           currentFxStates,
+                           currentSampleRate.load(std::memory_order_acquire),
+                           &currentSettings,
+                           sizeof(AppSettings));
+                           
         settingsNeedSaving = false;
         
-        // REBUILD I2S COMPLETELY to ensure clean DMA and Left/Right channel phase alignment
         I2SManager::initChannels(BoardHAL::getI2SConfig(currentSampleRate.load(std::memory_order_acquire)), HOP_SIZE);
-
-        // CLEAR PSRAM BUFFERS to prevent playing back stale data causing harmonic distortion
         memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t));
         memset(sramPitchLow, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t));
         memset(sramPitchHigh, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t));
         memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t));
         memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
         if (diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));
-
-        vTaskDelay(pdMS_TO_TICKS(30)); // Allow I2S PLLs to stabilize
-
-        I2SManager::enableChannels();
+        
+        vTaskDelay(pdMS_TO_TICKS(30)); 
+        
+        // CRITICAL FIX: Removed premature `enableChannels()` call that was previously here.
+        // It must NOT be called while the task is still parked.
+        hardwareSyncMuteFrames.store((currentSampleRate.load(std::memory_order_acquire) / HOP_SIZE) * 0.40f, std::memory_order_release);
         
         snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVE COMPLETE");
         
@@ -200,6 +201,9 @@ void loop() {
         while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) {
               vTaskDelay(pdMS_TO_TICKS(1));
         }
+
+        // Channels are enabled safely ONLY after the task is actively spinning and waiting.
+        I2SManager::enableChannels();
     }
 
     if (panicResetRequested.load(std::memory_order_acquire)) {

@@ -28,6 +28,7 @@ const bool INVERT_PB3 = false;
 
 std::atomic<bool> dsp_is_paused{false}, dsp_ack_parked{false}, lut_ack_parked{false}, ui_clear_meters_requested{false}, globalAudioResetRequested{false}, panicResetRequested{false}, bleEnabled{true};
 std::atomic<bool> manualSaveRequested{false};
+std::atomic<bool> dsp_ready_for_i2s{false};
 
 std::atomic<float> pitchShiftFactor{1.0f};
 std::atomic<uint32_t> currentSampleRate{96000};

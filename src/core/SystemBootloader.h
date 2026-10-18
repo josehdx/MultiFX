@@ -1,5 +1,4 @@
 #pragma once
-
 #include <Arduino.h>
 #include "esp_task_wdt.h"
 #include "SystemState.h"
@@ -59,7 +58,6 @@ public:
         currentSampleRate.store(loadedSr, std::memory_order_release);
         
         padVectorFilter.setLPF(1200.0f, (float)loadedSr);
-        I2SManager::initChannels(BoardHAL::getI2SConfig(loadedSr), HOP_SIZE);
 
         Serial0.println("[INIT 4/8] Setting up Analog Inputs...");
         analogReadResolution(12);
@@ -72,7 +70,6 @@ public:
         latencyMode.store(constrain(preferences.getInt("latMode", 0), 0, 3), std::memory_order_release);
         
         isPB2WiperMode = preferences.getBool("pb2Wiper", false);
-
         // Always boot in normal Whammy/Expression mode
         isVolumeMode = false;
         volumePedalGain = 1.0f;
@@ -108,18 +105,29 @@ public:
         if (sourceLut && destLut) {
             memcpy(destLut, sourceLut, 16384 * sizeof(float));
         }
-
         if (destLut) pitchShiftFactor.store(destLut[8192], std::memory_order_release);
 
         Serial0.println("[INIT 7/8] Spawning Core 0 (Audio) and Core 1 (LUT) FreeRTOS Tasks...");
-        I2SManager::enableChannels();
-
+        
         if (dspTaskStack != nullptr && dspTaskTCB != nullptr) {
             audioTaskHandle = xTaskCreateStaticPinnedToCore(AudioDSPTask, "DSP", 8192, NULL, 20, dspTaskStack, dspTaskTCB, 0);
         }
         if (lutTaskStack != nullptr && lutTaskTCB != nullptr) {
             lutTaskHandle = xTaskCreateStaticPinnedToCore(LUTUpdateTask, "LUT_Task", 3072, NULL, 1, lutTaskStack, lutTaskTCB, 1);
         }
+
+        // CRITICAL FIX: Wait dynamically for the AudioDSPTask to fully initialize.
+        // This eliminates the boot-time 96kHz DMA buffer overflow and channel swapping.
+        while (!dsp_ready_for_i2s.load(std::memory_order_acquire)) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
+        I2SManager::initChannels(BoardHAL::getI2SConfig(loadedSr), HOP_SIZE);
+        vTaskDelay(pdMS_TO_TICKS(30)); // Allow external DAC/ADC PLLs to lock
+        I2SManager::enableChannels();
+
+        // Hardware Mute Frames block audio output until the I2S clocks have stabilized
+        hardwareSyncMuteFrames.store((loadedSr / HOP_SIZE) * 0.40f, std::memory_order_release);
 
 #if defined(ESP_IDF_VERSION) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
         esp_task_wdt_config_t twdt_config = {

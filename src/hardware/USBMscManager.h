@@ -35,6 +35,10 @@ private:
             while(!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) { 
                 vTaskDelay(pdMS_TO_TICKS(1));  
             }
+
+            // CRITICAL FIX: Tear down DMA channels completely.
+            I2SManager::disableAndDestroyChannels();
+
             msc_paused_dsp = true;
         }
     }
@@ -100,13 +104,50 @@ private:
         flush_cb();
         if (!start) {
             Serial0.println("[USB] USB Storage safely ejected by host OS.");
+            msc_last_write_time = 0;
         }
         return true;
     }
 
     static void usbMscWorkerTask(void* pvParameters) {
         for (;;) {
-            handleCacheFlush();
+            bool usbConnected = (bool)USB;
+            
+            if (msc_cache_dirty && (!usbConnected || (millis() - msc_last_write_time > 2000))) {
+                flush_cb();
+            }
+
+            if (msc_paused_dsp && !msc_cache_dirty && (!usbConnected || (millis() - msc_last_write_time > 2000))) {
+                Serial0.println("[USB] File copy complete or physically disconnected: Resuming DSP...");
+                
+                uint32_t currentSr = currentSampleRate.load(std::memory_order_acquire);
+                I2SManager::initChannels(BoardHAL::getI2SConfig(currentSr), HOP_SIZE);
+                
+                memset(delayBuffer, 0, MAX_BUFFER_SIZE * sizeof(int16_t));
+                memset(sramPitchLow, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t));
+                memset(sramPitchHigh, 0, SRAM_PITCH_BUF_SIZE * sizeof(int16_t));
+                memset(fbDelayBuffer, 0, FB_BUFFER_SIZE * sizeof(int16_t));
+                memset(freezeBuffer, 0, FREEZE_BUFFER_SIZE * sizeof(int16_t));
+                if (diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));
+                vTaskDelay(pdMS_TO_TICKS(30)); 
+                
+                hardwareSyncMuteFrames.store((currentSr / HOP_SIZE) * 0.40f, std::memory_order_release);
+                globalAudioResetRequested.store(true, std::memory_order_release);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                
+                dsp_is_paused.store(false, std::memory_order_release);
+                msc_paused_dsp = false;
+                
+                if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
+                if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
+                
+                while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) {
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                }
+                
+                // CRITICAL FIX: Enable channels only AFTER the task is unparked and looping.
+                I2SManager::enableChannels();
+            }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
@@ -194,28 +235,6 @@ public:
                 &usbMscTaskHandle, 
                 1 
             );
-        }
-    }
-
-    static void handleCacheFlush() {
-        // CRITICAL FIX: Detect physical USB detachment and forcefully trigger flush/unpause
-        bool usbConnected = (bool)USB;
-        
-        if (msc_cache_dirty && (!usbConnected || (millis() - msc_last_write_time > 2000))) {
-            flush_cb();
-        }
-
-        if (msc_paused_dsp && !msc_cache_dirty && (!usbConnected || (millis() - msc_last_write_time > 2000))) {
-            Serial0.println("[USB] File copy complete or physically disconnected: Resuming DSP...");
-            
-            // Request full audio buffer zero-out before unpausing to prevent artifacts
-            globalAudioResetRequested.store(true, std::memory_order_release);
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            dsp_is_paused.store(false, std::memory_order_release);
-            msc_paused_dsp = false;
-            
-            if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
-            if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
         }
     }
 };

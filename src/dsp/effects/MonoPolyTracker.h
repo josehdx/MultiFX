@@ -20,7 +20,9 @@ private:
     int timerCount = 0;
     float confidenceMix = 0.0f;
 
-    float analysisBuffer[4096] __attribute__((aligned(16))) = {0.0f};
+    // CRITICAL FIX: Expanded from 4096 to 8192 to prevent buffer wrap-around corruption 
+    // at 96kHz. 96kHz grain spans can exceed 4096 samples, reading overwritten memory.
+    float analysisBuffer[8192] __attribute__((aligned(16))) = {0.0f};
     int writeIdx = 0;
     
     float detectedT0 = 200.0f; // Default safe period (~240 Hz)
@@ -95,14 +97,21 @@ public:
                         float p1, float p2, float p3, float p4, float p5) __attribute__((always_inline)) {
         
         analysisBuffer[writeIdx] = inSample;
-        writeIdx = (writeIdx + 1) & 4095;
+        writeIdx = (writeIdx + 1) & 8191; // Mask updated to match new buffer size
         
         int algo = constrain((int)(p1 * 4.99f), 0, 4);
         
-        if (++sweepCounter >= 256) {
+        // CRITICAL FIX: Filter/LFO Math Scaling. At 96kHz, running the 512-sample autocorrelation 
+        // every 256 samples takes 2.75ms. 256 samples at 96kHz is only 2.66ms of audio. Processing slower 
+        // than real-time drains the DMA buffer over a few seconds, completely muting the audio.
+        // Scaling the sweep to 512 at 96kHz ensures processing remains under 50% CPU.
+        uint32_t currentSr = currentSampleRate.load(std::memory_order_relaxed);
+        int sweepTarget = (currentSr == 96000) ? 512 : 256;
+        
+        if (++sweepCounter >= sweepTarget) {
             sweepCounter = 0;
             int minFreq = (algo == 0) ? (70 + (int)(p2 * 230.0f)) : 70;
-            lastVoicedState = trackPitch(currentSampleRate.load(std::memory_order_relaxed), minFreq);
+            lastVoicedState = trackPitch(currentSr, minFreq);
         }
 
         switch(currentState) {
@@ -136,14 +145,14 @@ public:
         
         switch(algo) {
             case 0: shiftedSample = executeTDPSOLA(inSample, targetPitch, detectedT0, p3, p4); break;
-            case 1: shiftedSample = executeYinSynth(targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); break;
-            case 2: shiftedSample = executeECKF(targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); break;
+            case 1: shiftedSample = executeYinSynth(targetPitch, detectedT0, p2, p3, p4, currentSr); break;
+            case 2: shiftedSample = executeECKF(targetPitch, detectedT0, p2, p3, p4, currentSr); break;
             case 3: 
-                 if (varDelayBuffer) shiftedSample = executeVarDelay(inSample, targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); 
+                 if (varDelayBuffer) shiftedSample = executeVarDelay(inSample, targetPitch, detectedT0, p2, p3, p4, currentSr); 
                  break;
             case 4: 
                 if (pvInput && pvOutput && pvWorkspace && pvMagWorkspace && pvPhaseWorkspace && pvLastPhase && pvSumPhase) {
-                    shiftedSample = executePhaseVocoder(inSample, targetPitch, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); 
+                    shiftedSample = executePhaseVocoder(inSample, targetPitch, p2, p3, p4, currentSr); 
                  }
                 break;
         }
@@ -159,7 +168,7 @@ private:
         
         float r0 = 0.0f;
         for (int i = 0; i < window; i++) {
-            int idx = (writeIdx - window + i + 4096) & 4095; 
+            int idx = (writeIdx - window + i + 8192) & 8191; 
             float val = analysisBuffer[idx];
             r0 = __builtin_fmaf(val, val, r0);
         }
@@ -172,8 +181,8 @@ private:
         for (int lag = lagMin; lag <= lagMax; lag++) {
             float rLag = 0.0f;
             for (int i = 0; i < window; i++) {
-                int idx1 = (writeIdx - window - lag + i + 4096) & 4095;
-                int idx2 = (writeIdx - window + i + 4096) & 4095;
+                int idx1 = (writeIdx - window - lag + i + 8192) & 8191;
+                int idx2 = (writeIdx - window + i + 8192) & 8191;
                 rLag = __builtin_fmaf(analysisBuffer[idx1], analysisBuffer[idx2], rLag);
             }
             if (rLag > maxR) { maxR = rLag; bestLag = lag; }
@@ -223,12 +232,12 @@ private:
         
         if (synthesisPhase >= T1) {
             synthesisPhase -= T1; 
-            int searchStart = (writeIdx - (int)(2.5f * T0) + 4096) & 4095; 
+            int searchStart = (writeIdx - (int)(2.5f * T0) + 8192) & 8191; 
             int searchLen = (int)(T0 * (0.1f + p_tol * 0.9f));
             float maxVal = -1.0f; int epochIdx = searchStart;
 
             for (int i = 0; i < searchLen; i++) {
-                int idx = (searchStart + i) & 4095;
+                int idx = (searchStart + i) & 8191;
                 float absVal = fabsf(analysisBuffer[idx]);
                 if (absVal > maxVal) { maxVal = absVal; epochIdx = idx; }
             }
@@ -238,7 +247,7 @@ private:
             for (int i = 0; i < 8; i++) {
                 if (!grains[i].active) {
                     grains[i].active = true; grains[i].winSpan = windowMultiplier * T0;
-                    grains[i].anchorIdx = (epochIdx - (int)(grains[i].winSpan * 0.5f) + 4096) & 4095; 
+                    grains[i].anchorIdx = (epochIdx - (int)(grains[i].winSpan * 0.5f) + 8192) & 8191; 
                     grains[i].currentPhase = 0.0f; grains[i].phaseInc = 1.0f / grains[i].winSpan; break;
                 }
             }
@@ -248,7 +257,7 @@ private:
         for (int i = 0; i < 8; i++) {
             if (grains[i].active) {
                 int readOffset = (int)(grains[i].currentPhase * grains[i].winSpan);
-                int readIdx = (grains[i].anchorIdx + readOffset) & 4095; 
+                int readIdx = (grains[i].anchorIdx + readOffset) & 8191; 
                 float rawSample = analysisBuffer[readIdx];
                 int lutIdx = ((int)(grains[i].currentPhase * 4095.0f)) & 4095;
 

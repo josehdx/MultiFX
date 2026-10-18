@@ -10,6 +10,15 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
           vTaskDelay(pdMS_TO_TICKS(10));
       }
 
+    // CRITICAL FIX: Signal that AudioDSPTask is ready to consume I2S frames.
+    // SystemBootloader will NOT enable I2S DMA until this flag is set, preventing
+    // ring buffer overflow and stereo phase misalignment at 96kHz boot.
+    dsp_ready_for_i2s.store(true, std::memory_order_release);
+    
+    while (I2SManager::rx_chan == NULL || I2SManager::tx_chan == NULL) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
     for(;;) {
 #ifdef ENABLE_ADVANCED_TELEMETRY
         // Record remaining Stack RAM in Bytes for Core 0 Audio Task
@@ -28,9 +37,23 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
         }
 
         size_t bytesRead = 0;
+        esp_err_t rx_err = ESP_FAIL;
         
         if (I2SManager::rx_chan != NULL && I2SManager::tx_chan != NULL) {
-            i2s_channel_read((i2s_chan_handle_t)I2SManager::rx_chan, i2s_in_block, HOP_SIZE*2*sizeof(int32_t), &bytesRead, pdMS_TO_TICKS(10));
+            rx_err = i2s_channel_read((i2s_chan_handle_t)I2SManager::rx_chan, i2s_in_block, HOP_SIZE*2*sizeof(int32_t), &bytesRead, pdMS_TO_TICKS(10));
+            
+            // CRITICAL FIX: DMA Phase-Lock Protection.
+            // If channels are disabled, destroyed, or rebuilding, reading returns ESP_ERR_INVALID_STATE.
+            // We MUST skip the entire DSP and TX write phase. Attempting to write a dummy block 
+            // to a disabled TX channel permanently breaks the TX/RX pointer sync.
+            if (rx_err != ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(2));
+                continue; 
+            }
+        } else {
+            // Channels are currently NULL (destroyed for mode swap or save)
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
         }
 
         if(__builtin_expect(bytesRead > 0, 1)) {
@@ -77,23 +100,15 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
 #ifdef ENABLE_ADVANCED_TELEMETRY
                 audio_underflow_count.fetch_add(1, std::memory_order_relaxed);
 #endif
-                memset(i2s_out_block, 0, bytesRead);
+                memset(i2s_out_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
                 size_t dummyBytes = 0;
                 if (I2SManager::tx_chan != NULL) {
-                    i2s_channel_write((i2s_chan_handle_t)I2SManager::tx_chan, i2s_out_block, bytesRead, &dummyBytes, 0);
+                    i2s_channel_write((i2s_chan_handle_t)I2SManager::tx_chan, i2s_out_block, HOP_SIZE * 8, &dummyBytes, 0);
                 }
-                taskYIELD(); // CRITICAL FIX: Eliminate 1ms delay. Yield to immediately attempt the next read.
+                taskYIELD();
             }
         } else {
-#ifdef ENABLE_ADVANCED_TELEMETRY
-            audio_underflow_count.fetch_add(1, std::memory_order_relaxed);
-#endif
-            memset(i2s_out_block, 0, HOP_SIZE * 2 * sizeof(int32_t));
-            size_t dummyBytes = 0;
-            if (I2SManager::tx_chan != NULL) {
-                i2s_channel_write((i2s_chan_handle_t)I2SManager::tx_chan, i2s_out_block, HOP_SIZE * 8, &dummyBytes, 0);
-            }
-            taskYIELD(); // CRITICAL FIX: Eliminate 1ms delay. Prevent death spiral loop at 96kHz.
+            taskYIELD();
         }
     }
 }

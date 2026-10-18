@@ -1,5 +1,4 @@
 #pragma once
-
 #include <Arduino.h>
 #include "SystemState.h"
 #include "PowerManager.h"
@@ -71,7 +70,9 @@ public:
             },
         };
 
-        std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384; 
+        // CRITICAL FIX: Downscale MCLK multiple from 384 to 256. 
+        // Keeps the APLL within safe hardware spec limits at 96kHz.
+        std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256; 
         return std_cfg;
     }
 
@@ -95,7 +96,6 @@ public:
         latestPar4 = analogRead(7);
         latestPar5 = analogRead(11);
 #endif
-
         adcLock.clear(std::memory_order_release);
     }
 
@@ -131,15 +131,12 @@ public:
                 dData.paramVals[2] = activeDSP->fxMem[0];
                 dData.paramVals[3] = activeDSP->fxMem[1];
             }
-
             dData.paramNames[0] = "P1"; dData.paramNames[1] = "P2"; dData.paramNames[2] = "P3"; 
             dData.paramNames[3] = "P4"; dData.paramNames[4] = "P5";
-
             dData.inMeter = inMeter; dData.outMeter = outMeter;
             dData.dspCoreLoad = dspLoad; dData.ctrlCoreLoad = ctrlLoad;
             dData.freeSRAM = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
             dData.freePSRAM = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-
             dData.sampleRate = sampleRate; dData.peakLatency = peakLatency;
             dData.underflows = underflows; dData.dmaCount = 0; 
             dData.stackWatermark = stackWatermark;

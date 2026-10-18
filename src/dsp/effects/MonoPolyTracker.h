@@ -1,4 +1,5 @@
 #pragma once
+
 #include "SystemState.h"
 #include "LUTManager.h"
 #include <dsps_fft2r.h>
@@ -15,11 +16,10 @@ private:
 
     enum State { UNVOICED, WAITING, FADING_IN, LOCKED, FADING_OUT };
     State currentState = UNVOICED;
+
     int timerCount = 0;
     float confidenceMix = 0.0f;
 
-    // CRITICAL FIX: Expanded from 2048 to 4096 to prevent buffer wrap-around corruption 
-    // at 96kHz when looking back (2.5 * 1371) = 3427 samples.
     float analysisBuffer[4096] __attribute__((aligned(16))) = {0.0f};
     int writeIdx = 0;
     
@@ -51,7 +51,7 @@ private:
     float* varDelayBuffer = nullptr;
     int varWriteIdx = 0;
     uint32_t tap_w1_1 = 0;
-    uint32_t tap_w1_2 = 2048 << 16; 
+    uint32_t tap_w1_2 = 2048 << 16;
 
     // --- Algo 4: Phase Vocoder State (Pointers) ---
     bool pvInitialized = false;
@@ -75,7 +75,6 @@ public:
         pvInput          = (float*)heap_caps_aligned_alloc(64, 512 * sizeof(float), MALLOC_CAP_SPIRAM);
         pvOutput         = (float*)heap_caps_aligned_alloc(64, 512 * sizeof(float), MALLOC_CAP_SPIRAM);
         
-        // Relocated to PSRAM to prevent Internal SRAM fragmentation allocation failures
         pvWorkspace      = (float*)heap_caps_aligned_alloc(64, 1024 * sizeof(float), MALLOC_CAP_SPIRAM);
         pvMagWorkspace   = (float*)heap_caps_aligned_alloc(64, 257 * sizeof(float), MALLOC_CAP_SPIRAM);
         pvPhaseWorkspace = (float*)heap_caps_aligned_alloc(64, 257 * sizeof(float), MALLOC_CAP_SPIRAM);
@@ -96,7 +95,7 @@ public:
                         float p1, float p2, float p3, float p4, float p5) __attribute__((always_inline)) {
         
         analysisBuffer[writeIdx] = inSample;
-        writeIdx = (writeIdx + 1) & 4095; // Mask updated to match new buffer size
+        writeIdx = (writeIdx + 1) & 4095;
         
         int algo = constrain((int)(p1 * 4.99f), 0, 4);
         
@@ -140,13 +139,12 @@ public:
             case 1: shiftedSample = executeYinSynth(targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); break;
             case 2: shiftedSample = executeECKF(targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); break;
             case 3: 
-                if (varDelayBuffer) shiftedSample = executeVarDelay(inSample, targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); 
-                break;
+                 if (varDelayBuffer) shiftedSample = executeVarDelay(inSample, targetPitch, detectedT0, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); 
+                 break;
             case 4: 
-                // Add strict null guard to prevent Core 0 panic if allocation failed
                 if (pvInput && pvOutput && pvWorkspace && pvMagWorkspace && pvPhaseWorkspace && pvLastPhase && pvSumPhase) {
                     shiftedSample = executePhaseVocoder(inSample, targetPitch, p2, p3, p4, currentSampleRate.load(std::memory_order_relaxed)); 
-                }
+                 }
                 break;
         }
         
@@ -161,19 +159,21 @@ private:
         
         float r0 = 0.0f;
         for (int i = 0; i < window; i++) {
-            int idx = (writeIdx - window + i + 4096) & 4095; // Applied offset update
+            int idx = (writeIdx - window + i + 4096) & 4095; 
             float val = analysisBuffer[idx];
             r0 = __builtin_fmaf(val, val, r0);
         }
+
         if (r0 < 0.01f) return false;
         
         float maxR = 0.0f;
         int bestLag = lagMin;
+
         for (int lag = lagMin; lag <= lagMax; lag++) {
             float rLag = 0.0f;
             for (int i = 0; i < window; i++) {
-                int idx1 = (writeIdx - window - lag + i + 4096) & 4095; // Applied offset update
-                int idx2 = (writeIdx - window + i + 4096) & 4095; // Applied offset update
+                int idx1 = (writeIdx - window - lag + i + 4096) & 4095;
+                int idx2 = (writeIdx - window + i + 4096) & 4095;
                 rLag = __builtin_fmaf(analysisBuffer[idx1], analysisBuffer[idx2], rLag);
             }
             if (rLag > maxR) { maxR = rLag; bestLag = lag; }
@@ -201,11 +201,12 @@ private:
         float d1 = y2 - y0;
         float d2 = y1 - y2;
         float d3 = y3 - y0;
+
         float c1 = 0.5f * d1;
         float c3 = __builtin_fmaf(1.5f, d2, 0.5f * d3);
         float c2 = y0 - y1 + c1 - c3;
-        float sample = __builtin_fmaf(__builtin_fmaf(__builtin_fmaf(c3, frac, c2), frac, c1), frac, y1);
 
+        float sample = __builtin_fmaf(__builtin_fmaf(__builtin_fmaf(c3, frac, c2), frac, c1), frac, y1);
         int lutIdx = ((uint32_t)(T * hannIntMult) >> 16) & 4095;
         float val = sample * LUTManager::hannLUT[lutIdx];
         
@@ -222,13 +223,12 @@ private:
         
         if (synthesisPhase >= T1) {
             synthesisPhase -= T1; 
-
-            int searchStart = (writeIdx - (int)(2.5f * T0) + 4096) & 4095; // Applied offset update
+            int searchStart = (writeIdx - (int)(2.5f * T0) + 4096) & 4095; 
             int searchLen = (int)(T0 * (0.1f + p_tol * 0.9f));
             float maxVal = -1.0f; int epochIdx = searchStart;
 
             for (int i = 0; i < searchLen; i++) {
-                int idx = (searchStart + i) & 4095; // Applied offset update
+                int idx = (searchStart + i) & 4095;
                 float absVal = fabsf(analysisBuffer[idx]);
                 if (absVal > maxVal) { maxVal = absVal; epochIdx = idx; }
             }
@@ -238,7 +238,7 @@ private:
             for (int i = 0; i < 8; i++) {
                 if (!grains[i].active) {
                     grains[i].active = true; grains[i].winSpan = windowMultiplier * T0;
-                    grains[i].anchorIdx = (epochIdx - (int)(grains[i].winSpan * 0.5f) + 4096) & 4095; // Applied offset update
+                    grains[i].anchorIdx = (epochIdx - (int)(grains[i].winSpan * 0.5f) + 4096) & 4095; 
                     grains[i].currentPhase = 0.0f; grains[i].phaseInc = 1.0f / grains[i].winSpan; break;
                 }
             }
@@ -248,18 +248,16 @@ private:
         for (int i = 0; i < 8; i++) {
             if (grains[i].active) {
                 int readOffset = (int)(grains[i].currentPhase * grains[i].winSpan);
-                int readIdx = (grains[i].anchorIdx + readOffset) & 4095; // Applied offset update
+                int readIdx = (grains[i].anchorIdx + readOffset) & 4095; 
                 float rawSample = analysisBuffer[readIdx];
                 int lutIdx = ((int)(grains[i].currentPhase * 4095.0f)) & 4095;
-                outSample = __builtin_fmaf(rawSample, LUTManager::hannLUT[lutIdx], outSample);
 
+                outSample = __builtin_fmaf(rawSample, LUTManager::hannLUT[lutIdx], outSample);
                 grains[i].currentPhase += grains[i].phaseInc;
                 if (grains[i].currentPhase >= 1.0f) grains[i].active = false;
             }
         }
         
-        // CRITICAL FIX: Amplitude compensation for PSOLA grain overlap density.
-        // As pitch goes up, grain density increases, artificially inflating the output volume.
         float overlapCompensation = 1.0f / sqrtf(targetPitch);
         return outSample * overlapCompensation;
     }
@@ -269,12 +267,14 @@ private:
 
         float F0 = sr / T0; 
         if (p_oct > 0.5f) targetPitch = exp2f(roundf(log2f(targetPitch)));
-
         float F1 = F0 * targetPitch;
+
         if (currentState == UNVOICED || currentState == WAITING) smoothedFreq = F1;
 
         float alpha = (p_gld > 0.01f) ? (1.0f / (p_gld * sr * 0.5f)) : 1.0f;
-        smoothedFreq += (F1 - smoothedFreq) * alpha;
+        
+        // CRITICAL FIX: Wrapped exponential decays to prevent unhandled CPU FPU Subnormal Traps
+        smoothedFreq = DSPEngine::AntiDenormal(smoothedFreq + (F1 - smoothedFreq) * alpha); 
 
         synthOscPhase += smoothedFreq / sr;
         if (synthOscPhase >= 1.0f) synthOscPhase -= 1.0f;
@@ -294,13 +294,14 @@ private:
         if (currentState == UNVOICED) { kf_freq = F0_meas; kf_p = 1.0f; }
         
         float Q = 0.0001f + (p_Q * 0.05f); 
-        float R = 0.01f + (p_R * 10.0f); 
+        float R = 0.01f + (p_R * 10.0f);  
         
         float p_pred = kf_p + Q;
         float K = __builtin_fminf(p_pred / (p_pred + R), 0.1f + (p_spd * 0.9f));
         
-        kf_freq = kf_freq + K * (F0_meas - kf_freq);
-        kf_p = (1.0f - K) * p_pred;
+        // CRITICAL FIX: Wrapped exponential decays to prevent unhandled CPU FPU Subnormal Traps
+        kf_freq = DSPEngine::AntiDenormal(kf_freq + K * (F0_meas - kf_freq)); 
+        kf_p = DSPEngine::AntiDenormal((1.0f - K) * p_pred); 
         
         eckfPhase += (kf_freq * targetPitch) / sr;
         if (eckfPhase >= 1.0f) eckfPhase -= 1.0f;
@@ -309,7 +310,7 @@ private:
     }
 
     inline float executeVarDelay(float sample, float targetPitch, float T0, float p_win, float p_zc, float p_trn, float sr) __attribute__((always_inline)) {
-        (void)T0; (void)p_win; (void)p_zc; (void)p_trn; (void)sr; 
+        (void)T0; (void)p_win; (void)p_zc; (void)p_trn; (void)sr;  
         
         varDelayBuffer[varWriteIdx] = sample;
 
@@ -330,11 +331,15 @@ private:
 
     inline float executePhaseVocoder(float sample, float targetPitch, float p_blr, float p_phs, float p_trn, float sr) __attribute__((always_inline)) {
         float absSample = fabsf(sample);
-        pvEnv = __builtin_fmaxf(0.0f, __builtin_fmaf(absSample - pvEnv, (absSample > pvEnv) ? 0.2f : 0.001f, pvEnv));
-
+        
+        // CRITICAL FIX: Wrapped exponential decays to prevent unhandled CPU FPU Subnormal Traps
+        pvEnv = DSPEngine::AntiDenormal(__builtin_fmaxf(0.0f, __builtin_fmaf(absSample - pvEnv, (absSample > pvEnv) ? 0.2f : 0.001f, pvEnv))); 
+        
         float transientSpike = absSample / (pvEnv + 0.001f);
         if (p_trn > 0.05f && transientSpike > (10.0f - p_trn * 8.0f)) pvTransientMix = 1.0f;
-        pvTransientMix *= 0.995f;
+        
+        // CRITICAL FIX: Wrapped exponential decays to prevent unhandled CPU FPU Subnormal Traps
+        pvTransientMix = DSPEngine::AntiDenormal(pvTransientMix * 0.995f); 
 
         float currentShift = (p_trn > 0.05f) ? __builtin_fmaf(1.0f - targetPitch, pvTransientMix, targetPitch) : targetPitch;
         
@@ -358,7 +363,6 @@ private:
                 int idx = (pvWriteIdx - 512 + i + 512) & 511;
                 pvWorkspace[i*2] = pvInput[idx] * LUTManager::hannLUT[(i * 8) & 4095]; 
                 pvWorkspace[i*2+1] = 0.0f;
-
                 pvMagWorkspace[i] = 0.0f;
                 pvPhaseWorkspace[i] = 0.0f;
             }

@@ -61,23 +61,22 @@ extern volatile int targetEffectMode;
 extern volatile bool pendingLatencyCycle;
 extern volatile bool pendingSampleRateCycle;
 extern volatile bool pendingPanicReset;
-
 extern char uiDebugMessage[64];
 extern float fxParams[10][5];
+
 extern const bool INVERT_PB3;
 
 extern std::atomic<bool> dsp_is_paused, dsp_ack_parked, lut_ack_parked, ui_clear_meters_requested, globalAudioResetRequested, panicResetRequested, bleEnabled;
 extern std::atomic<bool> manualSaveRequested;
-extern std::atomic<bool> dsp_ready_for_i2s;
 
 extern std::atomic<float> pitchShiftFactor;
 extern std::atomic<uint32_t> currentSampleRate;
 
 extern bool isKnobEditMode, showBleWarning, showSavingScreen, showKnobModeScreen;
 extern unsigned long warningTimer;
+
 extern std::atomic<bool> isScreenOff;
 extern std::atomic<bool> wakeupPending;
-
 extern const unsigned long LIGHT_SLEEP_TIMEOUT;
 extern const unsigned long SCREEN_OFF_TIMEOUT;
 
@@ -85,12 +84,14 @@ extern const float LATENCY_WINDOWS[];
 
 extern int32_t *i2s_in_block, *i2s_out_block;
 extern float *inBuf, *envBuf, *fzOutBuf, *masterGainBuf, *w1Buf, *w2Buf, *w3Buf, *padFilterBuf, *dryBuf, *fbOutBuf, *sMixBuf;
+
 extern esp_pm_lock_handle_t dsp_cpu_lock;
 
 extern int16_t dmaPingBuffer[HOP_SIZE];
 extern int16_t dmaPongBuffer[HOP_SIZE];
 extern int16_t* activeDmaReadBuf;
 extern int16_t* activeDmaWriteBuf;
+
 extern int16_t sramDryBlock[HOP_SIZE];
 
 extern DSPCoreState dspStates[2];
@@ -105,6 +106,7 @@ extern volatile uint8_t activePedalSource; // 0=CC11, 1=PB1, 2=PB2, 3=PB3
 extern volatile float effectMemory[10]; 
 extern volatile bool isWhammyActive, isFrozen, isFeedbackActive, isHarmonizerMode, isSynthMode, isPadMode, isCapoMode, isChorusMode, isSwellMode, isVibratoMode, isVolumeMode, isPB2WiperMode;
 extern volatile float volumePedalGain;
+
 extern std::atomic<int> latencyMode, activeEffectMode, feedbackIntervalIdx;
 
 extern int16_t *sramPitchLow, *sramPitchHigh, *delayBuffer, *fbDelayBuffer, *freezeBuffer;
@@ -133,6 +135,7 @@ extern volatile bool apfNeedsClear;
 
 extern volatile float freezeRamp, chorusLfoPhase, feedbackLfoPhase, vibratoLfoPhase, swellGain, feedbackRamp;
 extern float fbHpfState, feedbackFilter; 
+
 extern std::atomic<int> hardwareSyncMuteFrames;
 extern volatile bool sampleRateToggleRequested, pb2ToggleRequested;
 
@@ -150,12 +153,12 @@ extern std::atomic<float> ui_audio_level, ui_output_level;
 
 extern volatile bool isAdcPaused;
 inline std::atomic_flag adcLock = ATOMIC_FLAG_INIT;
-
 extern adc_continuous_handle_t multifx_adc_handle;
+
 extern volatile int latestPB1, latestPB2, latestPB3, latestPar1;
 extern std::atomic<int> latestBat;
-
 extern const int BOOT_SENSE_PIN, BLE_TOGGLE_PIN;
+
 extern volatile uint16_t currentPB1, currentPB2, currentPB3, currentCC11;
 
 extern USBMIDI_Interface usbmidi;

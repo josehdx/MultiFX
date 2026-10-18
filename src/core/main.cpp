@@ -185,8 +185,9 @@ void loop() {
         
         vTaskDelay(pdMS_TO_TICKS(30)); 
         
-        // CRITICAL FIX: Removed premature `enableChannels()` call that was previously here.
-        // It must NOT be called while the task is still parked.
+        // CRITICAL FIX: Enable hardware DMA *before* unparking the task
+        I2SManager::enableChannels();
+        
         hardwareSyncMuteFrames.store((currentSampleRate.load(std::memory_order_acquire) / HOP_SIZE) * 0.40f, std::memory_order_release);
         
         snprintf(uiDebugMessage, sizeof(uiDebugMessage), "SAVE COMPLETE");
@@ -201,9 +202,6 @@ void loop() {
         while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) {
               vTaskDelay(pdMS_TO_TICKS(1));
         }
-
-        // Channels are enabled safely ONLY after the task is actively spinning and waiting.
-        I2SManager::enableChannels();
     }
 
     if (panicResetRequested.load(std::memory_order_acquire)) {

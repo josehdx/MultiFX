@@ -10,15 +10,6 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
           vTaskDelay(pdMS_TO_TICKS(10));
       }
 
-    // CRITICAL FIX: Signal that AudioDSPTask is ready to consume I2S frames.
-    // SystemBootloader will NOT enable I2S DMA until this flag is set, preventing
-    // ring buffer overflow and stereo phase misalignment at 96kHz boot.
-    dsp_ready_for_i2s.store(true, std::memory_order_release);
-    
-    while (I2SManager::rx_chan == NULL || I2SManager::tx_chan == NULL) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-
     for(;;) {
 #ifdef ENABLE_ADVANCED_TELEMETRY
         // Record remaining Stack RAM in Bytes for Core 0 Audio Task
@@ -44,8 +35,7 @@ static void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvP
             
             // CRITICAL FIX: DMA Phase-Lock Protection.
             // If channels are disabled, destroyed, or rebuilding, reading returns ESP_ERR_INVALID_STATE.
-            // We MUST skip the entire DSP and TX write phase. Attempting to write a dummy block 
-            // to a disabled TX channel permanently breaks the TX/RX pointer sync.
+            // We MUST skip the entire DSP and TX write phase to preserve pointers.
             if (rx_err != ESP_OK) {
                 vTaskDelay(pdMS_TO_TICKS(2));
                 continue; 

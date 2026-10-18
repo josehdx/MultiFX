@@ -36,7 +36,6 @@ private:
                 vTaskDelay(pdMS_TO_TICKS(1));  
             }
 
-            // CRITICAL FIX: Tear down DMA channels completely.
             I2SManager::disableAndDestroyChannels();
 
             msc_paused_dsp = true;
@@ -131,6 +130,9 @@ private:
                 if (diffuserBuf) memset(diffuserBuf, 0, 1024 * sizeof(float));
                 vTaskDelay(pdMS_TO_TICKS(30)); 
                 
+                // CRITICAL FIX: Enable hardware DMA *before* unparking the task
+                I2SManager::enableChannels();
+                
                 hardwareSyncMuteFrames.store((currentSr / HOP_SIZE) * 0.40f, std::memory_order_release);
                 globalAudioResetRequested.store(true, std::memory_order_release);
                 std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -144,9 +146,6 @@ private:
                 while(dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) {
                     vTaskDelay(pdMS_TO_TICKS(1));
                 }
-                
-                // CRITICAL FIX: Enable channels only AFTER the task is unparked and looping.
-                I2SManager::enableChannels();
             }
             vTaskDelay(pdMS_TO_TICKS(10));
         }

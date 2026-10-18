@@ -109,6 +109,9 @@ public:
 
         Serial0.println("[INIT 7/8] Spawning Core 0 (Audio) and Core 1 (LUT) FreeRTOS Tasks...");
         
+        // CRITICAL FIX: Ensure tasks start in a parked state before spawning
+        dsp_is_paused.store(true, std::memory_order_release);
+
         if (dspTaskStack != nullptr && dspTaskTCB != nullptr) {
             audioTaskHandle = xTaskCreateStaticPinnedToCore(AudioDSPTask, "DSP", 8192, NULL, 20, dspTaskStack, dspTaskTCB, 0);
         }
@@ -116,15 +119,27 @@ public:
             lutTaskHandle = xTaskCreateStaticPinnedToCore(LUTUpdateTask, "LUT_Task", 3072, NULL, 1, lutTaskStack, lutTaskTCB, 1);
         }
 
-        // CRITICAL FIX: Wait dynamically for the AudioDSPTask to fully initialize.
-        // This eliminates the boot-time 96kHz DMA buffer overflow and channel swapping.
-        while (!dsp_ready_for_i2s.load(std::memory_order_acquire)) {
+        I2SManager::initChannels(BoardHAL::getI2SConfig(loadedSr), HOP_SIZE);
+        
+        // Wait for tasks to spin up and park safely
+        while (!dsp_ack_parked.load(std::memory_order_acquire) || !lut_ack_parked.load(std::memory_order_acquire)) {
             vTaskDelay(pdMS_TO_TICKS(1));
         }
 
-        I2SManager::initChannels(BoardHAL::getI2SConfig(loadedSr), HOP_SIZE);
         vTaskDelay(pdMS_TO_TICKS(30)); // Allow external DAC/ADC PLLs to lock
+        
+        // CRITICAL FIX: Enable hardware DMA *before* unparking the task. 
+        // This ensures the hardware starts pumping data EXACTLY as the software wakes up to consume it.
         I2SManager::enableChannels();
+
+        // Immediately unpark the tasks to consume the perfectly aligned Phase 0 frame
+        dsp_is_paused.store(false, std::memory_order_release);
+        if (audioTaskHandle) xTaskNotifyGive(audioTaskHandle);
+        if (lutTaskHandle) xTaskNotifyGive(lutTaskHandle);
+        
+        while (dsp_ack_parked.load(std::memory_order_acquire) || lut_ack_parked.load(std::memory_order_acquire)) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
 
         // Hardware Mute Frames block audio output until the I2S clocks have stabilized
         hardwareSyncMuteFrames.store((loadedSr / HOP_SIZE) * 0.40f, std::memory_order_release);

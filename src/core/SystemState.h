@@ -69,6 +69,8 @@ extern const bool INVERT_PB3;
 extern std::atomic<bool> dsp_is_paused, dsp_ack_parked, lut_ack_parked, ui_clear_meters_requested, globalAudioResetRequested, panicResetRequested, bleEnabled;
 extern std::atomic<bool> manualSaveRequested;
 
+extern std::atomic<bool> dsp_ready_for_i2s;
+
 extern std::atomic<float> pitchShiftFactor;
 extern std::atomic<uint32_t> currentSampleRate;
 
@@ -144,6 +146,15 @@ extern unsigned long lastActivityTime;
 extern std::atomic<float> core0_dsp_load, core1_ctrl_load;
 extern std::atomic<uint32_t> max_loop_latency_ms;
 extern std::atomic<float> ui_audio_level, ui_output_level;
+
+// --- ADVANCED DEBUG METRICS ---
+extern std::atomic<uint32_t> dbg_peak_rx_cyc;
+extern std::atomic<uint32_t> dbg_peak_dsp_cyc;
+extern std::atomic<uint32_t> dbg_peak_tx_cyc;
+extern std::atomic<uint32_t> dbg_partial_rx;
+extern std::atomic<uint32_t> dbg_phase_tears;
+extern std::atomic<uint32_t> dbg_rx_errors;
+extern std::atomic<uint32_t> dbg_tx_errors;
 
 #ifdef ENABLE_ADVANCED_TELEMETRY
     extern std::atomic<uint32_t> audio_underflow_count;

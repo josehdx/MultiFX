@@ -50,6 +50,15 @@ struct DisplayData {
     float whammyHeel;
     
     char debugMsg[64];
+
+    // Advanced Debug Tracking
+    uint32_t peakRxCyc;
+    uint32_t peakDspCyc;
+    uint32_t peakTxCyc;
+    uint32_t partialRx;
+    uint32_t phaseTears;
+    uint32_t rxErrors;
+    uint32_t txErrors;
 };
 
 class DisplayManager {
@@ -57,12 +66,13 @@ private:
     TFT_eSPI tft = TFT_eSPI();
     TFT_eSprite spr = TFT_eSprite(&tft);
     TFT_eSprite bgSpr = TFT_eSprite(&tft);
-
     DisplayData cache = {};
+
     char cachedMidiDebug[64] = "";
     char cachedBleEvent[64] = "";
     char cachedBleScan[64] = "";
     char cachedDiscReason[64] = "";
+
     int lastRenderMode = -1;
     bool lastMonoPolyActive = false;
     bool lastVolumeMode = false;
@@ -74,7 +84,6 @@ private:
     const char* MODE_NAMES[10] = {"WHAMMY", "FREEZE", "FEEDBACK", "HARMONY", "CAPO", "SYNTH", "PAD", "CHORUS", "SWELL", "VIBRATO"};
     
     const char* MONO_ALGOS[5] = {"PSOLA", "YIN SYNTH", "ECKF", "VAR DELAY", "VOCODER"};
-
     const char* MONO_LABELS[5][5] = {
         {"ALGO", "RNG",  "FRM",  "TOL",  "MIX"},
         {"ALGO", "WAV",  "GLD",  "OCT",  "MIX"},
@@ -108,6 +117,7 @@ private:
     void drawKnobDynamic(TFT_eSprite& s, int cx, int cy, int r, float normVal, bool isBipolar, const char* valStr) {
         float angleDeg = isBipolar ? (normVal * 135.0f) : (-135.0f + (normVal * 270.0f));
         float rad = (angleDeg - 90.0f) * 0.0174532925f;
+
         int px = cx + (int)(cosf(rad) * (r - 3));
         int py = cy + (int)(sinf(rad) * (r - 3));
         
@@ -155,15 +165,20 @@ private:
         if ((d.freeSRAM / 1024) != (cache.freeSRAM / 1024) || (d.freePSRAM / 1024) != (cache.freePSRAM / 1024)) return true;
         
         if (d.whammyToe != cache.whammyToe || d.whammyHeel != cache.whammyHeel) return true;
-        
         if (strcmp(d.debugMsg, cache.debugMsg) != 0) return true;
+
+        if (d.peakDspCyc != cache.peakDspCyc || d.phaseTears != cache.phaseTears || 
+            d.rxErrors != cache.rxErrors || d.txErrors != cache.txErrors || 
+            d.partialRx != cache.partialRx) return true;
 
         for (int i = 0; i < 10; i++) {
             if (d.fxStates[i] != cache.fxStates[i]) return true;
         }
+
         for (int i = 0; i < 5; i++) {
             if (fabsf(d.paramVals[i] - cache.paramVals[i]) > 0.005f) return true;
         }
+
         return false;
     }
 
@@ -174,8 +189,8 @@ public:
         
         pinMode(38, OUTPUT);
         digitalWrite(38, HIGH); 
-        delay(100);             
-        
+        delay(100);                         
+
         tft.init();
         tft.setRotation(1);
         tft.fillScreen(TFT_BLACK);
@@ -193,6 +208,7 @@ public:
         lastMonoPolyActive = false;
         lastVolumeMode = false;
         lastMonoPolyAlgo = -1;
+        
         bootLogY = 8;
     }
 
@@ -201,7 +217,6 @@ public:
         tft.setTextDatum(TL_DATUM);
         tft.drawString(line, 6, bootLogY, 2);
         bootLogY += 19;
-
         if (bootLogY > 150) {
             bootLogY = 8;
             tft.fillScreen(TFT_BLACK);
@@ -383,11 +398,9 @@ public:
         
         int activeIndices[10];
         int activeCount = 0;
-
         for (int i = 0; i < 10; i++) {
             int fxIdx = CHAIN_ORDER[i];
             bool isEffectActive = (fxIdx == 0) ? (d.fxStates[0] || d.isMonoPolyActive) : d.fxStates[fxIdx];
-
             if (isEffectActive) activeIndices[activeCount++] = fxIdx;
         }
 
@@ -399,6 +412,7 @@ public:
             for (int k = 0; k < activeCount; k++) {
                 int fxIdx = activeIndices[k];
                 int bx = startX + (k * (badgeW + 2));
+
                 uint16_t bColor = (fxIdx == 0 && d.isMonoPolyActive) ? TFT_DARKGREY : TFT_BLUE;
                 
                 const char* bName = FX_NAMES[fxIdx];
@@ -412,24 +426,38 @@ public:
         }
 
         if (SHOW_TELEMETRY) {
-            spr.fillRect(16, 142, 288, 26, TFT_BLACK); 
-            spr.drawRect(16, 142, 288, 26, TFT_YELLOW);
+            spr.fillRect(16, 130, 288, 38, TFT_BLACK); 
+            spr.drawRect(16, 130, 288, 38, TFT_YELLOW);
             
             spr.setTextDatum(TL_DATUM);
             spr.setTextColor(TFT_YELLOW, TFT_BLACK);
             
             char line1[128];
-            snprintf(line1, sizeof(line1), "CPU0:%d%% CPU1:%d%% | SR:%luHz | LAT:%ums [W:%d]", 
-                     (int)d.dspCoreLoad, (int)d.ctrlCoreLoad, (unsigned long)d.sampleRate,
-                     (unsigned int)d.peakLatency, d.latencyMode);
+            snprintf(line1, sizeof(line1), "CPU0:%d%% CPU1:%d%% | SR:%luHz | LAT:%ums", 
+                      (int)d.dspCoreLoad, (int)d.ctrlCoreLoad, (unsigned long)d.sampleRate,
+                     (unsigned int)d.peakLatency);
                      
             char line2[128];
             snprintf(line2, sizeof(line2), "RAM:%uK PS:%uK UDF:%u | %s", 
-                     (unsigned int)(d.freeSRAM / 1024), (unsigned int)(d.freePSRAM / 1024), 
-                     (unsigned int)d.underflows, d.debugMsg);
+                      (unsigned int)(d.freeSRAM / 1024), (unsigned int)(d.freePSRAM / 1024), 
+                      (unsigned int)d.underflows, d.debugMsg);
 
-            spr.drawString(line1, 20, 144, 1);
-            spr.drawString(line2, 20, 156, 1);
+            char line3[128];
+            snprintf(line3, sizeof(line3), "PkDSP:%lu | Err:%lu | Tear:%lu | pRX:%lu",
+                     (unsigned long)d.peakDspCyc, 
+                     (unsigned long)(d.rxErrors + d.txErrors), 
+                     (unsigned long)d.phaseTears, 
+                     (unsigned long)d.partialRx);
+
+            spr.drawString(line1, 20, 132, 1);
+            spr.drawString(line2, 20, 144, 1);
+            
+            // Turn text RED if there is a DSP deadline violation or Phase Sync failure
+            if (d.peakDspCyc > 160000 || d.rxErrors > 0 || d.txErrors > 0 || d.phaseTears > 0 || d.partialRx > 0) {
+                spr.setTextColor(TFT_RED, TFT_BLACK);
+            }
+            spr.drawString(line3, 20, 156, 1);
+            spr.setTextColor(TFT_YELLOW, TFT_BLACK);
         }
 
         if (d.showSavingScreen) {

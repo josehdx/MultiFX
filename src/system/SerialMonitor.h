@@ -10,7 +10,6 @@ struct TelemetryData {
     float ctrlCoreLoad;
     uint32_t sampleRate;
     int latencyMode;
-
     float batVoltage;
     int batPercent;
     bool isCharging;
@@ -18,10 +17,12 @@ struct TelemetryData {
     bool bleConnected;
     bool bleHostConnected;
     bool blePedalConnected;
+    
     char bleHostStatus[16];
     char blePedalStatus[16];
     char bleTarget[32];
     char bleLastSeen[32];
+    
     uint32_t blePackets;
 
     int activeMode;
@@ -36,6 +37,15 @@ struct TelemetryData {
     uint32_t dspStackWatermark;
     uint32_t peakLoopLatency;
     uint32_t dmaTransfers;
+
+    // Advanced Debug Tracking
+    uint32_t peakRxCyc;
+    uint32_t peakDspCyc;
+    uint32_t peakTxCyc;
+    uint32_t partialRx;
+    uint32_t phaseTears;
+    uint32_t rxErrors;
+    uint32_t txErrors;
 };
 
 class SerialMonitor {
@@ -88,7 +98,7 @@ public:
             dualPrintf("Latency Mode     : %d\n", data.latencyMode);
             
             dualPrintf("Battery State    : %.2fV (%d%%) - Charging: %s\n", 
-                        data.batVoltage, data.batPercent, data.isCharging ? "YES" : "NO");
+                       data.batVoltage, data.batPercent, data.isCharging ? "YES" : "NO");
 
             dualPrintln("----------- DUAL-ROLE BLE TELEMETRY -----------");
             dualPrintf("Init Sequence    : %s\n", bleInitStep);
@@ -109,12 +119,20 @@ public:
             
             dualPrintf("Active Effects   : %s\n", activeFxStr);
             dualPrintf("Pedal Vals       : PB1:%d | PB2:%d | PB3:%d | CC11:%d\n", 
-                        data.pb1, data.pb2, data.pb3, data.cc11);
+                       data.pb1, data.pb2, data.pb3, data.cc11);
             dualPrintf("Audio Meters     : IN: %.3f | OUT: %.3f\n", data.inMeter, data.outMeter);
-
             dualPrintf("Audio Underflows : %lu\n", data.audioUnderflows);
             dualPrintf("DSP Min Stack RAM: %lu Bytes\n", data.dspStackWatermark);
             dualPrintf("Peak Loop Latency: %lu ms\n", data.peakLoopLatency);
+            
+            dualPrintln("-------------- CORE 0 DIAGNOSTICS -------------");
+            dualPrintf("Peak RX Wait Cyc : %lu\n", data.peakRxCyc);
+            dualPrintf("Peak DSP Loop Cyc: %lu\n", data.peakDspCyc);
+            dualPrintf("Peak TX Wait Cyc : %lu\n", data.peakTxCyc);
+            dualPrintf("Partial RX Reads : %lu\n", data.partialRx);
+            dualPrintf("Word Phase Tears : %lu\n", data.phaseTears);
+            dualPrintf("RX Driver Errors : %lu\n", data.rxErrors);
+            dualPrintf("TX Driver Errors : %lu\n", data.txErrors);
             dualPrintln("====================================================");
         }
     }

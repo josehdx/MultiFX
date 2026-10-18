@@ -17,9 +17,10 @@ public:
 
         tData.dspCoreLoad = core0_dsp_load.load(std::memory_order_relaxed);
         tData.ctrlCoreLoad = core1_ctrl_load.load(std::memory_order_relaxed);
+
         tData.sampleRate = currentSampleRate.load(std::memory_order_acquire);
         tData.latencyMode = latencyMode.load(std::memory_order_relaxed);
-
+        
         tData.batVoltage = 4.00f;
         tData.batPercent = 100;
         tData.isCharging = false;
@@ -70,6 +71,14 @@ public:
 #endif
         
         tData.peakLoopLatency = max_loop_latency_ms.exchange(0, std::memory_order_relaxed);
+        
+        tData.peakRxCyc = dbg_peak_rx_cyc.exchange(0, std::memory_order_relaxed);
+        tData.peakDspCyc = dbg_peak_dsp_cyc.exchange(0, std::memory_order_relaxed);
+        tData.peakTxCyc = dbg_peak_tx_cyc.exchange(0, std::memory_order_relaxed);
+        tData.partialRx = dbg_partial_rx.load(std::memory_order_relaxed);
+        tData.phaseTears = dbg_phase_tears.load(std::memory_order_relaxed);
+        tData.rxErrors = dbg_rx_errors.load(std::memory_order_relaxed);
+        tData.txErrors = dbg_tx_errors.load(std::memory_order_relaxed);
         
         serialMonitor.printMetrics(tData, BluetoothManager::bleInitStep);
     }

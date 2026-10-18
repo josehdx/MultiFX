@@ -70,7 +70,6 @@ public:
             },
         };
 
-        // CRITICAL FIX: Reverted to 384x. External DAC/ADC PLLs require standard 384x oversampling.
         std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384; 
         return std_cfg;
     }
@@ -153,6 +152,15 @@ public:
             dData.whammyHeel = activeDSP->fxMem[1];
             
             strlcpy(dData.debugMsg, dbgMsg, sizeof(dData.debugMsg));
+
+            // CRITICAL FIX: Load the global tracking variables cleanly into the Display pipeline
+            dData.peakRxCyc = dbg_peak_rx_cyc.load(std::memory_order_relaxed);
+            dData.peakDspCyc = dbg_peak_dsp_cyc.load(std::memory_order_relaxed);
+            dData.peakTxCyc = dbg_peak_tx_cyc.load(std::memory_order_relaxed);
+            dData.partialRx = dbg_partial_rx.load(std::memory_order_relaxed);
+            dData.phaseTears = dbg_phase_tears.load(std::memory_order_relaxed);
+            dData.rxErrors = dbg_rx_errors.load(std::memory_order_relaxed);
+            dData.txErrors = dbg_tx_errors.load(std::memory_order_relaxed);
             
             displayManager.render(dData);
         }

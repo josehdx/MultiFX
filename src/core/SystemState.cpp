@@ -28,6 +28,8 @@ const bool INVERT_PB3 = false;
 std::atomic<bool> dsp_is_paused{false}, dsp_ack_parked{false}, lut_ack_parked{false}, ui_clear_meters_requested{false}, globalAudioResetRequested{false}, panicResetRequested{false}, bleEnabled{true};
 std::atomic<bool> manualSaveRequested{false};
 
+std::atomic<bool> dsp_ready_for_i2s{false};
+
 std::atomic<float> pitchShiftFactor{1.0f};
 std::atomic<uint32_t> currentSampleRate{96000}; // Default to Polyphonic mode on boot
 std::atomic<bool> isMonoPolyActive{false}; 
@@ -106,6 +108,15 @@ std::atomic<float> core0_dsp_load __attribute__((aligned(64))) {0.0f};
 std::atomic<float> core1_ctrl_load __attribute__((aligned(64))) {0.0f};
 std::atomic<uint32_t> max_loop_latency_ms{0};
 std::atomic<float> ui_audio_level __attribute__((aligned(64))) {0.0f}, ui_output_level __attribute__((aligned(64))) {0.0f};
+
+// --- ADVANCED DEBUG METRICS ---
+std::atomic<uint32_t> dbg_peak_rx_cyc{0};
+std::atomic<uint32_t> dbg_peak_dsp_cyc{0};
+std::atomic<uint32_t> dbg_peak_tx_cyc{0};
+std::atomic<uint32_t> dbg_partial_rx{0};
+std::atomic<uint32_t> dbg_phase_tears{0};
+std::atomic<uint32_t> dbg_rx_errors{0};
+std::atomic<uint32_t> dbg_tx_errors{0};
 
 #ifdef ENABLE_ADVANCED_TELEMETRY
     std::atomic<uint32_t> audio_underflow_count{0};

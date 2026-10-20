@@ -18,6 +18,7 @@ extern char bleLatchedDiscReason[64];
 struct DisplayData {
     float batVoltage;
     int batPercent;
+    bool isCharging;
     
     bool bleConnected;
     bool bleHostConnected;
@@ -66,13 +67,12 @@ private:
     TFT_eSPI tft = TFT_eSPI();
     TFT_eSprite spr = TFT_eSprite(&tft);
     TFT_eSprite bgSpr = TFT_eSprite(&tft);
-    DisplayData cache = {};
 
+    DisplayData cache = {};
     char cachedMidiDebug[64] = "";
     char cachedBleEvent[64] = "";
     char cachedBleScan[64] = "";
     char cachedDiscReason[64] = "";
-
     int lastRenderMode = -1;
     bool lastMonoPolyActive = false;
     bool lastVolumeMode = false;
@@ -84,6 +84,7 @@ private:
     const char* MODE_NAMES[10] = {"WHAMMY", "FREEZE", "FEEDBACK", "HARMONY", "CAPO", "SYNTH", "PAD", "CHORUS", "SWELL", "VIBRATO"};
     
     const char* MONO_ALGOS[5] = {"PSOLA", "YIN SYNTH", "ECKF", "VAR DELAY", "VOCODER"};
+
     const char* MONO_LABELS[5][5] = {
         {"ALGO", "RNG",  "FRM",  "TOL",  "MIX"},
         {"ALGO", "WAV",  "GLD",  "OCT",  "MIX"},
@@ -117,7 +118,6 @@ private:
     void drawKnobDynamic(TFT_eSprite& s, int cx, int cy, int r, float normVal, bool isBipolar, const char* valStr) {
         float angleDeg = isBipolar ? (normVal * 135.0f) : (-135.0f + (normVal * 270.0f));
         float rad = (angleDeg - 90.0f) * 0.0174532925f;
-
         int px = cx + (int)(cosf(rad) * (r - 3));
         int py = cy + (int)(sinf(rad) * (r - 3));
         
@@ -153,7 +153,8 @@ private:
             d.showSavingScreen != cache.showSavingScreen || 
             d.showKnobModeScreen != cache.showKnobModeScreen ||
             d.isMonoPolyActive != cache.isMonoPolyActive ||
-            d.isVolumeMode != cache.isVolumeMode) return true;
+            d.isVolumeMode != cache.isVolumeMode ||
+            d.isCharging != cache.isCharging) return true;
             
         if (d.activeMode != cache.activeMode) return true;
         if (d.latencyMode != cache.latencyMode) return true;
@@ -174,7 +175,6 @@ private:
         for (int i = 0; i < 10; i++) {
             if (d.fxStates[i] != cache.fxStates[i]) return true;
         }
-
         for (int i = 0; i < 5; i++) {
             if (fabsf(d.paramVals[i] - cache.paramVals[i]) > 0.005f) return true;
         }
@@ -190,7 +190,7 @@ public:
         pinMode(38, OUTPUT);
         digitalWrite(38, HIGH); 
         delay(100);                         
-
+        
         tft.init();
         tft.setRotation(1);
         tft.fillScreen(TFT_BLACK);
@@ -304,7 +304,11 @@ public:
         spr.setTextColor(TFT_WHITE, TFT_BLACK);
         
         char batBuf[32];
-        snprintf(batBuf, sizeof(batBuf), "%.2fV %d%%", d.batVoltage, d.batPercent);
+        if (d.isCharging) {
+            snprintf(batBuf, sizeof(batBuf), "%.2fV CHARGING", d.batVoltage);
+        } else {
+            snprintf(batBuf, sizeof(batBuf), "%.2fV %d%%", d.batVoltage, d.batPercent);
+        }
         spr.drawString(batBuf, 5, 2, 2); 
 
         spr.setTextDatum(TC_DATUM);
@@ -412,7 +416,6 @@ public:
             for (int k = 0; k < activeCount; k++) {
                 int fxIdx = activeIndices[k];
                 int bx = startX + (k * (badgeW + 2));
-
                 uint16_t bColor = (fxIdx == 0 && d.isMonoPolyActive) ? TFT_DARKGREY : TFT_BLUE;
                 
                 const char* bName = FX_NAMES[fxIdx];
@@ -434,13 +437,13 @@ public:
             
             char line1[128];
             snprintf(line1, sizeof(line1), "CPU0:%d%% CPU1:%d%% | SR:%luHz | LAT:%ums", 
-                      (int)d.dspCoreLoad, (int)d.ctrlCoreLoad, (unsigned long)d.sampleRate,
+                     (int)d.dspCoreLoad, (int)d.ctrlCoreLoad, (unsigned long)d.sampleRate,
                      (unsigned int)d.peakLatency);
                      
             char line2[128];
             snprintf(line2, sizeof(line2), "RAM:%uK PS:%uK UDF:%u | %s", 
-                      (unsigned int)(d.freeSRAM / 1024), (unsigned int)(d.freePSRAM / 1024), 
-                      (unsigned int)d.underflows, d.debugMsg);
+                     (unsigned int)(d.freeSRAM / 1024), (unsigned int)(d.freePSRAM / 1024), 
+                     (unsigned int)d.underflows, d.debugMsg);
 
             char line3[128];
             snprintf(line3, sizeof(line3), "PkDSP:%lu | Err:%lu | Tear:%lu | pRX:%lu",

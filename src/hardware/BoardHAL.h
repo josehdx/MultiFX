@@ -1,4 +1,5 @@
 #pragma once
+
 #include <Arduino.h>
 #include "SystemState.h"
 #include "PowerManager.h"
@@ -49,7 +50,7 @@ public:
     #if ENABLE_SERIAL_DEBUG
                 .ws   = (gpio_num_t)-1, 
                 .dout = (gpio_num_t)21,
-                .din  = (gpio_num_t)-1,     
+                .din  = (gpio_num_t)-1,              
     #else
                 .ws   = (gpio_num_t)18,
                 .dout = (gpio_num_t)21,
@@ -69,7 +70,6 @@ public:
                 },
             },
         };
-
         std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384; 
         return std_cfg;
     }
@@ -102,8 +102,15 @@ public:
         static unsigned long lastDisplayUpdate = 0;
         
         static float smoothBatRaw = -1.0f;
-        if (smoothBatRaw < 0) smoothBatRaw = batVal;
-        else smoothBatRaw = (smoothBatRaw * 0.98f) + (batVal * 0.02f);
+        if (smoothBatRaw < 0) {
+            smoothBatRaw = batVal;
+        } else if (batVal < smoothBatRaw - 100.0f) {
+            // Drop instantly by bypassing the moving average if the USB cable is unplugged (~0.1V drop)
+            smoothBatRaw = batVal; 
+        } else {
+            // Apply heavy filtering to strictly stabilize resting battery level jitter
+            smoothBatRaw = (smoothBatRaw * 0.95f) + (batVal * 0.05f);
+        }
         
         if (millis() - lastDisplayUpdate >= 250 || showSavingScreen || showKnobModeScreen) {
             lastDisplayUpdate = millis();
@@ -111,6 +118,10 @@ public:
             
             dData.batVoltage = PowerManager::getBatteryVoltage(smoothBatRaw);
             dData.batPercent = PowerManager::getBatteryPercentage(dData.batVoltage);
+            
+            // Ditch the stuck USB boolean. Use a strict physical voltage threshold.
+            // Active chargers push the line above 4.15V. Resting batteries sit below 4.15V.
+            dData.isCharging = (dData.batVoltage >= 4.15f); 
             
             dData.bleConnected = bleConnected;
             dData.bleHostConnected = BluetoothManager::isHostConnected;
@@ -129,8 +140,10 @@ public:
                 dData.paramVals[2] = activeDSP->fxMem[0];
                 dData.paramVals[3] = activeDSP->fxMem[1];
             }
+
             dData.paramNames[0] = "P1"; dData.paramNames[1] = "P2"; dData.paramNames[2] = "P3"; 
             dData.paramNames[3] = "P4"; dData.paramNames[4] = "P5";
+
             dData.inMeter = inMeter; dData.outMeter = outMeter;
             dData.dspCoreLoad = dspLoad; dData.ctrlCoreLoad = ctrlLoad;
             dData.freeSRAM = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
@@ -153,7 +166,6 @@ public:
             
             strlcpy(dData.debugMsg, dbgMsg, sizeof(dData.debugMsg));
 
-            // CRITICAL FIX: Load the global tracking variables cleanly into the Display pipeline
             dData.peakRxCyc = dbg_peak_rx_cyc.load(std::memory_order_relaxed);
             dData.peakDspCyc = dbg_peak_dsp_cyc.load(std::memory_order_relaxed);
             dData.peakTxCyc = dbg_peak_tx_cyc.load(std::memory_order_relaxed);

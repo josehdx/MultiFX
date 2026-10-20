@@ -17,13 +17,13 @@ public:
 
         tData.dspCoreLoad = core0_dsp_load.load(std::memory_order_relaxed);
         tData.ctrlCoreLoad = core1_ctrl_load.load(std::memory_order_relaxed);
-
         tData.sampleRate = currentSampleRate.load(std::memory_order_acquire);
         tData.latencyMode = latencyMode.load(std::memory_order_relaxed);
         
-        tData.batVoltage = 4.00f;
-        tData.batPercent = 100;
-        tData.isCharging = false;
+        // Ensure Telemetry parses live battery metrics properly and relies on voltage for charging status
+        tData.batVoltage = PowerManager::getBatteryVoltage(latestBat.load(std::memory_order_relaxed));
+        tData.batPercent = PowerManager::getBatteryPercentage(tData.batVoltage);
+        tData.isCharging = (tData.batVoltage >= 4.15f);
 
 #if !defined(FW_MODE_KNOBS_ONLY)
         tData.bleConnected = BluetoothManager::isMvaveConnected || BluetoothManager::isHostConnected || BluetoothManager::isNuxConnected;
@@ -59,6 +59,7 @@ public:
         tData.fxStates[9] = activeDSP->vb;
         
         tData.pb1 = currentPB1; tData.pb2 = currentPB2; tData.pb3 = currentPB3; tData.cc11 = currentCC11;
+
         tData.inMeter = ui_audio_level.load(std::memory_order_acquire);
         tData.outMeter = ui_output_level.load(std::memory_order_acquire);
 

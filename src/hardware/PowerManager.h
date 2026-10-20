@@ -9,23 +9,24 @@
 class PowerManager {
 public:
     static i2s_std_config_t getI2SConfig(uint32_t sampleRate) {
-        i2s_std_config_t stdConfig = { 
-             .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sampleRate), 
-             .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
-             .gpio_cfg = { 
-                 .mclk = GPIO_NUM_43, 
-                 .bclk = GPIO_NUM_44, 
-                 .ws   = GPIO_NUM_18, 
-                 .dout = GPIO_NUM_21, 
-                 .din  = GPIO_NUM_17 
-             } 
-         };
+        i2s_std_config_t stdConfig = {
+              .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sampleRate),
+              .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+              .gpio_cfg = {
+                  .mclk = GPIO_NUM_43,
+                  .bclk = GPIO_NUM_44,
+                  .ws   = GPIO_NUM_18,
+                  .dout = GPIO_NUM_21,
+                  .din  = GPIO_NUM_17
+              }
+          };
         stdConfig.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
         return stdConfig;
     }
 
     static float getBatteryVoltage(int raw) {
-        return ((float)raw / 4095.0f) * 2.0f * 3.3f;
+        // Updated with calibrated hardware multiplier (2.133f) and 3.3V pin reference under load (3.25f)
+        return ((float)raw / 4095.0f) * 2.133f * 3.25f;
     }
 
     static int getBatteryPercentage(float voltage) {
